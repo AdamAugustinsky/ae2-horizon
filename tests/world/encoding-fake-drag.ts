@@ -9,6 +9,12 @@ try {
   const start = await fixture.start(); const [px, py, pz] = start.player.position;
   const x = Math.floor(px) + 32, y = Math.ceil(py) + 5, z = Math.floor(pz) + 32;
   const at = (dx: number) => `${x + dx} ${y} ${z}`, terminal = at(2);
+  // In-frame setblock/fill require loaded chunks; the +32 fixture can cross
+  // the initial simulation boundary even after the world startup barrier.
+  await fixture.command(`tp @s ${x + 2.5} ${y} ${z - 2.5}`);
+  for (const [dx,dz] of [[-2,-3],[-2,3],[5,-3],[5,3]] as const) {
+    await until(() => fixture.raw(`block ${x + dx} ${y} ${z + dz}`), block => block.loaded, 'fixture corner chunk loaded', 30000);
+  }
   await fixture.command(`fill ${x - 2} ${y} ${z - 3} ${x + 5} ${y + 4} ${z + 3} minecraft:air`);
   await fixture.command(`fill ${x - 2} ${y - 1} ${z - 3} ${x + 5} ${y - 1} ${z + 3} minecraft:stone`);
   await fixture.command(`setblock ${at(0)} ae2:creative_energy_cell`);

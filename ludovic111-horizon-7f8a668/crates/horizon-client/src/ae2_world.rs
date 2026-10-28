@@ -268,13 +268,7 @@ impl Machine {
     /// Real owned inventory, including crafting CPU escrow. Job metadata and
     /// terminal listings are virtual and must never be emitted as drops.
     pub fn physical_contents(&self) -> Vec<ItemStack> {
-        let physical_slots = if self.kind == MachineKind::DebugItemGenerator { &[][..] } else { &self.slots[..] };
-        let mut out: Vec<_> = physical_slots
-            .iter()
-            .chain(self.upgrades.iter())
-            .flatten()
-            .cloned()
-            .collect();
+        let mut out=self.physical_slots_and_upgrades();
         if matches!(
             self.kind,
             MachineKind::CraftingUnit
@@ -312,7 +306,11 @@ impl Machine {
                     }
                 }
             }
-            if let Some(horizon_world::nbt::Tag::List(entries)) = self.config.get(&"ae2_provider_send_items".into()) {
+            if self.config.contains_key(&crate::ae2_provider_queue::QUEUE.into()) {
+                if let Ok(entries)=crate::ae2_provider_queue::read(&self.config) {
+                    if let Ok(items)=crate::ae2_provider_queue::physical_items(&entries) {out.extend(items);}
+                }
+            } else if let Some(horizon_world::nbt::Tag::List(entries)) = self.config.get(&"ae2_provider_send_items".into()) {
                 if entries.len() <= 8192 {
                     for entry in entries {
                         if matches!(entry.get("count"),Some(horizon_world::nbt::Tag::Int(n)) if *n>0) {
@@ -323,6 +321,17 @@ impl Machine {
             }
         }
         out
+    }
+    /// Physical block slots and installed upgrades; deferred AE2 inventories
+    /// are handled by the source-aware drop path using their own limits.
+    pub fn physical_slots_and_upgrades(&self) -> Vec<ItemStack> {
+        let physical_slots = if self.kind == MachineKind::DebugItemGenerator { &[][..] } else { &self.slots[..] };
+        physical_slots
+            .iter()
+            .chain(self.upgrades.iter())
+            .flatten()
+            .cloned()
+            .collect()
     }
     pub fn installed_speed_cards(&self) -> usize {
         self.upgrades
@@ -524,6 +533,21 @@ mod tests {
         let (_,BlockEntity::Ae2(restored))=save::decode_block_entity(&encoded).unwrap() else{panic!("provider")};
         assert_eq!(restored.physical_contents(),vec![item]);
         let mut other=Machine::new(MachineKind::Terminal);other.config=restored.config.clone();assert!(other.physical_contents().is_empty());
+    }
+    #[test]
+    fn provider_ordered_queue_preserves_item_custody_across_save() {
+        let mut provider=Machine::new(MachineKind::PatternProvider);
+        let mut item=ItemStack::new("minecraft:stone",1);
+        item.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("variant",Tag::String("queued".into()))])));
+        let water=ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components:vec![1,2]};
+        crate::ae2_provider_queue::write(&mut provider.config,&[
+            crate::ae2_provider_queue::Entry::Fluid{key:water,amount:1000},
+            crate::ae2_provider_queue::Entry::Item{prototype:item.clone(),amount:999_999},
+        ]).unwrap();
+        let encoded=save::encode_block_entity((1,2,3),&BlockEntity::Ae2(Box::new(provider)),"ae2:pattern_provider");
+        let (_,BlockEntity::Ae2(restored))=save::decode_block_entity(&encoded).unwrap() else{panic!("provider")};
+        let items=restored.physical_contents();assert_eq!(items.len(),1);assert_eq!(items[0].count,999_999);
+        assert!(items[0].same_item_same_components(&item));
     }
     #[test]
     fn terminal_does_not_duplicate_network_contents_and_invalid_state_is_rejected() {

@@ -1,19 +1,19 @@
 # Native validation checkpoint
 
-The latest completed host gate recorded here is Wave 11 on macOS / Apple M3 Pro. The source target is AE2 19.2.18 at `db17504a86128fdf3dae31f5fb7a112a646e0b93`; the engine target is Horizon / Minecraft 26.3 at `7f8a6680a88f36a3c4a499f821862c447b72ce3f`.
+The latest completed host gate recorded here is Wave 13b on macOS / Apple M3 Pro. The source target is AE2 19.2.18 at `db17504a86128fdf3dae31f5fb7a112a646e0b93`; the engine target is Horizon / Minecraft 26.3 at `7f8a6680a88f36a3c4a499f821862c447b72ce3f`.
 
 This is bounded evidence, not certification of full AE2, Java-world or ATM10 compatibility. Later working-tree changes need their own gate. The parity ledgers distinguish implementation, named tests and remaining work.
 
 ## Reproducible inputs
 
-- Client binary SHA-256: `3dd50add7863c9538c60dac638df0054302a446300f3d9df53905cce29da6283`.
-- Frozen source archive SHA-256: `c4524acbb0dba7b6fa89808095c3f026af4b4bc50deedbf5de720bfae7049a86`.
+- Client binary SHA-256: `b81581dfbf19eb742dfd7cd6e4088ef85367a5f286e9a4bee2a96d59601f484d`.
+- Frozen source archive SHA-256: `49089e32d2bcb9d1a7f9302e08d10b626d210be563e76dc396d7adf83534a5e0`.
 - Rust 1.95.0, locked dependencies, `fast` profile, `horizon-client`, default features disabled, `ae2-lab` enabled.
 - Runtime content generated locally from the pinned source and owned Minecraft resources. Prepared assets, saves and binaries are excluded from the repository.
 
 ## Automated checks
 
-The AE2-filtered gate passed 106 library tests and 311 client tests; three library tests were ignored for resource prerequisites. The separately selected wrapped-stack gate passed seven tests, with one resource-dependent test ignored. The standalone crafting core passed 80 tests.
+The Wave 13b AE2-filtered gate passed 110 library tests and 320 client tests; three library tests were ignored in that default selection and passed separately with their prerequisites on Wave 12. The separately selected wrapped-stack gate passed seven tests, with one resource-dependent test ignored. The standalone crafting core passed 80 tests.
 
 Actual pinned Java tree classes compiled against test-only host stubs agree with the native byte-accounting cases, including cake (68 bytes), reusable containers (34), crafted substitutes, source-greedy shortages, and four 10,000-push cases (60,016 or 70,016 bytes). These stubs do not represent a running Java game. Separate source oracles cover pathing on 128 synthetic graphs, stored-energy numeric boundaries, and seven actual QuantumCluster/Locatables readiness, pairing and unload/reload states.
 
@@ -44,3 +44,21 @@ Run `bun run scripts/test.ts --client` for the host gate and `bun run scripts/te
 Wave 11 also passed actual three-frame first-registration pairing, unload without promoting the third frame, and original-pair reconnection. The old 128-depth, 4,096-node and CPU-step guards were replaced by an explicit continuation machine, interned nodes and fallible allocations; 256 source-Java layers, 4,097 nodes and 4,097 steps have differential cases. A real 4,097-step job and component-bearing escrow round-trip through NBT, using a ByteArray above the old modified-UTF-8 String boundary. Processing amount and Interface stock editors have physical Set/Back, per-item limits, restart and stale-owner checks.
 
 On macOS, harness deadlines, control waits and shutdown timers use `mach_absolute_time`, matching awake-time progression; sleep pauses a budget and never causes an action to be resent. No display assertion is used. Lid closure can still suspend the machine.
+
+## Wave 12: menu ownership, fake slots and physical container/fluid custody
+
+The immutable native binary SHA-256 is `dd0779ac13ba4b8c431d9b09c4ff9c2ad7ec2e79f637f4223ca14c96129527b4`; its source archive is `baf5bf23bfd4e6ded848c0adf7beab594a86334ab43e733f24a389c44169ae94` and patch against `9a065b746dc99e392749428ea007db1afe6a9aa4` is `4adc4f196aaf758020fe8d5ce48f675ec32a300072916e9eb351fe98efe37fd1`. The frozen host gate passed 106 library tests and 316 client tests; the separate wrapped-item gate passed seven tests. Three resource-gated checks also passed when explicitly run against the actual pinned Java recipe export and source advancement data: 491 AE2 recipe IDs/special flags, synchronized recipe IDs, and 407 advancements including 381 recipe-unlock criteria.
+
+Eleven hidden server-thread worlds passed: `machine-menu-identity`, `encoding-fake-drag`, `fake-slot-drag-machines`, `encoding-fast-clicks`, `encoding-fake-gestures`, `wrapped-workbench`, `annihilation-container-custody`, `annihilation-container-overflow`, `source-wrapped-crafting-input`, `provider-condenser-fluid`, and `storage-bus-condenser-fluid`. The Encoding drag and rapid same-slot processing cases also passed in-frame. These cover exact physical cursor/cell/card custody, stale host/part closure, item/fluid ghost actions, source wrapped-input crafting, chest/furnace pickup, partial cell acceptance with overflow left in the world, Condenser ME-capability routing, blocked fluid escrow and restart.
+
+The first machine-drag fixture expected an Interface-specific title although the current renderer uses `AE2 Machine`. The first rapid-quantity fixture incorrectly expected more than one item in crafting mode, which source `fixCraftingRecipes` clamps; its queued-amount assertion now uses processing mode. The first Storage Bus fixture held the server while waiting for inventory replication. One in-frame run issued setup writes before its target chunk loaded, so its power source was never placed. These setup/assertion failures were corrected and rerun on the same binary. Setup now waits for the relevant loaded chunks; the harness immediately rejects an unloaded-position response to a block mutation. No failed setup or unexecuted gesture is counted as a passing behavior.
+
+Two additional actual-source method oracles passed: eight wrapped input conversion cases and thirteen Provider/Condenser cases. They use minimal host stubs, so they do not replace a live Java world comparison. Full AE2 parity remains unfinished, including the next aggregate processing-queue integration and broader block-entity/menu coverage.
+
+## Wave 13b: aggregate reservations and ordered Provider queues
+
+The source archive above was built against `9a065b746dc99e392749428ea007db1afe6a9aa4`; its patch SHA-256 is `0179b5fa5c8efe6fe5563575d06be40cad3788e72176d1efb9b144ec8d253b0f`. The host gate includes queue migration, mixed item/fluid order, partial retries, stack-size-aware drop boundaries and CPU restart/cancellation cases. Legacy queue readers retain opaque fluid bytes. The cable-block additional-drop boundary and non-unit crafting inputs remain separate source gaps.
+
+Four new hidden server-thread fixtures passed: Encoding fake hotkeys, Interface fake hotkeys, a 999,999-item physical processing reservation/queue, and a separate creative-cell grid reached through an unconfigured Interface. The finite job checks exact component identity, a lower-priority multi-stack chest drained before a cell, CPU escrow restart and cancellation, a blocked Provider queue, queue restart and retry of only the accepted 64 items. The creative case verifies the physical remote-grid pass-through and pending quantity after restart. The source large amount is not represented as millions of physical dropped entities.
+
+The existing fluid-template, CPU-capacity and reusable-container worlds also passed on this binary; Encoding fake hotkeys passed in-frame. A new physical save fixture creates a valid component-bearing ingredient whose active CPU job exceeds 65,535 bytes. It checks the real NBT ByteArray and the existence of index 65,535 before and after a full world restart, then cancels and verifies the exact ingredient after another restart. Its first length assertion incorrectly counted the deliberately truncated `/data get` chat; the corrected authoritative index check passed on the same binary. This extends the earlier 4,097-step NBT unit test with real region/save/reload custody; it is not a 4,097-step physical execution test.

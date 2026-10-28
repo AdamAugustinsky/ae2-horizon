@@ -19,7 +19,9 @@ fn physical_record_valid(part:&Tag)->bool {
         if super::ae2_parts::strict_part_items(machine.get("slots"),slot_limit).is_err()
             || super::ae2_parts::strict_part_items(machine.get("upgrades"),upgrade_limit).is_err() {return false}
         if !valid_list(machine.get("config").and_then(|c|c.get("ae2_provider_return_items")),9){return false}
-        if !valid_list(machine.get("config").and_then(|c|c.get("ae2_provider_send_items")),8192){return false}
+        if let Some(Tag::Compound(config))=machine.get("config").filter(|c|c.get(horizon_client::ae2_provider_queue::QUEUE).is_some()) {
+            if horizon_client::ae2_provider_queue::read(config).is_err(){return false}
+        } else if !valid_list(machine.get("config").and_then(|c|c.get("ae2_provider_send_items")),8192){return false}
         if matches!(id.as_str(), "ae2:terminal" | "ae2:crafting_terminal" | "ae2:pattern_encoding_terminal")
             && super::ae2_parts::decode_terminal_view_cells(machine.get("config").and_then(|c| c.get("ae2_view_cells"))).is_err() { return false; }
     }
@@ -40,7 +42,10 @@ impl Game<'_> {
         if !physical_record_valid(&part){return true}
         let mut single=Machine::new(MachineKind::CableBus);
         single.config.insert("parts".into(),Tag::List(vec![part.clone()]));
-        let items=super::spill::ae2_physical_drops(&single);
+        let items=super::spill::ae2_physical_drops_with_max(&single,&|stack| {
+            let default=self.res.items().get(&stack.item).map_or(64,|info|info.max_stack).max(1);
+            super::ae2_formation::max_stack(stack,default)
+        });
         if items.is_empty(){return true} // malformed/unknown parts stay installed
         let before=self.inventory.clone();
         let mut overflow=Vec::new();
@@ -76,6 +81,12 @@ mod tests {
         assert!(physical_record_valid(&part(vec![item])));
         assert!(!physical_record_valid(&part(vec![Tag::compound([("id",Tag::String("minecraft:diamond".into()))])])));
         assert!(!physical_record_valid(&part(vec![horizon_client::save::item_to_nbt(&ItemStack::new("minecraft:diamond",1));8193])));
+        let mut config=Default::default();
+        horizon_client::ae2_provider_queue::write(&mut config,&[horizon_client::ae2_provider_queue::Entry::Item{prototype:ItemStack::new("minecraft:diamond",1),amount:999_999}]).unwrap();
+        let with_queue=|config|Tag::compound([("id",Tag::String("ae2:cable_pattern_provider".into())),("machine",Tag::compound([("config",Tag::Compound(config))]))]);
+        assert!(physical_record_valid(&with_queue(config.clone())));
+        config.insert("ae2_provider_send_items".into(),Tag::List(vec![horizon_client::save::item_to_nbt(&ItemStack::new("minecraft:diamond",1))]));
+        assert!(!physical_record_valid(&with_queue(config)));
     }
     #[test]
     fn malformed_terminal_view_cells_cannot_be_removed() {

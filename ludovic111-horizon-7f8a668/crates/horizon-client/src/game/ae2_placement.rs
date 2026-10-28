@@ -122,7 +122,10 @@ impl Game<'_> {
             // Do not destroy stored energy when the block's loot is unavailable.
             return true;
         }
-        drops.extend(super::spill::ae2_physical_drops(&machine));
+        drops.extend(super::spill::ae2_physical_drops_with_max(&machine,&|stack| {
+            let default=self.res.items().get(&stack.item).map_or(64,|info|info.max_stack).max(1);
+            super::ae2_formation::max_stack(stack,default)
+        }));
         let entity=self.world.block_entities.remove(&key);let block_name=self.world.block_names.remove(&key);
         // A loaded chunk can still retain an older serialized BE. Remove that
         // copy too so generic block-removal fallback cannot spill it a second time.

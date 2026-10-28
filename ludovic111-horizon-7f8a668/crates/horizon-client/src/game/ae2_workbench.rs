@@ -45,6 +45,11 @@ fn workbench_store_filters(machine:&mut horizon_client::ae2_world::Machine,slots
     let entries=horizon_client::ae2_cell_codec::encode_view_filter_slots(slots)?;
     machine.config.insert(WORKBENCH_FILTERS.into(),Tag::List(entries));Ok(())
 }
+// EMPTY_ITEM is a right-click action, not a generic conversion of every
+// bucket placed over a fluid-only filter. Left and drag actions use the item.
+fn workbench_emptying_mode(cell:Option<&ItemStack>,button:i32)->bool {
+    button==1 && cell.is_none_or(|cell|is_fluid(cell) || matches!(cell.item.as_ref(),"ae2:view_cell"|"ae2:creative_storage_cell"))
+}
 fn workbench_filter_allowed(cell:&ItemStack,entry:&Tag)->bool{
     if entry.get("item").is_some() {
         return !is_fluid(cell) && entry.get("item").and_then(horizon_client::save::item_from_nbt)
@@ -145,6 +150,17 @@ mod workbench_template_tests {
     use horizon_client::ae2_world::Machine;
     fn item_filter(id:&str)->Tag{Tag::compound([("item",horizon_client::save::item_to_nbt(&ItemStack::new(id,1)))])}
     fn one(id:&str,slot:usize)->Vec<Option<Tag>>{let mut out=vec![None;63];out[slot]=Some(item_filter(id));out}
+    #[test]
+    fn filled_bucket_is_fluid_only_for_a_right_click_emptying_action() {
+        let cell=ItemStack::new("ae2:fluid_storage_cell_1k",1);
+        let bucket=ItemStack::new("minecraft:water_bucket",1);
+        assert!(!workbench_emptying_mode(Some(&cell),0));
+        assert!(workbench_ghost_from_carried(Some(&cell),&bucket,workbench_emptying_mode(Some(&cell),0),&|_,_|true).is_err());
+        assert!(workbench_emptying_mode(Some(&cell),1));
+        let ghost=workbench_ghost_from_carried(Some(&cell),&bucket,workbench_emptying_mode(Some(&cell),1),&|_,_|true).unwrap();
+        assert_eq!(ghost.get("fluid"),Some(&Tag::String("minecraft:water".into())));
+        assert_eq!(bucket.count,1);
+    }
     #[test]
     fn wrapped_fluid_and_item_filters_use_contents_without_consuming_wrapper() {
         use horizon_client::ae2_generic_stack::{GenericStack,wrap};

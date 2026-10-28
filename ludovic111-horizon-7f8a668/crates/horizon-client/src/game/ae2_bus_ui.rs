@@ -25,9 +25,14 @@ pub(super) struct GuestBus {
     signature: Tag,
     menu: Menu,
     drag: Option<BusDrag>,
+    fake_revisions: std::collections::VecDeque<(i32,usize,usize)>,
+    owner_identity: (u64,[i32;4]),
     emitter_identity: Option<(u64,[i32;4])>,
     emitter_edit: Option<String>,
     energy_edit: Option<EnergyEdit>,
+}
+fn bus_fake_revision_matches(history:&std::collections::VecDeque<(i32,usize,usize)>,state:i32,page:usize,slots:usize)->bool {
+    history.iter().rev().find(|(revision,_,_)|*revision==state).is_some_and(|(_,shown_page,shown_slots)|*shown_page==page && *shown_slots==slots)
 }
 fn face_name(face: u8) -> Option<&'static str> {
     ["east", "west", "up", "down", "south", "north"]
@@ -139,7 +144,8 @@ impl Game<'_> {
         };
         let energy=field(&data,"id").as_deref()==Some("ae2:energy_level_emitter");
         let emitter=energy || field(&data,"id").as_deref()==Some("ae2:level_emitter");
-        let emitter_identity=if emitter {let Some(identity)=self.emitter_ui_identity(pos,&data) else{return false};Some(identity)}else{None};
+        let Some(owner_identity)=self.bus_ui_identity(pos,&data) else{return false};
+        let emitter_identity=if emitter {Some(owner_identity)}else{None};
         let energy_edit=if energy {
             let Ok(state)=super::ae2_emitter::energy_emitter_read(&data) else{return false};
             static NEXT_ENERGY_EDITOR:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
@@ -176,6 +182,8 @@ impl Game<'_> {
             signature,
             menu: if emitter {emitter_session_menu(&data)}else{Menu::new(Kind::Chest(6))},
             drag: None,
+            fake_revisions: std::collections::VecDeque::new(),
+            owner_identity,
             emitter_identity,
             emitter_edit:None,
             energy_edit:energy_edit.clone(),
@@ -276,12 +284,16 @@ impl Game<'_> {
         }
         items.extend((9..36).chain(0..9).map(|i| g.inventory[i].clone()));
         let carried = g.carried.clone();
+        let fake:Vec<u8>=(0..state.slots().saturating_sub(page*36).min(36)).map(|slot|slot as u8).collect();
+        Self::lan_ae2_fake_slots(host,conn,window,&fake);
         let Some(s) = host.play.get_mut(&conn).and_then(|p| p.ae2_bus.as_mut()) else {
             return;
         };
         s.signature = stable(&data).unwrap();
         s.state = (s.state + 1) & 0x7fff;
         let next = s.state;
+        s.fake_revisions.push_back((next,page,state.slots()));
+        while s.fake_revisions.len()>64 {s.fake_revisions.pop_front();}
         let items = items.iter().map(|v| host.hub.stack(v)).collect();
         let carried = host.hub.stack(&carried);
         host.hub.send_to(
@@ -340,7 +352,7 @@ impl Game<'_> {
             );
             return true;
         }
-        if session.emitter_identity.is_some() && self.emitter_ui_identity(session.pos,&data)!=session.emitter_identity {
+        if self.bus_ui_identity(session.pos,&data)!=Some(session.owner_identity) {
             host.play.entry(conn).or_default().ae2_bus=Some(session);
             self.lan_ae2_bus_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:p.container}));return true;
         }
@@ -356,8 +368,9 @@ impl Game<'_> {
             if field(&data,"id").as_deref()==Some("ae2:energy_level_emitter") {return self.lan_ae2_energy_emitter_click(host,conn,gi,p,session,data);}
             return self.lan_ae2_emitter_click(host,conn,gi,p,session,data);
         }
-        let input = super::lan_crafting::input(p.input);
         let slot = p.slot as usize;
+        let raw_input=super::lan_crafting::input(p.input);
+        let input=if slot<36 && raw_input==Input::QuickMove {Input::Pickup}else{raw_input};
         if input == Input::QuickCraft {
             let stage = i32::from(p.button) & 3;
             let mode = (i32::from(p.button) >> 2) & 3;
@@ -528,7 +541,8 @@ impl Game<'_> {
             self.lan_send_ae2_bus(host, conn);
             return true;
         }
-        if input != Input::Pickup || !(0..=1).contains(&p.button) {
+        if input != Input::Pickup || (!(0..=1).contains(&p.button)
+            && !(matches!(p.button,2|3) && slot<36 && host.hub.guests[gi].carried.is_some())) {
             host.play.entry(conn).or_default().ae2_bus = Some(session);
             self.lan_send_ae2_bus(host, conn);
             return true;
@@ -542,6 +556,9 @@ impl Game<'_> {
                 return true;
             }
         };
+        if slot<36 && !bus_fake_revision_matches(&session.fake_revisions,p.state,session.page,state.slots()) {
+            host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_send_ae2_bus(host,conn);return true;
+        }
         let mut changed = false;
         if slot < 36 {
             let index = session.page * 36 + slot;
@@ -754,9 +771,10 @@ impl Game<'_> {
                     !g.spectator() && g.within_block_range([pos.0, pos.1, pos.2], 4.0)
                 });
             let data=self.bus_ui_read(pos,face);
+            let session_owner=host.play.get(&conn).and_then(|p|p.ae2_bus.as_ref()).map(|s|s.owner_identity);
             let identity=host.play.get(&conn).and_then(|p|p.ae2_bus.as_ref()).and_then(|s|s.emitter_identity);
             if dim != self.dim.id() || !in_range || data.is_none()
-                || identity.is_some_and(|old|data.as_ref().and_then(|v|self.emitter_ui_identity(pos,v))!=Some(old)) {
+                || session_owner.is_none_or(|old|data.as_ref().and_then(|v|self.bus_ui_identity(pos,v))!=Some(old)) {
                 self.lan_ae2_bus_closed(host, conn, None);
                 host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose { container: window }));continue;
             }
@@ -796,7 +814,7 @@ impl Game<'_> {
             self.ae2_emitter_provider_refresh(super::ae2_parts::PartAddress{host,face});
         }
     }
-    fn emitter_ui_identity(&self,pos:Pos,data:&Compound)->Option<(u64,[i32;4])> {
+    fn bus_ui_identity(&self,pos:Pos,data:&Compound)->Option<(u64,[i32;4])> {
         let host=self.world.block_entities.incarnation(&pos)?;
         let part=super::ae2_channels::part_identity(&Tag::Compound(data.clone()))?;
         Some((host,part))
@@ -812,6 +830,7 @@ impl Game<'_> {
         let fuzzy=emitter_card(&state,"ae2:fuzzy_card");
         let fluid=matches!(state.filter.as_ref(),Some(EmitterFilter::Fluid(_)));
         let mut items=vec![None;54];
+        let editing=edit.is_some();
         if let Some(edit)=edit {
             for digit in 0..10 {items[digit]=icon(format!("Threshold digit {digit}"));}
             items[10]=icon("Backspace threshold".into());
@@ -842,6 +861,7 @@ impl Game<'_> {
         }
         items.extend((9..36).chain(0..9).map(|i|g.inventory[i].clone()));
         let carried=g.carried.clone();
+        Self::lan_ae2_fake_slots(host,conn,window,if editing {&[]}else{&[0]});
         let Some(session)=host.play.get_mut(&conn).and_then(|p|p.ae2_bus.as_mut()) else{return};
         let Some(signature)=stable(&data) else{return};
         session.signature=signature;session.state=(session.state+1)&0x7fff;
@@ -1070,7 +1090,7 @@ impl Game<'_> {
         let valid=host.hub.here(&host.hub.guests[gi]) && !host.hub.guests[gi].spectator()
             && host.hub.guests[gi].within_block_range([session.pos.0,session.pos.1,session.pos.2],4.0)
             && session.dim==self.dim.id() && data.as_ref().is_some_and(|data|
-                field(data,"id").as_deref()==Some("ae2:energy_level_emitter") && self.emitter_ui_identity(session.pos,data)==session.emitter_identity);
+                field(data,"id").as_deref()==Some("ae2:energy_level_emitter") && self.bus_ui_identity(session.pos,data)==session.emitter_identity);
         if !valid {
             let window=session.window;host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_ae2_bus_closed(host,conn,None);
             host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));return true;
@@ -1101,6 +1121,15 @@ impl Game<'_> {
 
 #[cfg(test)]
 mod emitter_menu_tests {
+    #[test]
+    fn fake_action_revision_checks_page_and_enabled_slot_count() {
+        use super::bus_fake_revision_matches;
+        let history=std::collections::VecDeque::from([(5,0,9),(6,0,9),(7,1,63)]);
+        assert!(bus_fake_revision_matches(&history,5,0,9));
+        assert!(!bus_fake_revision_matches(&history,5,1,9));
+        assert!(!bus_fake_revision_matches(&history,5,0,18));
+        assert!(!bus_fake_revision_matches(&history,4,0,9));
+    }
     use super::*;
     #[test]
     fn number_entry_energy_wire_and_limits() {

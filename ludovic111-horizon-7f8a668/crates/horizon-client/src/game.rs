@@ -1501,6 +1501,8 @@ struct Game<'a> {
     craft_table: Option<[i32; 3]>,
     /// A quick craft drag over inventory slots: (button, game slots so far).
     inv_drag: Option<(i32, Vec<usize>)>,
+    #[cfg(feature="ae2-lab")]
+    ae2_fake_drag: Vec<usize>,
     /// `AbstractContainerScreen`'s quick craft and skip-release state.
     inv_clicks: horizon_client::container_screen::Clicks,
     /// The Mouse Tweaks extra's drag and wheel (`tweaks`).
@@ -5615,6 +5617,8 @@ impl Game<'_> {
     /// model take every slot.
     fn quick_craft_accepts(&mut self, slot: usize, ty: i32, dragged: usize) -> bool {
         #[cfg(feature="ae2-lab")]
+        if self.ae2_is_fake_slot(slot) {return self.carried.is_some();}
+        #[cfg(feature="ae2-lab")]
         if self.ae2_local_crafting_terminal_open() {
             if !(slot<36 || (327..=335).contains(&slot)) {return false;}
             let Some(carried)=self.carried.clone() else{return false;};
@@ -6544,6 +6548,8 @@ impl Game<'_> {
     pub(super) fn reset_inventory_clicks(&mut self) {
         self.inv_clicks = Default::default();
         self.inv_drag = None;
+        #[cfg(feature="ae2-lab")]
+        self.ae2_fake_drag.clear();
         self.last_inv_click = None;
     }
     pub(super) fn close_container(&mut self) {
@@ -7310,6 +7316,8 @@ impl Game<'_> {
     /// The plain inventory mouse press: starts a quick craft drag when a
     /// stack is held, gathers on a double click, else the normal click.
     fn inventory_press(&mut self, right: bool) {
+        #[cfg(feature="ae2-lab")]
+        self.ae2_fake_drag.clear();
         use horizon_client::container_screen::Target;
         use horizon_client::menu::Input;
         #[cfg(feature = "ae2-lab")]
@@ -7422,6 +7430,10 @@ impl Game<'_> {
                     last == slot && !was_right && now.duration_since(at).as_millis() < 250
                 });
             self.last_inv_click = Some((now, slot, right));
+            // AEBaseScreen intercepts FakeSlot clicks before vanilla's
+            // double-click pickup-all behavior.
+            #[cfg(feature="ae2-lab")]
+            let double=double && !self.ae2_is_fake_slot(slot);
             if double && self.menu_click(Some(slot), 0, Input::PickupAll) {
                 self.last_inv_click = None;
                 // The double click's own release (`mouseReleased`'s PICKUP_ALL).
@@ -7478,6 +7490,16 @@ impl Game<'_> {
             return;
         };
         let batch = self.screen_batch([r.config.width, r.config.height]);
+        #[cfg(feature="ae2-lab")]
+        if let Some(slot)=self.slot_at(&batch,self.cursor.0,self.cursor.1) {
+            if self.carried.is_some() && self.ae2_is_fake_slot(slot) {
+                if !self.ae2_fake_drag.contains(&slot) {self.ae2_fake_drag.push(slot);}
+                if self.ae2_fake_drag.len()>1 {
+                    for target in self.ae2_fake_drag.clone() {self.ae2_fake_drag_action(target,ty!=0);}
+                }
+                return;
+            }
+        }
         if let Some(slot) = self.slot_at(&batch, self.cursor.0, self.cursor.1)
             && slot != 200
             && slot < Creative::DISPLAY
@@ -7625,6 +7647,8 @@ impl Game<'_> {
             self.has_shift_down(),
             false,
         );
+        #[cfg(feature="ae2-lab")]
+        if std::mem::take(&mut self.ae2_fake_drag).len()>1 {self.inv_drag=None;return;}
         match (release, Target::of(slot, outside)) {
             (Release::QuickCraft, _) => self.inventory_release(),
             (Release::Click(input), Target::Outside) => {
@@ -7651,6 +7675,8 @@ impl Game<'_> {
     /// 2 that fills every slot it crosses; without infinite materials the
     /// press does nothing.
     fn inventory_pick_press(&mut self) {
+        #[cfg(feature="ae2-lab")]
+        self.ae2_fake_drag.clear();
         use horizon_client::container_screen::{Button, Target};
         let (slot, outside) = self.inventory_target();
         let was_crafting = self.inv_clicks.quick_crafting().is_some();
@@ -7691,6 +7717,8 @@ impl Game<'_> {
             self.has_shift_down(),
             true,
         );
+        #[cfg(feature="ae2-lab")]
+        if std::mem::take(&mut self.ae2_fake_drag).len()>1 {self.inv_drag=None;return;}
         match (release, slot) {
             (Release::QuickCraft, _) => self.inventory_release(),
             (Release::Click(input), Some(slot)) if !outside => {
@@ -13463,6 +13491,8 @@ impl<'a> Game<'a> {
             craft_size: 2,
             craft_table: None,
             inv_drag: None,
+            #[cfg(feature="ae2-lab")]
+            ae2_fake_drag: Vec::new(),
             tweaks: Default::default(),
             inv_clicks: Default::default(),
             last_inv_click: None,

@@ -1288,6 +1288,37 @@ impl Game<'_> {
         }
         result
     }
+    /// Aggregate variant for CPU reservations. The same forwarding guard
+    /// protects pass-through networks; stocked interfaces retain exact keys.
+    pub(super) fn ae2_interface_item_extract_bulk_staged(
+        &mut self, host: GridAddress, face: horizon_core::geometry::Direction,
+        key: &ItemKey, limit: u64, plan: &mut super::ae2_buses::FormationPlan,
+    ) -> Option<Result<u64, String>> {
+        let owner = self.interface_owner_at(host, face)?;
+        let mut machine = self.interface_get(owner)?;
+        let config = match interface_config(&machine) { Ok(v) => v, Err(e) => return Some(Err(e)) };
+        let fluid_config = match interface_fluid_config(&machine) { Ok(v) => v, Err(e) => return Some(Err(e)) };
+        let _guard = ForwardGuard::enter(owner)?;
+        if config.iter().all(Option::is_none) && fluid_config.iter().all(Option::is_none) {
+            return Some(self.ae2_grid_extract_bulk_staged_encoded(host, key, limit, false, false, plan));
+        }
+        let filter = match ae2_lab::prototype(key) { Ok(v) => v, Err(e) => return Some(Err(e)) };
+        let mut left = limit;
+        for slot in &mut machine.slots {
+            let Some(item) = slot.as_mut() else { continue };
+            if !filter.same_item_same_components(item) { continue; }
+            let n = left.min(u64::from(item.count));
+            item.count -= n as u32;
+            left -= n;
+            if item.count == 0 { *slot = None; }
+            if left == 0 { break; }
+        }
+        if left < limit {
+            wake_interface(&mut machine);
+            if let Err(error) = self.interface_store(owner, &machine) { return Some(Err(error)); }
+        }
+        Some(Ok(limit - left))
+    }
     pub(super) fn ae2_interface_item_extract_staged(
         &mut self, host: GridAddress, face: horizon_core::geometry::Direction,
         limit: u32, filter: Option<&ItemStack>, simulate: bool,

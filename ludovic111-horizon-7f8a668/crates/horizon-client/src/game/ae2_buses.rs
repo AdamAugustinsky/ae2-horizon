@@ -1209,7 +1209,7 @@ impl Game<'_> {
                 };
                 let target_exists = self.ae2_has_interface_face(target, target_side)
                     || if fluid {
-                        matches!(self.ae2_block_entity(target),Some(BlockEntity::Ae2(m)) if m.kind==MachineKind::SkyStoneTank)
+                        matches!(self.ae2_block_entity(target),Some(BlockEntity::Ae2(m)) if matches!(m.kind,MachineKind::SkyStoneTank|MachineKind::Condenser))
                     } else {
                         self.ae2_native_container_supports(target, target_side)
                     };
@@ -1409,6 +1409,29 @@ impl Game<'_> {
         if !changed.is_empty() { self.ae2_monitor_invalidate(mount.identity); }
         plan.actions.extend(changed.into_iter().map(|(address, incarnation)| FormationAction::ContainerChanged { address, incarnation }));
         Ok(out)
+    }
+
+    /// Aggregate reservations use the same mount access rules and drain a
+    /// complete external mount before advancing through grid priorities.
+    pub(super) fn ae2_storage_extract_bulk(
+        &mut self, mount: &StorageMount, key: &ae2_cell_core::ItemKey,
+        amount: u64, plan: &mut FormationPlan,
+    ) -> Result<u64, String> {
+        if !mount.allows(&Key::from(key), true) { return Ok(0); }
+        if self.ae2_has_interface_face(mount.target, mount.face) {
+            if !self.ae2_interface_mount_allowed(mount.target, mount.face, false) { return Ok(0); }
+            return self.ae2_interface_item_extract_bulk_staged(mount.target, mount.face, key, amount, plan)
+                .unwrap_or_else(|| Ok(0));
+        }
+        let mut left = amount;
+        while left > 0 {
+            let Some(stack) = self.ae2_storage_extract(mount, key, left, false, plan)? else { break };
+            let moved = u64::from(stack.count);
+            if moved == 0 { break; }
+            if moved > left { return Err("storage mount exceeded requested extraction".into()); }
+            left -= moved;
+        }
+        Ok(amount - left)
     }
 
     /// Enumerates exact-filtered storage bus slots on one cable bus. The grid
@@ -1805,7 +1828,7 @@ impl Game<'_> {
                     let block=self.world.block(front.0,front.1,front.2);
                     let facts=self.res.facts().get(block);
                     let eligible=facts.hardness>=0.0 && !matches!(facts.name.as_ref(),"minecraft:air"|"minecraft:cave_air"|"minecraft:void_air"|"minecraft:water"|"minecraft:lava")
-                        && !self.world.block_entities.contains_key(&front)
+                        && self.ae2_plane_supported_target(front)
                         && !self.res.items().block_in_tag("ae2:blacklisted/annihilation_plane",&facts.name);
                     let token=format!("{}:{online}:{eligible}",block.0);
                     data.remove(&"plane_next_tick".into());
@@ -2233,11 +2256,43 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
+    /// The host's live vanilla container name is plain text. A saved rich
+    /// name cannot be copied without an identity-aware raw-name association.
+    fn ae2_plane_plain_name_supported(&self,target:(i32,i32,i32))->bool {
+        fn structured_name(tag:Option<&Tag>)->bool {
+            match tag {
+                Some(Tag::Compound(_) | Tag::List(_))=>true,
+                Some(Tag::String(name))=>{
+                    let name=name.to_string_lossy();
+                    name.starts_with('{') || name.starts_with('[')
+                },
+                _=>false,
+            }
+        }
+        let Some(extras)=self.world.chunks.get(&(target.0>>4,target.2>>4)).and_then(|chunk|chunk.saved.as_deref()) else{return true};
+        extras.block_entity_sources.iter().filter(|(pos,_)|*pos==target).all(|(_,tag)|
+            !structured_name(tag.get("CustomName"))
+                && !structured_name(tag.get("components").and_then(|c|c.get("minecraft:custom_name"))))
+    }
+    /// Vanilla chest and furnace removals have modeled physical spill and
+    /// loot-data paths. Other BEs remain guarded until their extra drops and
+    /// component-bearing block loot are modeled.
+    fn ae2_plane_supported_target(&self,target:(i32,i32,i32))->bool {
+        match self.world.block_entities.get(&target) {
+            Some(BlockEntity::Chest(_))=>self.ae2_plane_plain_name_supported(target) && matches!(
+                self.res.facts().get(self.world.block(target.0,target.1,target.2)).name.as_ref(),
+                "minecraft:chest" | "minecraft:trapped_chest"
+            ),
+            Some(BlockEntity::Furnace(_))=>self.ae2_plane_plain_name_supported(target),
+            Some(_)=>false,
+            None=>super::spill::saved_entity(&self.world,[target.0,target.1,target.2]).is_none(),
+        }
+    }
     /// Item pickup strategy, source ItemPickupStrategy: select the
     /// appropriate diamond fake tool, evaluate actual loot, preflight network
     /// capacity and energy, destroy without default drops, then insert the
     /// evaluated items; any unexpected overflow becomes a real item entity.
-    /// Blocks with entities are deliberately deferred.
+    /// Live vanilla chests and furnaces preserve their physical contents.
     fn ae2_plane_pickup_block(
         &mut self,
         pos: (i32, i32, i32),
@@ -2248,9 +2303,7 @@ impl Game<'_> {
         let Some(target) = target(pos, face) else {
             return Ok(false);
         };
-        if self.world.block_entities.contains_key(&target)
-            || super::spill::saved_entity(&self.world, [target.0, target.1, target.2]).is_some()
-        {
+        if !self.ae2_plane_supported_target(target) {
             return Ok(false);
         }
         let state = self.world.block(target.0, target.1, target.2);
@@ -2292,13 +2345,25 @@ impl Game<'_> {
                 tool.enchant(id, *level);
             }
         }
-        let drops = self.res.items().block_drops_in(
-            self.pack.assets.registry,
-            state,
-            tool.as_ref(),
-            &mut self.world.random,
-            Some((&mut self.rand_sequences, self.level.seed)),
-        );
+        let at=[target.0,target.1,target.2];
+        let mut drops = if let Some(entity)=self.world.block_entities.get(&target).cloned() {
+            self.pending.record(at,&entity,&facts.name,self.world.block_names.get(&target).cloned());
+            let mut drops=self.block_loot_at(at,state,tool.as_ref());
+            for stack in &mut drops {self.pending.attach(at,stack);}
+            self.pending.clear(at);
+            drops
+        } else {
+            self.res.items().block_drops_in(
+                self.pack.assets.registry,
+                state,
+                tool.as_ref(),
+                &mut self.world.random,
+                Some((&mut self.rand_sequences, self.level.seed)),
+            )
+        };
+        // ItemPickupStrategy.obtainBlockDrops filters the empty stacks that
+        // can be produced by a loot table before energy and capacity checks.
+        drops.retain(|stack|stack.count>0 && stack.item.as_ref()!="minecraft:air");
         let efficiency = plane.map_or(0, |s| s.enchantment_level("minecraft:efficiency"));
         let unbreaking = plane.map_or(0, |s| s.enchantment_level("minecraft:unbreaking"));
         let other = enchantments
@@ -2339,6 +2404,23 @@ impl Game<'_> {
         if !self.with_level(|b, level, ticks| b.destroy_block(level, ticks, block, false)) {
             return Ok(false);
         }
+        // Source breakBlockAndStoreExtraItems captures all item entities in
+        // the target block AABB inflated by 0.2, including spilled contents.
+        let extra:Vec<_>=self.dropped.iter().filter(|e|{
+            let p=e.position;
+            p.x+0.125>f64::from(target.0)-0.2 && p.x-0.125<f64::from(target.0)+1.2
+                && p.y+0.25>f64::from(target.1)-0.2 && p.y<f64::from(target.1)+1.2
+                && p.z+0.125>f64::from(target.2)-0.2 && p.z-0.125<f64::from(target.2)+1.2
+        }).map(|e|(e.id,e.stack.clone())).collect();
+        for (id,stack) in extra {
+            let inserted=self.ae2_grid_insert(pos,&stack,u64::from(stack.count)).unwrap_or(0).min(u64::from(stack.count)) as u32;
+            if inserted>0 {
+                if let Some(entity)=self.dropped.iter_mut().find(|entity|entity.id==id && entity.stack.same_item_same_components(&stack)) {
+                    entity.stack.count=entity.stack.count.saturating_sub(inserted);
+                }
+            }
+        }
+        self.dropped.retain(|e|e.stack.count>0);
         for mut stack in drops {
             let inserted = self
                 .ae2_grid_insert(pos, &stack, u64::from(stack.count))

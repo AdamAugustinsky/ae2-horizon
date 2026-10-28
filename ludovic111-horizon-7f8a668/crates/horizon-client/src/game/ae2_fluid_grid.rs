@@ -45,7 +45,10 @@ impl Game<'_> {
         }
         for mount in self.ae2_fluid_storage_mounts_encoded(pos) {
             let entries =
-                if let Some(entries) = self.ae2_interface_fluid_entries(mount.target, mount.face) {
+                if matches!(self.ae2_block_entity(mount.target),Some(BlockEntity::Ae2(machine)) if machine.kind==horizon_client::ae2_world::MachineKind::Condenser) {
+                    // CondenserMEStorage exposes output items, but no fluids.
+                    Vec::new()
+                } else if let Some(entries) = self.ae2_interface_fluid_entries(mount.target, mount.face) {
                     entries
                 } else {
                     self.ae2_monitor_read(&mount)?.1
@@ -265,7 +268,12 @@ impl Game<'_> {
     /// Keep the existing interface and tank transaction rules behind one
     /// storage operation while priority/preferred passes choose its order.
     fn ae2_fluid_mount_change(&mut self,mount:&super::ae2_buses::StorageMount,key:&ItemKey,amount:u64,insert:bool,simulate:bool)->Result<(u64,Option<TankChange>),String>{
-        if self.ae2_has_interface_face(mount.target,mount.face){
+        if matches!(self.ae2_block_entity(mount.target),Some(BlockEntity::Ae2(machine)) if machine.kind==horizon_client::ae2_world::MachineKind::Condenser) {
+            if !mount.allows(&ae2_machines_core::Key::from(key),!insert){return Ok((0,None))}
+            let moved=if insert {self.ae2_condenser_me_fluid_insert_at(mount.target,amount,simulate)}else{0};
+            if moved>0 && !simulate {self.ae2_monitor_invalidate(mount.identity);}
+            Ok((if insert&&mount.void_overflow{amount}else{moved},None))
+        }else if self.ae2_has_interface_face(mount.target,mount.face){
             if !mount.allows(&ae2_machines_core::Key::from(key),!insert)||!self.ae2_interface_mount_allowed(mount.target,mount.face,insert){return Ok((0,None))}
             let moved=self.ae2_interface_fluid_move(mount.target,mount.face,key,amount,insert,simulate).unwrap_or(0);
             Ok((if insert&&mount.void_overflow{amount}else{moved},None))

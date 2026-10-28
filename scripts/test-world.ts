@@ -20,9 +20,13 @@ const suites = [
   'crafting-large-substitutions', 'wrapped-player-inventory', 'crafting-substitute-container', 'quantum-three-frame-unload',
   'facade-materials', 'crafting-fluid-template', 'encoding-fake-gestures',
   'interface-stock-editor', 'anchor-grid-chunk-events', 'quantum-forced-ready', 'encoding-processing-amount', 'source-wrapped-crafting-input',
+  'machine-menu-identity', 'encoding-fake-drag', 'fake-slot-drag-machines',
+  'annihilation-container-custody', 'annihilation-container-overflow',
+  'provider-condenser-fluid', 'storage-bus-condenser-fluid',
+  'encoding-fake-hotkeys', 'interface-fake-hotkeys', 'processing-large-provider-queue', 'processing-creative-interface', 'crafting-large-job-persistence',
 ];
 // Explicitly selectable before-cases, not part of the default passing checkpoint.
-const pending = new Set(['quantum-forced-ready', 'source-wrapped-crafting-input']);
+const pending = new Set(['quantum-forced-ready']);
 if (!help('Usage: bun run scripts/test-world.ts [--build METADATA.json] [--content DIRECTORY] [--in-frame] [SUITE ...]\nRuns only hidden, isolated fixtures, sequentially under a host rendering lease.\nSuites: ' + suites.join(', '))) {
   const args = process.argv.slice(2), selected: string[] = [], env = { ...process.env };
   let inFrame = false;

@@ -21,11 +21,64 @@ use horizon_world::{
 };
 use std::collections::HashMap;
 
+/// Source AEItemKey.addDrops creates natural-size stacks until the shared
+/// drop list already contains more than 1000 stacks. Fluids produce no item.
+#[cfg(feature = "ae2-lab")]
+fn append_ae2_key_drops(out:&mut Vec<ItemStack>,prototype:&ItemStack,mut amount:u64,max:&impl Fn(&ItemStack)->u32) {
+    let limit=u64::from(max(prototype).max(1));
+    while amount>0 && out.len()<=1000 {
+        let count=amount.min(limit);out.push(ItemStack{count:count as u32,..prototype.clone()});amount-=count;
+    }
+    if amount>0 {log::warn!("AE2 source drop limit omitted {amount} of {}",prototype.item);}
+}
+#[cfg(feature = "ae2-lab")]
+fn append_provider_custody(out:&mut Vec<ItemStack>,config:&horizon_world::nbt::Compound,max:&impl Fn(&ItemStack)->u32) {
+    if config.contains_key(&horizon_client::ae2_provider_queue::QUEUE.into()) {
+        if let Ok(entries)=horizon_client::ae2_provider_queue::read(config) {
+            for entry in entries {
+                if let horizon_client::ae2_provider_queue::Entry::Item{prototype,amount}=entry {append_ae2_key_drops(out,&prototype,amount,max);}
+            }
+        }
+    } else if let Some(Tag::List(entries))=config.get(&"ae2_provider_send_items".into()) {
+        if entries.len()<=8192 {
+            for entry in entries {
+                if matches!(entry.get("count"),Some(Tag::Int(n)) if *n>0) {
+                    if let Some(item)=horizon_client::save::item_from_nbt(entry) {append_ae2_key_drops(out,&item,u64::from(item.count),max);}
+                }
+            }
+        }
+    }
+    if let Some(Tag::List(entries))=config.get(&"ae2_provider_return_items".into()) {
+        for entry in entries.iter().take(9) {
+            if matches!(entry.get("count"),Some(Tag::Int(n)) if *n>0) {
+                if let Some(item)=horizon_client::save::item_from_nbt(entry) {append_ae2_key_drops(out,&item,u64::from(item.count),max);}
+            }
+        }
+    }
+}
 /// Physical machine slots and installed parts only. Terminal listings are
 /// virtual and never stored in these slots. Cable type is not recorded yet.
 #[cfg(feature = "ae2-lab")]
-pub(super) fn ae2_physical_drops(machine: &horizon_client::ae2_world::Machine) -> Vec<ItemStack> {
-    let mut out: Vec<ItemStack> = machine.physical_contents();
+pub(super) fn ae2_physical_drops_with_max(machine:&horizon_client::ae2_world::Machine,max:&impl Fn(&ItemStack)->u32)->Vec<ItemStack> {
+    use horizon_client::ae2_world::MachineKind;
+    let mut out=machine.physical_slots_and_upgrades();
+    if matches!(machine.kind,MachineKind::CraftingUnit|MachineKind::CraftingAccelerator|MachineKind::CraftingStorage1k|MachineKind::CraftingStorage4k|MachineKind::CraftingStorage16k|MachineKind::CraftingStorage64k|MachineKind::CraftingStorage256k|MachineKind::CraftingMonitor) {
+        let mut counts=std::collections::BTreeMap::<String,(ItemStack,u64)>::new();
+        if let Some(Tag::List(entries))=machine.config.get(&"ae2_cpu_escrow".into()) {
+            for entry in entries {
+                if !matches!(entry.get("count"),Some(Tag::Int(n)) if *n>0) {continue;}
+                let Some(mut item)=horizon_client::save::item_from_nbt(entry) else{continue;};
+                let amount=u64::from(item.count);item.count=1;
+                let key=horizon_client::item_data::canon_stack(Some(&item));
+                let value=counts.entry(key).or_insert((item,0));value.1=value.1.saturating_add(amount);
+            }
+        }
+        // CraftingBlockEntity uses a fresh drop list for each key.
+        for (_, (item,amount)) in counts {
+            let mut key_drops=Vec::new();append_ae2_key_drops(&mut key_drops,&item,amount,max);out.extend(key_drops);
+        }
+    }
+    if machine.kind==MachineKind::PatternProvider {append_provider_custody(&mut out,&machine.config,max);}
     if machine.kind == horizon_client::ae2_world::MachineKind::CableBus {
         let cable = machine
             .config
@@ -130,22 +183,7 @@ pub(super) fn ae2_physical_drops(machine: &horizon_client::ae2_world::Machine) -
                         }
                     }
                     if id=="ae2:cable_pattern_provider" {
-                        if let Some(Tag::List(entries))=machine.get("config").and_then(|c|c.get("ae2_provider_return_items")) {
-                            for entry in entries.iter().take(9) {
-                                if matches!(entry.get("count"),Some(Tag::Int(n)) if *n>0) {
-                                    if let Some(stack)=horizon_client::save::item_from_nbt(entry){out.push(stack);}
-                                }
-                            }
-                        }
-                        if let Some(Tag::List(entries))=machine.get("config").and_then(|c|c.get("ae2_provider_send_items")) {
-                            if entries.len()<=8192 {
-                                for entry in entries {
-                                    if matches!(entry.get("count"),Some(Tag::Int(n)) if *n>0) {
-                                        if let Some(stack)=horizon_client::save::item_from_nbt(entry){out.push(stack);}
-                                    }
-                                }
-                            }
-                        }
+                        if let Some(Tag::Compound(config))=machine.get("config") {append_provider_custody(&mut out,config,max);}
                     }
                 }
             }
@@ -180,6 +218,10 @@ pub(super) fn ae2_physical_drops(machine: &horizon_client::ae2_world::Machine) -
         }
     }
     out
+}
+#[cfg(all(feature="ae2-lab",test))]
+fn ae2_physical_drops(machine:&horizon_client::ae2_world::Machine)->Vec<ItemStack> {
+    ae2_physical_drops_with_max(machine,&|_|64)
 }
 
 /// Cable bus is a multipart host, not an additional physical block item.
@@ -572,9 +614,11 @@ impl GameLevel<'_> {
         if side_effects {
             #[cfg(feature = "ae2-lab")]
             if let Some(BlockEntity::Ae2(machine)) = &entity {
-                for stack in ae2_physical_drops(machine) {
-                    self.drop_item_stack(pos, Some(stack));
-                }
+                let drops=ae2_physical_drops_with_max(machine,&|stack| {
+                    let default=self.items.get(&stack.item).map_or(64,|info|info.max_stack).max(1);
+                    super::ae2_formation::max_stack(stack,default)
+                });
+                for stack in drops {self.drop_item_stack(pos,Some(stack));}
             }
             match kind {
                 PreRemove::Contents { slots, furnace } => {
@@ -729,9 +773,11 @@ impl GameLevel<'_> {
         if let Some((_, BlockEntity::Ae2(machine))) =
             horizon_client::save::decode_block_entity(&tag)
         {
-            for stack in ae2_physical_drops(&machine) {
-                self.drop_item_stack(pos, Some(stack));
-            }
+            let drops=ae2_physical_drops_with_max(&machine,&|stack| {
+                let default=self.items.get(&stack.item).map_or(64,|info|info.max_stack).max(1);
+                super::ae2_formation::max_stack(stack,default)
+            });
+            for stack in drops {self.drop_item_stack(pos,Some(stack));}
             return true;
         }
         let name = self.facts.get(old).name.clone();
@@ -823,6 +869,36 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature="ae2-lab")]
+    #[test]
+    fn ae2_provider_drop_limit_is_shared_across_entries_and_return_inventory() {
+        use horizon_client::{ae2_provider_queue::{self,Entry},ae2_world::{Machine,MachineKind}};
+        let mut provider=Machine::new(MachineKind::PatternProvider);
+        provider.slots[0]=Some(ItemStack::new("ae2:processing_pattern",1));
+        let first=ItemStack::new("minecraft:stone",1);let second=ItemStack::new("minecraft:diamond",1);
+        ae2_provider_queue::write(&mut provider.config,&[
+            Entry::Item{prototype:first.clone(),amount:999*64},Entry::Item{prototype:second.clone(),amount:129},
+        ]).unwrap();
+        provider.config.insert("ae2_provider_return_items".into(),Tag::List(vec![horizon_client::save::item_to_nbt(&ItemStack::new("minecraft:emerald",1))]));
+        let drops=ae2_physical_drops_with_max(&provider,&|_|64);
+        assert_eq!(drops.len(),1001);assert_eq!(drops[0].item.as_ref(),"ae2:processing_pattern");
+        assert_eq!(drops.iter().filter(|item|item.same_item_same_components(&first)).map(|item|u64::from(item.count)).sum::<u64>(),999*64);
+        assert_eq!(drops.iter().filter(|item|item.same_item_same_components(&second)).map(|item|u64::from(item.count)).sum::<u64>(),64);
+        assert!(!drops.iter().any(|item|item.item.as_ref()=="minecraft:emerald"));
+    }
+    #[cfg(feature="ae2-lab")]
+    #[test]
+    fn ae2_cpu_drop_limit_uses_a_fresh_list_per_exact_key_and_max_stack() {
+        use horizon_client::ae2_world::{Machine,MachineKind};
+        let mut cpu=Machine::new(MachineKind::CraftingStorage256k);
+        let mut first=ItemStack::new("minecraft:stone",2_002);first.data_mut().custom_name=Some("one".into());
+        let mut second=ItemStack::new("minecraft:stone",2_002);second.data_mut().custom_name=Some("two".into());
+        cpu.config.insert("ae2_cpu_escrow".into(),Tag::List(vec![horizon_client::save::item_to_nbt(&first),horizon_client::save::item_to_nbt(&second)]));
+        let drops=ae2_physical_drops_with_max(&cpu,&|_|2);
+        assert_eq!(drops.len(),2_002);assert!(drops.iter().all(|item|item.count==2));
+        assert_eq!(drops.iter().filter(|item|item.same_item_same_components(&first)).count(),1_001);
+        assert_eq!(drops.iter().filter(|item|item.same_item_same_components(&second)).count(),1_001);
+    }
     use horizon_client::{block_entity_item, item_data, mobs::raider, save};
     use horizon_world::nbt::Tag;
 
@@ -922,7 +998,18 @@ mod tests {
             ("machine",Tag::compound([("slots",Tag::List(vec![])),("upgrades",Tag::List(vec![])),
                 ("config",Tag::compound([("ae2_provider_return_items",Tag::List(vec![save::item_to_nbt(&physical)])),("ae2_provider_send_items",Tag::List(vec![save::item_to_nbt(&sending)])),("ae2_provider_send_fluids",Tag::List(vec![Tag::compound([("fluid",Tag::String("minecraft:water".into()))])]))]))])),
         ])]));
-        assert_eq!(ae2_physical_drops(&nested),vec![ItemStack::new("ae2:cable_pattern_provider",1),physical,sending]);
+        assert_eq!(ae2_physical_drops(&nested),vec![ItemStack::new("ae2:cable_pattern_provider",1),sending,physical]);
+        let mut queued=ItemStack::new("minecraft:stone",1);
+        queued.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("variant",Tag::String("exact".into()))])));
+        let mut queue_config=Default::default();
+        horizon_client::ae2_provider_queue::write(&mut queue_config,&[horizon_client::ae2_provider_queue::Entry::Item{prototype:queued.clone(),amount:999_999}]).unwrap();
+        nested.config.insert("parts".into(),Tag::List(vec![Tag::compound([
+            ("id",Tag::String("ae2:cable_pattern_provider".into())),
+            ("machine",Tag::compound([("config",Tag::Compound(queue_config))]))
+        ])]));
+        let recovered=ae2_physical_drops(&nested);assert_eq!(recovered.len(),1001);
+        assert_eq!(recovered.iter().skip(1).map(|item|u64::from(item.count)).sum::<u64>(),64_000);
+        assert!(recovered.iter().skip(1).all(|item|item.same_item_same_components(&queued)));
         let mut encoded=ItemStack::new("ae2:crafting_pattern",1);encoded.data_mut().custom_name=Some("physical encoded pattern".into());
         let blank=ItemStack::new("ae2:blank_pattern",3);
         let mut enc_host=Machine::new(MachineKind::CableBus);

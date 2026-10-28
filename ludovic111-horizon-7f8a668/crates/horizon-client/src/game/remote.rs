@@ -174,6 +174,8 @@ pub(super) struct Remote {
     #[cfg(feature = "ae2-lab")]
     ae2_base_screen: bool,
     #[cfg(feature = "ae2-lab")]
+    ae2_fake_slots: Vec<(i16,bool)>,
+    #[cfg(feature = "ae2-lab")]
     ae2_priority_search_backup: Option<horizon_client::ui::EditBox>,
     #[cfg(feature = "ae2-lab")]
     ae2_energy_screen: bool,
@@ -513,6 +515,8 @@ impl Game<'_> {
             ae2_stock_spec: None,
             #[cfg(feature = "ae2-lab")]
             ae2_base_screen: false,
+            #[cfg(feature = "ae2-lab")]
+            ae2_fake_slots: Vec::new(),
             #[cfg(feature = "ae2-lab")]
             ae2_priority_search_backup: None,
             #[cfg(feature = "ae2-lab")]
@@ -1723,6 +1727,17 @@ impl Game<'_> {
                         let window=v.get("window").and_then(|x|x.as_i64());
                         let cells=v.get("cells").and_then(|v|v.as_array()).filter(|v|v.len()==5).and_then(|v|v.iter().map(|s|horizon_client::item_data::parse_stack(s.as_str()?).ok()).collect::<Option<Vec<_>>>());
                         if let (Some(cells),Some(r))=(cells,self.remote.as_mut()) {if window.is_some_and(|w|r.menu.as_ref().is_some_and(|m|i64::from(m.0)==w)) {r.ae2_view_cells=Some(cells);}}
+                    }
+                }
+            }
+            #[cfg(feature = "ae2-lab")]
+            C::CustomPayload(p) if p.channel == "ae2:fake_slots" => {
+                if (4..=94).contains(&p.data.len()) {
+                    if let Ok(bytes)=<&[u8;4]>::try_from(&p.data[..4]) {
+                        let window=i32::from_be_bytes(*bytes);
+                        if let Some(r)=self.remote.as_mut().filter(|r|r.menu.as_ref().is_some_and(|m|m.0==window)) {
+                            r.ae2_fake_slots=p.data[4..].iter().map(|slot|(i16::from(*slot & 0x7f),*slot & 0x80!=0)).collect();
+                        }
                     }
                 }
             }
@@ -5271,6 +5286,26 @@ impl Game<'_> {
             if ae2 && self.slot_view(*slot).is_some_and(|item|item.item.as_ref()=="ae2:wrapped_generic_stack") {return true;}
         }
         #[cfg(feature="ae2-lab")]
+        if let [(Some(slot),button,input)]=ops {
+            if *input!=Input::QuickCraft && self.ae2_is_remote_fake_slot(*slot) {
+                if matches!(*input,Input::Swap|Input::Throw) && self.carried.is_some() {return true;}
+                // checkHotbarKeyPressed sends SwapSlotsPacket for slots whose
+                // source slot limit is not 64. FakeSlot.mayPickup is false,
+                // so that attempted physical swap cannot change either slot.
+                if *input==Input::Swap && *button!=40 && !self.ae2_remote_fake_hotbar_direct(*slot) {return true;}
+                let (window,menu)=self.remote_menu();
+                if let Some(wire)=Self::menu_slot_index(&menu,*slot) {
+                    // AEBaseScreen intercepts all remaining fake-slot click
+                    // types, using the button to choose the fake action. The
+                    // Interface QuickMove is Horizon's stock-editor shortcut.
+                    let (button,input)=if matches!(*input,Input::Pickup|Input::QuickMove) {(*button,*input)}
+                        else {(i32::from(*button==1),Input::Pickup)};
+                    self.send_clicks(window,vec![(wire as i16,button,input,Vec::new(),self.carried.clone())],false);
+                    return true;
+                }
+            }
+        }
+        #[cfg(feature="ae2-lab")]
         if self.remote.as_ref().is_some_and(|r| r.ae2_terminal_toolbox.is_some())
             && ops.iter().any(|(slot, _, _)| slot.is_some_and(|s| (365..374).contains(&s)))
         {
@@ -5375,6 +5410,32 @@ impl Game<'_> {
             )
         });
         self.send_clicks(container, sent,true);
+    }
+    #[cfg(feature="ae2-lab")]
+    fn ae2_is_remote_fake_slot(&self,slot:usize)->bool {
+        let Some(remote)=self.remote.as_ref() else{return false};
+        if remote.ae2_priority_screen {return false;}
+        let Some((_,menu))=remote.menu.as_ref() else{return false};
+        Self::menu_slot_index(menu,slot).is_some_and(|wire|remote.ae2_fake_slots.iter().any(|(fake,_)|*fake==wire as i16))
+    }
+    #[cfg(feature="ae2-lab")]
+    fn ae2_remote_fake_hotbar_direct(&self,slot:usize)->bool {
+        let Some(remote)=self.remote.as_ref() else{return false};
+        let Some((_,menu))=remote.menu.as_ref() else{return false};
+        Self::menu_slot_index(menu,slot).is_some_and(|wire|remote.ae2_fake_slots.iter().any(|(fake,direct)|*fake==wire as i16 && *direct))
+    }
+    #[cfg(feature="ae2-lab")]
+    pub(super) fn ae2_is_fake_slot(&self,slot:usize)->bool {
+        if self.remote.is_some() {self.ae2_is_remote_fake_slot(slot)}else{self.ae2_local_encoding_fake_slot(slot)}
+    }
+    #[cfg(feature="ae2-lab")]
+    pub(super) fn ae2_fake_drag_action(&mut self,slot:usize,single:bool) {
+        if self.remote.is_some() {
+            // Buttons 2/3 are private pickup sub-actions sent only for a
+            // classified fake slot. They never enter vanilla prediction.
+            let button=if single {2}else{3};
+            self.remote_menu_ops(&[(Some(slot),button,Input::Pickup)]);
+        } else {self.ae2_local_encoding_drag(slot,single);}
     }
     /// Server acknowledgments delimit authoritative updates for each click,
     /// including rejected and intermediate drag stages.
@@ -5613,6 +5674,7 @@ impl Game<'_> {
                 r.ae2_priority_token = None;
                 r.ae2_stock_spec = None;
                 r.ae2_base_screen = false;
+                r.ae2_fake_slots.clear();
                 r.ae2_priority_search_backup = None;
                 r.ae2_energy_screen = false;
                 r.ae2_energy_token = None;
@@ -5849,6 +5911,7 @@ impl Game<'_> {
                 r.ae2_priority_token=None;
                 r.ae2_stock_spec=None;
                 r.ae2_base_screen=false;
+                r.ae2_fake_slots.clear();
                 r.ae2_priority_search_backup=None;
                 r.ae2_energy_screen=false;
                 r.ae2_energy_token=None;

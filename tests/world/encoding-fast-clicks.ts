@@ -10,6 +10,12 @@ try {
   const [px, py, pz] = start.player.position;
   const x = Math.floor(px) + 32, y = Math.ceil(py) + 5, z = Math.floor(pz) + 32;
   const at = (dx: number) => `${x + dx} ${y} ${z}`, terminal = at(2);
+  // In-frame setblock/fill require loaded chunks; the +32 fixture can cross
+  // the initial simulation boundary even after the world startup barrier.
+  await fixture.command(`tp @s ${x + 2.5} ${y} ${z - 2.5}`);
+  for (const [dx,dz] of [[-2,-3],[-2,3],[5,-3],[5,3]] as const) {
+    await until(() => fixture.raw(`block ${x + dx} ${y} ${z + dz}`), block => block.loaded, 'fixture corner chunk loaded', 30000);
+  }
   await fixture.command(`fill ${x - 2} ${y} ${z - 3} ${x + 5} ${y + 4} ${z + 3} minecraft:air`);
   await fixture.command(`fill ${x - 2} ${y - 1} ${z - 3} ${x + 5} ${y - 1} ${z + 3} minecraft:stone`);
   await fixture.command(`setblock ${at(0)} ae2:creative_energy_cell`);
@@ -26,6 +32,8 @@ try {
   await until(() => fixture.raw('screen'), view => String(slot(view, 348)?.components ?? '').includes('Encode crafting pattern'), 'encoding terminal');
   await fixture.raw('click-slot 348');
   await until(() => fixture.raw('screen'), view => String(slot(view, 348)?.components ?? '').includes('Back to storage'), 'encoding editor');
+  // PatternEncodingLogic clamps crafting inputs to one; processing mode retains quantities.
+  await fixture.raw('click-slot 346'); await until(() => fixture.raw('screen'), view => String(slot(view, 346)?.components ?? '').includes('processing'), 'processing mode');
   await fixture.raw('click-slot 0');
   await until(() => fixture.raw('inventory'), view => view.carried?.item === 'minecraft:oak_planks' && view.carried.count === 2, 'physical template on cursor');
   await fixture.raw('click-slot 300');

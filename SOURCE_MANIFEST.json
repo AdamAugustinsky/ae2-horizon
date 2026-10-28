@@ -1,7 +1,7 @@
 {
   "schema": 2,
-  "snapshot": "source-port-wave11",
-  "source_captured_at": "2026-10-28T23:03:15.326040+00:00",
+  "snapshot": "source-port-wave13b",
+  "source_captured_at": "2026-10-28T23:42:50.059553+00:00",
   "upstreams": {
     "horizon": {
       "url": "https://github.com/ludovic111/horizon",
@@ -83,6 +83,10 @@
       "sha256": "25c7a9e68b60e0b2038ecee0103b43f95a16fcbb0f583105ecebd8f3301bb8ff"
     },
     {
+      "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/ae2_provider_queue.rs",
+      "sha256": "ee659c1d6e3ab9b11e7c593c12ea07fc0cd04045f3715ce7b1cc892e67f2b008"
+    },
+    {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/ae2_stack_identity.rs",
       "sha256": "5d7ae782788f22f4af09b688f62acf2f421c8318e0dac08fd95f8ce98eab5c1d"
     },
@@ -100,7 +104,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/ae2_world.rs",
-      "sha256": "37e882300218655547d9c3191bda0179b3aef24aee6d21211be23423be70ffd3"
+      "sha256": "15e5fa52534c969823ad26b83cce5ed79d17af713c130b2bfe5515f279042124"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/arrows.rs",
@@ -176,7 +180,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game.rs",
-      "sha256": "f4c141db0e08a2d282e77a3835f917e9e07ca45737bb395df8ef7a33847c1aad"
+      "sha256": "49ba7e054d7e6cd1b3074214403e1efa79f1c49065e39717a1ad8d70693ef550"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/advancements.rs",
@@ -200,15 +204,15 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_autocrafting.rs",
-      "sha256": "8e02d15a2a3e188a2318c1d7541dcc896d545037dc63829391e0c1c47e4cb785"
+      "sha256": "2c74367a224bb5ee511b217c54d0a1c696a5ba1c6c6099b0fbb43a5be1e393c2"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_bus_ui.rs",
-      "sha256": "63ccc0aada9d0d0448c4d9d4d208e0df1ee2c22259912bfd526f42e2dae01ba9"
+      "sha256": "3998484548ceed9aa9ec70fb3777f1a60c112c5f675baa8daabeef176062c748"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_buses.rs",
-      "sha256": "175722124303eb61f788ae6bab52d3f81cfd344c8d1daf8f930bda5e9d840f3b"
+      "sha256": "3885c997111ec3c7529ca309aaab3788e5ef4043e97955fb655f2d0f62f5c2f4"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_cannon.rs",
@@ -308,7 +312,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_fluid_grid.rs",
-      "sha256": "d4b493c5ffa21cfcd45db336bf64cc82f883754bee8cb2a749009d9303f51266"
+      "sha256": "17314171109ef7ebde150bf3f3584745ea53089d480566677b1ea430156008d0"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_fluids.rs",
@@ -332,7 +336,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_grid.rs",
-      "sha256": "fc61e8b95da14b28311d825b068980e83e8c5e49b9f03c5f043ae7a68450139e"
+      "sha256": "ff334c4a544aa027e8cd05a07bdc91270d5b8bb91a2a139afbf37075148049e5"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_guide.rs",
@@ -356,7 +360,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_interface.rs",
-      "sha256": "8ff98d7848863de8305f1becb6f0aaf140b8ef12d40d796453f618f45300407f"
+      "sha256": "37242e5c5b86b617d61c542952d4c9fcab5261567d93c9348e58d1f19cda14dc"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_job_events.rs",
@@ -480,7 +484,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_part_remove.rs",
-      "sha256": "eaca7a0a64fd37c2ce395a10f11dc593e8f4e0e07035697a2e9195e52e38a0c5"
+      "sha256": "25d385d0b8cc716bd43dc0007bc796820204ad1d5fb9e254f9677807fd702b09"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_parts.rs",
@@ -492,7 +496,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_placement.rs",
-      "sha256": "81a688f676eea9c29f289386d017af591d7d17becaec1e28221d4d735ee70470"
+      "sha256": "b74ce7349c4664102cf5aeb9e60a33133032ec36455d00ee51fde5d8624685ac"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_portable_ui.rs",
@@ -524,7 +528,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_source_patterns.rs",
-      "sha256": "74db3b4611958dd9a3c3d58ba3e8855d2cf6918eabd61b2a29263298a37c965f"
+      "sha256": "d8b432654fab111433f4eae86021a085c886b415c2e901210d82a7fccb19bab4"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_spatial.rs",
@@ -552,7 +556,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_storage_devices.rs",
-      "sha256": "f3fd889a5f1ed559a7257a296fb8a29829fddfe584594e6ba149f69dfc92d5de"
+      "sha256": "f03284c6e15db6320a400a806f32a2b6f5982a2503a9a4fcceca3b256da57b7d"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_storage_monitor.rs",
@@ -568,7 +572,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_terminal.rs",
-      "sha256": "e9fe5a5e25c1505aa8c8a78b6cef583362b6fa380fb4035764f8652f95db8642"
+      "sha256": "b598726c8675f87d2bcf295c53b0dd903fd31d57dfb2803a51d9079c16404f47"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_tick_tracker.rs",
@@ -592,7 +596,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_workbench.rs",
-      "sha256": "c7ee8ba7460bf5fd90e05335a6e8aa40475cb5a73b0192f633b1967fe0b238e0"
+      "sha256": "5504fd9295dc4d2aba2b180031f94ec7bf907c8d9610c764edab5a0947fbf84d"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/ae2_worldgen.rs",
@@ -768,7 +772,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/remote.rs",
-      "sha256": "ccc644b15ba71e5635780a86a929b7340d5aacbf2fa5a52c0d78ddc259e8fd5e"
+      "sha256": "fea124b803778c06e3eb83fec01afcf68d6e77df1d3ba408cd87ad9eba78e2e2"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/remote_mob_use.rs",
@@ -796,7 +800,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/spill.rs",
-      "sha256": "a0efdcd396a1a03e8bd5efa9fc375bba3054457a13f062f22f6f4de016eeeaa6"
+      "sha256": "2bb518d354a6a61e3d7d61d9825b848bc376437fae7920632ba4409128836a35"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/game/startup_menu.rs",
@@ -900,7 +904,7 @@
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/lib.rs",
-      "sha256": "1e1ff58ca4c02e3380a072c4ffa5e843f1d80f9b89f71c942407c19f16de4a9e"
+      "sha256": "1aab500e863822bb2478383f456b8988731fbbee097d735c8034439d7a2c6c81"
     },
     {
       "path": "ludovic111-horizon-7f8a668/crates/horizon-client/src/menu.rs",
@@ -1126,15 +1130,31 @@
     },
     {
       "path": "ae2-crafting-core/tests/oracle/README.md",
-      "sha256": "7373a76522c6131f164ae8f5f88f38e73a29c77f314542c731c322d87d5d4067"
+      "sha256": "944a5e7d1076cbbd083fa715422ffa3a5a8657b13ae2edbee293736fb051011b"
+    },
+    {
+      "path": "ae2-crafting-core/tests/oracle/SourceProviderOracle.java",
+      "sha256": "9225128f96b783fbd1a8df4ee8fa2462738dfbb525e7ef50685b4e42723d4e87"
+    },
+    {
+      "path": "ae2-crafting-core/tests/oracle/SourceWrappedOracle.java",
+      "sha256": "47681e327b1ac2bca071f1d0bc81890f90b700977c7669772afdd268c17543cc"
     },
     {
       "path": "ae2-crafting-core/tests/oracle/run-fluid-template-oracle.ts",
       "sha256": "2245a4e1d05111443ada404181f1b2b126a336eac9215d03fc577755a214d9bf"
     },
     {
+      "path": "ae2-crafting-core/tests/oracle/run-provider-send-oracle.ts",
+      "sha256": "c81d40bc9601bb2a32455e021a6dfdcaab43929544d6f20b7a4833c708b975c6"
+    },
+    {
       "path": "ae2-crafting-core/tests/oracle/run-tree-oracle.ts",
       "sha256": "7647932ac6eb914296de0124193f16d4dbb6dfa52685f110f5cccecc20eaa1df"
+    },
+    {
+      "path": "ae2-crafting-core/tests/oracle/run-wrapped-input-oracle.ts",
+      "sha256": "6fb26d0d28c5b10ab4bdc3cf927433591102630521ff0af92a5587db6d47a4b4"
     },
     {
       "path": "ae2-links-core/Cargo.lock",
@@ -1274,14 +1294,18 @@
     }
   ],
   "validation": {
-    "checkpoint": "wave11",
-    "binary_sha256": "3dd50add7863c9538c60dac638df0054302a446300f3d9df53905cce29da6283",
-    "source_archive_sha256": "c4524acbb0dba7b6fa89808095c3f026af4b4bc50deedbf5de720bfae7049a86",
-    "library_passed": 106,
+    "checkpoint": "wave13b",
+    "binary_sha256": "b81581dfbf19eb742dfd7cd6e4088ef85367a5f286e9a4bee2a96d59601f484d",
+    "source_archive_sha256": "49089e32d2bcb9d1a7f9302e08d10b626d210be563e76dc396d7adf83534a5e0",
+    "library_passed": 110,
     "library_ignored": 3,
-    "client_passed": 311,
+    "client_passed": 320,
     "crafting_core_passed": 80,
     "platform": "macOS / Apple M3 Pro",
-    "automated_clients": "hidden, unfocused, private profiles, virtual input, 30 FPS, serialized render lease"
+    "automated_clients": "hidden, unfocused, private profiles, virtual input, 30 FPS, serialized render lease",
+    "source_patch_sha256": "0179b5fa5c8efe6fe5563575d06be40cad3788e72176d1efb9b144ec8d253b0f",
+    "base_commit": "9a065b746dc99e392749428ea007db1afe6a9aa4",
+    "resource_gated_checks_passed_on_wave12": 3,
+    "wrapped_library_passed": 7
   }
 }

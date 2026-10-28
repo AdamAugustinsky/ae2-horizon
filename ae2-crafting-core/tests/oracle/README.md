@@ -31,3 +31,14 @@ AE2_REFERENCE=/path/to/ae2-reference bun ae2-crafting-core/tests/oracle/run-flui
 ```
 
 It checks bucket and remainder eligibility, disabled fluid substitution, absent fluid and a fluid-capable milk bucket. These stubs do not reproduce Minecraft's full fluid-container registry or other mods' capabilities.
+
+## Wrapped input and processing-provider source methods
+
+```sh
+AE2_REFERENCE=/path/to/ae2-reference bun ae2-crafting-core/tests/oracle/run-wrapped-input-oracle.ts
+AE2_REFERENCE=/path/to/ae2-reference bun ae2-crafting-core/tests/oracle/run-provider-send-oracle.ts
+```
+
+Both runners verify the pinned revision, extract the named LGPL source methods into temporary Java files, and compile them against the minimal stubs in `SourceWrappedOracle.java` and `SourceProviderOracle.java`. The wrapped-input runner exercises `AECraftingPattern.getCraftingInputs`, `GenericStack.fromItemStack`/`unwrapItemStack` and `WrappedGenericStack.unwrapWhat`/`unwrapAmount`. It checks ordinary and component-bearing wrapped keys, wrapper outer and inner counts, empty/degenerate wrappers, a fluid key, and the nine-slot limit.
+
+The provider runner exercises `AEProcessingPattern.pushInputsToExternalInventory`, its default interface method, `PatternProviderLogic.addToSendList`/`sendStacksOut`, and `CondenserMEStorage.insert`. It checks sparse mixed-key order, partial retries, a large amount in one queue entry, simulation, full-output rejection, and integer-scaled fluid power. These stubs are not Minecraft inventories or a running AE2 provider, so they do not establish host-world integration, chunk persistence, or actual machine capability behavior. The provider runner changes the extracted private methods' visibility only so the harness can invoke them; their bodies remain unchanged.

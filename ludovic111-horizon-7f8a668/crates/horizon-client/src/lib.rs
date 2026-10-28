@@ -236,6 +236,9 @@ pub mod ae2_cell_codec;
 pub mod ae2_generic_stack;
 
 #[cfg(feature = "ae2-lab")]
+pub mod ae2_provider_queue;
+
+#[cfg(feature = "ae2-lab")]
 pub mod ae2_meteorite;
 #[cfg(feature = "ae2-lab")]
 pub mod ae2_common_config;

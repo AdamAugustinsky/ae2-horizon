@@ -494,6 +494,19 @@ fn condenser_apply(
     machine.config.insert("condenser_power".into(),Tag::Double(power.to_bits()));
     condenser_fill_output(machine,max_stack)
 }
+/// CondenserMEStorage.insert checks output capacity, accepts the complete
+/// generic-stack amount and uses Java integer division for fluid power. This
+/// differs from its separate one-bucket FluidHandler, which uses fractions.
+fn condenser_me_fluid_insert(machine:&mut horizon_client::ae2_world::Machine,amount:u64,max_stack:u32,simulate:bool)->Result<u64,String> {
+    if machine.kind!=horizon_client::ae2_world::MachineKind::Condenser || machine.slots.len()!=2 || amount>i64::MAX as u64 {return Err("invalid condenser ME input".into());}
+    let (output,_)=condenser_mode(machine)?;
+    if !output.is_empty() && machine.slots[0].as_ref().is_some_and(|stack|
+        stack.item.as_ref()!=output || !stack.same_item_same_components(&ItemStack::new(output,1)) || stack.count>=max_stack) {
+        return Ok(0);
+    }
+    if !simulate && amount>0 {condenser_apply(machine,(amount/125) as f64,max_stack)?;}
+    Ok(amount)
+}
 /// Memory Card setting import invokes the same `addPower(0)` callback as a
 /// menu mode change. The caller stages the machine before committing it.
 pub(super) fn condenser_apply_memory_mode(
@@ -543,6 +556,24 @@ fn condenser_consumed(mut stack: ItemStack, accepted: u32) -> Option<ItemStack> 
     (stack.count > 0).then_some(stack)
 }
 impl Game<'_> {
+    pub(super) fn ae2_condenser_me_fluid_insert_at(&mut self,address:super::ae2_global::GridAddress,amount:u64,simulate:bool)->u64 {
+        let Some((dim,pos))=self.ae2_address_parts(address) else{return 0;};let back=self.dim;
+        if self.enter_level(None,dim).is_err(){return 0;}
+        let accepted=self.ae2_condenser_me_fluid_insert(pos,amount,simulate).unwrap_or(0);
+        let _=self.enter_level(None,back);accepted
+    }
+    fn ae2_condenser_me_fluid_insert(&mut self,pos:Pos,amount:u64,simulate:bool)->Result<u64,String> {
+        let Some(BlockEntity::Ae2(machine))=self.world.block_entities.get(&pos) else{return Err("condenser missing".into());};
+        let (output,_)=condenser_mode(machine)?;
+        let max=if output.is_empty(){64}else{self.res.items().get(output).ok_or("condenser output item missing")?.max_stack.max(1)};
+        let mut staged=(**machine).clone();
+        let accepted=condenser_me_fluid_insert(&mut staged,amount,max,simulate)?;
+        if accepted>0 && !simulate {
+            let Some(BlockEntity::Ae2(machine))=self.world.block_entities.get_mut(&pos) else{return Err("condenser disappeared".into());};
+            **machine=staged;self.world.modified.insert((pos.0>>4,pos.2>>4));
+        }
+        Ok(accepted)
+    }
     pub(super) fn ae2_condenser_insert_at(&mut self,address:super::ae2_global::GridAddress,stack:&ItemStack,limit:u32,simulate:bool)->u32 {
         let Some((dim,pos))=self.ae2_address_parts(address) else {return 0;};let back=self.dim;
         if self.enter_level(None,dim).is_err(){return 0;}
@@ -816,6 +847,21 @@ impl Game<'_> {
 mod storage_tests {
     use super::*;
     use horizon_client::ae2_world::{Machine, MachineKind};
+    #[test]
+    fn condenser_me_fluid_obeys_source_output_and_integer_amount_rules() {
+        let mut machine=Machine::new(MachineKind::Condenser);
+        machine.slots[1]=Some(ItemStack::new("ae2:cell_component_1k",1));
+        machine.config.insert("condenser_output".into(),Tag::String("matter_balls".into()));
+        let before=machine.clone();
+        assert_eq!(condenser_me_fluid_insert(&mut machine,1377,64,true).unwrap(),1377);assert_eq!(machine,before);
+        assert_eq!(condenser_me_fluid_insert(&mut machine,1377,64,false).unwrap(),1377);assert_eq!(condenser_power(&machine).unwrap(),11.0);
+        assert_eq!(condenser_me_fluid_insert(&mut machine,124,64,false).unwrap(),124);assert_eq!(condenser_power(&machine).unwrap(),11.0);
+        machine.slots[0]=Some(ItemStack::new("ae2:matter_ball",64));let blocked=machine.clone();
+        assert_eq!(condenser_me_fluid_insert(&mut machine,1377,64,false).unwrap(),0);assert_eq!(machine,blocked);
+        machine.config.insert("condenser_output".into(),Tag::String("trash".into()));
+        assert_eq!(condenser_me_fluid_insert(&mut machine,1377,64,false).unwrap(),1377);
+        assert_eq!(condenser_power(&machine).unwrap(),22.0);
+    }
     #[test]
     fn fuzzy_cell_partitions_follow_candidate_range_and_fluid_identity() {
         let fluid=|components|ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components};
@@ -1224,8 +1270,7 @@ impl Game<'_> {
                     if next.slots.first().and_then(Option::as_ref).is_none()&&!workbench_keep(&next){return Ok(())}
                     let mut filters=workbench_filters_checked(&next,&|id,fluid|self.ae2_known_cell_key(id,fluid))?;let index=(*page).min(3)*18+(slot-305);
                     if index>=63{return Ok(())}
-                    let fluid=next.slots.first().and_then(Option::as_ref).is_some_and(is_fluid)
-                        ||(button==1&&next.slots.first().and_then(Option::as_ref).is_none_or(|cell|matches!(cell.item.as_ref(),"ae2:view_cell"|"ae2:creative_storage_cell")));
+                    let fluid=workbench_emptying_mode(next.slots.first().and_then(Option::as_ref),button);
                     filters[index]=if let Some(held)=next_cursor.as_ref(){
                         match workbench_ghost_from_carried(next.slots.first().and_then(Option::as_ref),held,fluid,&|id,fluid|self.ae2_known_cell_key(id,fluid)) {
                             Ok(ghost)=>Some(ghost),Err(_)=>return Ok(()),

@@ -2156,20 +2156,18 @@ mod recursive {
                 }
             }
             for (key, amount) in requested {
-                let mut left = amount;
-                while left > 0 {
-                    match self.ae2_grid_extract_staged(pos, &key, left, &mut formation) {
-                        Ok(Some(item)) if item.count > 0 => {
-                            left -= u64::from(item.count);
-                            physical.push(item)
-                        }
-                        _ => {
-                            restore(self, backup);
-                            return Err(
-                                "not enough items or energy while reserving; restored world".into(),
-                            );
-                        }
-                    }
+                let mut exemplar=match ae2_lab::prototype(&key) {Ok(item)=>item,Err(error)=>{restore(self,backup);return Err(error);}};
+                let chunk_max=i32::MAX as u64;
+                let chunks=amount/chunk_max+u64::from(amount%chunk_max!=0);
+                let Ok(chunks)=usize::try_from(chunks) else {restore(self,backup);return Err("CPU escrow allocation overflow".into());};
+                if physical.try_reserve(chunks).is_err(){restore(self,backup);return Err("CPU escrow allocation failed".into());}
+                if self.ae2_grid_extract_bulk_staged(pos,&key,amount,&mut formation).ok()!=Some(amount) {
+                    restore(self,backup);
+                    return Err("not enough items or energy while reserving; restored world".into());
+                }
+                let mut left=amount;
+                while left>0 {
+                    let count=left.min(chunk_max);exemplar.count=count as u32;physical.push(exemplar.clone());left-=count;
                 }
             }
             let session = Session {
@@ -2218,6 +2216,77 @@ mod recursive {
             items.remove(index);
         }
         Some(result)
+    }
+    // Processing patterns can request hundreds of thousands of the same
+    // item. Drain physical escrow by stack, not by single item, and perform
+    // the availability/allocation checks before changing the original list.
+    fn take_physical_many(items:&mut Vec<ItemStack>,key:&str,count:u64)->Result<Option<Vec<ItemStack>>,String> {
+        if count==0 {return Ok(Some(Vec::new()));}
+        let mut available=0u64;
+        let mut prototype=None;
+        for item in items.iter() {
+            if item.count>0 && canon(item)==key {
+                if prototype.is_none(){prototype=Some(item.clone());}
+                available=available.saturating_add(u64::from(item.count));
+                if available>=count {break;}
+            }
+        }
+        if available<count {return Ok(None);}
+        let prototype=prototype.ok_or("missing physical escrow prototype")?;
+        let max=u64::from(u32::MAX);
+        let chunks=count/max+u64::from(count%max!=0);
+        let chunks=usize::try_from(chunks).map_err(|_|"physical escrow allocation overflow")?;
+        let mut taken=Vec::new();
+        taken.try_reserve_exact(chunks).map_err(|_|"physical escrow allocation failed")?;
+        let mut left=count;
+        while left>0 {
+            let amount=left.min(max);let mut stack=prototype.clone();stack.count=amount as u32;
+            taken.push(stack);left-=amount;
+        }
+        let mut left=count;
+        for item in items.iter_mut() {
+            if left==0 {break;}
+            if item.count>0 && canon(item)==key {
+                let amount=left.min(u64::from(item.count));item.count-=amount as u32;left-=amount;
+            }
+        }
+        debug_assert_eq!(left,0);items.retain(|item|item.count>0);Ok(Some(taken))
+    }
+    /// AEProcessingPattern expands condensed inputs in sparse-slot order
+    /// before handing them to the target. The legacy format did not store
+    /// fluid slot positions, so it retains the legacy item-then-fluid order.
+    fn processing_input_order(pattern:&ItemStack)->Result<Vec<(String,u64)>,String> {
+        let (items,_)=ae2_processing::ae2_decode_processing_pattern(pattern).ok_or("invalid processing pattern")?;
+        let (fluids,_)=ae2_processing::ae2_decode_processing_fluids(pattern).ok_or("invalid processing fluids")?;
+        let mut ordered=Vec::new();
+        match ae2_processing::ae2_decode_processing_positions(pattern)? {
+            Some((positioned,_))=>{
+                if items.len()!=positioned.len(){return Err("processing position count mismatch".into());}
+                for (item,fluid) in items.iter().zip(positioned) {
+                    match (item,fluid) {
+                        (Some(item),None)=>ordered.push((canon(item),u64::from(item.count))),
+                        (None,Some(fluid))=>ordered.push((fluid_name(&fluid.key),fluid.amount)),
+                        (None,None)=>{},
+                        _=>return Err("overlapping processing position".into()),
+                    }
+                }
+            }
+            None=>{
+                ordered.extend(items.iter().flatten().map(|item|(canon(item),u64::from(item.count))));
+                ordered.extend(fluids.iter().map(|fluid|(fluid_name(&fluid.key),fluid.amount)));
+            }
+        }
+        Ok(ordered)
+    }
+    fn checked_processing_input_order(pattern:&ItemStack,inputs:&Inventory)->Result<Vec<(String,u64)>,String> {
+        let ordered=processing_input_order(pattern)?;
+        let mut condensed=Inventory::new();
+        for (key,amount) in &ordered {
+            let value=condensed.entry(key.clone()).or_default();
+            *value=value.checked_add(*amount).ok_or("processing input overflow")?;
+        }
+        if &condensed!=inputs {return Err("processing inputs changed before dispatch".into());}
+        Ok(ordered)
     }
     fn pattern_grid(spec: &Spec) -> Result<Vec<Option<ItemStack>>, String> {
         if spec.grid.len() != 9 {
@@ -2543,7 +2612,7 @@ mod recursive {
             self.provider_receive(ProviderOwner::Block(provider), &fluid_name(fluid), accepted);
         }
         fn provider_send_pending(machine:&Machine)->bool {
-            ["ae2_provider_send_items","ae2_provider_send_fluids"].iter().any(|key|match machine.config.get(&(*key).into()) {None=>false,Some(Tag::List(v))=>!v.is_empty(),Some(_)=>true})
+            [horizon_client::ae2_provider_queue::QUEUE,"ae2_provider_send_items","ae2_provider_send_fluids"].iter().any(|key|match machine.config.get(&(*key).into()) {None=>false,Some(Tag::List(v))=>!v.is_empty(),Some(_)=>true})
         }
         fn provider_send_direction(face:horizon_core::geometry::Direction)->i8 {
             use horizon_core::geometry::Direction::*;match face {East=>0,West=>1,Up=>2,Down=>3,South=>4,North=>5}
@@ -2565,52 +2634,42 @@ mod recursive {
                 _=>return Err("invalid provider send direction".into()),
             };
             let Some(target)=self.recursive_neighbors(owner.anchor()).into_iter().find(|at|self.provider_target_face(owner.anchor(),*at)==Some(face)) else{return Ok(());};
-            let items=match machine.config.get(&"ae2_provider_send_items".into()) {
-                None=>Vec::new(),Some(Tag::List(entries)) if entries.len()<=8192=>{
-                    let mut items=Vec::new();for entry in entries {
-                        let Some(Tag::Int(count))=entry.get("count") else{return Err("invalid provider send item count".into());};
-                        if *count<=0 {return Err("invalid provider send item count".into());}
-                        let item=horizon_client::save::item_from_nbt(entry).ok_or("invalid provider send item")?;
-                        let max=self.res.items().get(&item.item).map_or(64,|info|info.max_stack).max(1);
-                        if item.count>max {return Err("oversized provider send item".into());}items.push(item);
-                    }items
-                },_=>return Err("invalid provider send items".into()),
-            };
-            let fluids=match machine.config.get(&"ae2_provider_send_fluids".into()) {
-                None=>Vec::new(),Some(Tag::List(entries)) if entries.len()<=81=>{
-                    let mut fluids=Vec::new();for entry in entries {
-                        let (Some(Tag::String(id)),Some(Tag::ByteArray(components)),Some(Tag::Long(amount)))=(entry.get("fluid"),entry.get("components"),entry.get("amount")) else{return Err("invalid provider send fluid".into());};
-                        if *amount<=0 {return Err("invalid provider send fluid amount".into());}
-                        fluids.push((ae2_cell_core::ItemKey{item_id:id.to_string().map_err(|_|"invalid fluid id")?,components:components.clone()},*amount as u64));
-                    }fluids
-                },_=>return Err("invalid provider send fluids".into()),
-            };
+            let entries=horizon_client::ae2_provider_queue::read(&machine.config)?;
             let before=snapshot(self);
             let previous=plan.len();
             let result=(|| {
-                let mut left_items=Vec::new();
-                for mut item in items {
-                    let moved=match self.ae2_item_p2p_insert_staged(target,face,&item,false,plan) {
-                        Some(n)=>n,None=>self.ae2_native_item_insert_staged(target,face,&item,item.count,false,plan),
-                    };
-                    if moved>item.count {return Err("provider target overaccepted item".into());}
-                    item.count-=moved;if item.count>0 {left_items.push(horizon_client::save::item_to_nbt(&item));}
-                }
-                let mut left_fluids=Vec::new();
-                for (key,amount) in fluids {
-                    let moved=self.provider_target_fluid_insert(target,face,&key,amount,false);
-                    if moved>amount {return Err("provider target overaccepted fluid".into());}
-                    if moved<amount {left_fluids.push(Tag::compound([("fluid",Tag::String(key.item_id.as_str().into())),("components",Tag::ByteArray(key.components)),("amount",Tag::Long((amount-moved) as i64))]));}
+                use horizon_client::ae2_provider_queue::Entry;
+                let mut remaining=Vec::new();
+                remaining.try_reserve(entries.len()).map_err(|_|"provider send allocation failed")?;
+                for entry in entries {
+                    match entry {
+                        Entry::Item{prototype,amount}=>{
+                            let count=amount.min(u64::from(u32::MAX)) as u32;
+                            let item=ItemStack{count,..prototype.clone()};
+                            let moved=match self.ae2_item_p2p_insert_staged(target,face,&item,false,plan) {
+                                Some(n)=>n,None=>self.ae2_native_item_insert_staged(target,face,&item,item.count,false,plan),
+                            };
+                            if moved>count{return Err("provider target overaccepted item".into());}
+                            if u64::from(moved)<amount {remaining.push(Entry::Item{prototype,amount:amount-u64::from(moved)});}
+                        }
+                        Entry::Fluid{key,amount}=>{
+                            let moved=self.provider_target_fluid_insert(target,face,&key,amount,false);
+                            if moved>amount{return Err("provider target overaccepted fluid".into());}
+                            if moved<amount {remaining.push(Entry::Fluid{key,amount:amount-moved});}
+                        }
+                    }
                 }
                 let mut updated=self.provider_machine(owner).ok_or("provider disappeared")?;
-                if left_items.is_empty(){updated.config.remove(&"ae2_provider_send_items".into());}else{updated.config.insert("ae2_provider_send_items".into(),Tag::List(left_items));}
-                if left_fluids.is_empty(){updated.config.remove(&"ae2_provider_send_fluids".into());}else{updated.config.insert("ae2_provider_send_fluids".into(),Tag::List(left_fluids));}
+                horizon_client::ae2_provider_queue::write(&mut updated.config,&remaining)?;
                 if !Self::provider_send_pending(&updated){updated.config.remove(&"ae2_provider_send_face".into());}
                 self.store_provider(owner,&updated)?;Ok(())
             })();
             if result.is_err(){restore(self,before);plan.truncate(previous);}result
         }
         fn provider_target_fluid_insert(&mut self,target:GridAddress,face:horizon_core::geometry::Direction,key:&ae2_cell_core::ItemKey,amount:u64,simulate:bool)->u64 {
+            if matches!(self.ae2_block_entity(target),Some(BlockEntity::Ae2(machine)) if machine.kind==MachineKind::Condenser) {
+                return self.ae2_condenser_me_fluid_insert_at(target,amount,simulate);
+            }
             if let Some(n)=self.ae2_fluid_p2p_fill(target,face,key,amount,simulate) {return n;}
             if let Some(n)=self.ae2_interface_fluid_move(target,face,key,amount,true,simulate) {return n;}
             if let Some(n)=self.ae2_provider_return_fluid_at(target,face,key,amount,simulate) {return n;}
@@ -3648,9 +3707,9 @@ mod recursive {
                 let identity=match owner {ProviderOwner::Block(a)=>network.node_identities.get(&a.network_pos()).copied(),ProviderOwner::Part{host,face}=>network.part_identities.get(&(host.network_pos(),face)).copied()};
                 let current=self.provider_machine(owner);
                 let signature=|m:&Machine| {
-                    serde_json::to_vec(&["ae2_provider_return_items","ae2_provider_return_fluids","ae2_provider_send_items","ae2_provider_send_fluids","ae2_provider_send_face"].iter().map(|key|m.config.get(&(*key).into()).map(horizon_client::item_data::canon_tag).unwrap_or_default()).collect::<Vec<_>>()).unwrap_or_default()
+                    serde_json::to_vec(&["ae2_provider_return_items","ae2_provider_return_fluids",horizon_client::ae2_provider_queue::QUEUE,"ae2_provider_send_items","ae2_provider_send_fluids","ae2_provider_send_face"].iter().map(|key|m.config.get(&(*key).into()).map(horizon_client::item_data::canon_tag).unwrap_or_default()).collect::<Vec<_>>()).unwrap_or_default()
                 };
-                let work=|m:&Machine| ["ae2_provider_return_items","ae2_provider_return_fluids","ae2_provider_send_items","ae2_provider_send_fluids"].iter().any(|key|matches!(m.config.get(&(*key).into()),Some(Tag::List(v)) if !v.is_empty()));
+                let work=|m:&Machine| ["ae2_provider_return_items","ae2_provider_return_fluids",horizon_client::ae2_provider_queue::QUEUE,"ae2_provider_send_items","ae2_provider_send_fluids"].iter().any(|key|matches!(m.config.get(&(*key).into()),Some(Tag::List(v)) if !v.is_empty()));
                 if let (Some(identity),Some(before))=(identity,current.as_ref()) {
                     let token=signature(before);let active=self.provider_online(owner);let pending=work(before);
                     if token.len()<=1_048_576 {
@@ -3898,48 +3957,32 @@ mod recursive {
                 let mut next = session.cpu.clone();
                 let (id, step) = next.dispatch_task(index).map_err(|e|format!("CPU task dispatch: {e:?}"))?;
                 if spec.processing {
-                    let item_inputs: Vec<_> = step
-                        .inputs
-                        .iter()
-                        .filter(|(key, _)| parse_fluid(key).is_none())
-                        .collect();
-                    let fluid_inputs: Vec<_> = step
-                        .inputs
-                        .iter()
-                        .filter_map(|(key, count)| parse_fluid(key).map(|k| (k, *count)))
-                        .collect();
+                    use horizon_client::ae2_provider_queue::Entry;
+                    let provider=self.provider_machine(spec.provider).ok_or("provider disappeared")?;
+                    let pattern=match &spec.definition {
+                        Some(definition)=>item_data::parse_stack(definition)?.ok_or("missing processing definition")?,
+                        None=>provider.slots.get(spec.slot).and_then(Clone::clone).ok_or("missing processing pattern")?,
+                    };
+                    let ordered=checked_processing_input_order(&pattern,&step.inputs)?;
                     let mut next_physical = physical.clone();
                     let mut next_fluids = fluids.clone();
-                    let mut offered = Vec::new();
+                    let mut offered:Vec<Entry> = Vec::new();
+                    offered.try_reserve(ordered.len()).map_err(|_|"processing input allocation failed")?;
                     let mut fits = true;
-                    for (key, count) in item_inputs {
-                        for _ in 0..*count {
-                            let Some(one) = take_physical(&mut next_physical, key, 1) else {
-                                fits = false;
-                                break;
-                            };
-                            if let Some(last) = offered.last_mut().filter(|s: &&mut ItemStack| {
-                                s.same_item_same_components(&one) && s.count < u32::MAX
-                            }) {
-                                last.count += 1;
-                            } else {
-                                offered.push(one);
+                    let face=self.provider_target_face(spec.provider.anchor(),at).ok_or("invalid provider target face")?;
+                    for (key,amount) in ordered {
+                        if let Some(fluid)=parse_fluid(&key) {
+                            let old=next_fluids.get(&fluid).copied().unwrap_or(0);
+                            if old<amount || self.provider_target_fluid_insert(at,face,&fluid,amount,true)==0 {fits=false;break;}
+                            if old==amount {next_fluids.remove(&fluid);}else{next_fluids.insert(fluid.clone(),old-amount);}
+                            offered.push(Entry::Fluid{key:fluid,amount});
+                        } else {
+                            let Some(stacks)=take_physical_many(&mut next_physical,&key,amount)? else{fits=false;break;};
+                            for mut stack in stacks {
+                                let amount=u64::from(stack.count);stack.count=1;
+                                offered.push(Entry::Item{prototype:stack,amount});
                             }
                         }
-                        if !fits {
-                            break;
-                        }
-                    }
-                    if !fits {
-                        rejected_targets.entry(step.pattern.clone()).or_default().insert(at);continue 'dispatch;
-                    }
-                    let face=self.provider_target_face(spec.provider.anchor(),at).ok_or("invalid provider target face")?;
-                    for (key, amount) in &fluid_inputs {
-                        if next_fluids.get(key).copied().unwrap_or(0) < *amount || self.provider_target_fluid_insert(at,face,key,*amount,true)==0 {
-                            fits=false;break;
-                        }
-                        let old=next_fluids[key];
-                        if old==*amount {next_fluids.remove(key);} else {next_fluids.insert(key.clone(),old-*amount);}
                     }
                     if !fits {
                         rejected_targets.entry(step.pattern.clone()).or_default().insert(at);continue 'dispatch;
@@ -3947,33 +3990,31 @@ mod recursive {
                     if owned_counts(&next_physical, &next_fluids)? != *next.escrow() {
                         return Err("processing dispatch ownership mismatch".into());
                     }
-                    // PatternProviderLogic accepts a positive simulation for every
-                    // key and retains any actual remainder in its physical send list.
-                    let mut send_items=Vec::new();
-                    for stack in &offered {
-                        let accepted=match self.ae2_item_p2p_insert_staged(at,face,stack,false,formation) {
-                            Some(n)=>n,None=>self.ae2_native_item_insert_staged(at,face,stack,stack.count,false,formation),
-                        };
-                        if accepted>stack.count {return Err("provider target overaccepted item".into());}
-                        let mut remaining=stack.count-accepted;
-                        let max=self.res.items().get(&stack.item).map_or(64,|info|info.max_stack).max(1);
-                        while remaining>0 {
-                            let count=remaining.min(max);let mut part=stack.clone();part.count=count;
-                            send_items.push(horizon_client::save::item_to_nbt(&part));remaining-=count;
+                    // Source pushes sparse inputs in order and keeps each
+                    // unaccepted amount as one owned generic-stack entry.
+                    let mut send=Vec::new();send.try_reserve(offered.len()).map_err(|_|"provider send allocation failed")?;
+                    for entry in offered {
+                        match entry {
+                            Entry::Item{prototype,amount}=>{
+                                let count=u32::try_from(amount).map_err(|_|"processing item amount overflow")?;
+                                let stack=ItemStack{count,..prototype.clone()};
+                                let accepted=match self.ae2_item_p2p_insert_staged(at,face,&stack,false,formation) {
+                                    Some(n)=>n,None=>self.ae2_native_item_insert_staged(at,face,&stack,count,false,formation),
+                                };
+                                if accepted>count{return Err("provider target overaccepted item".into());}
+                                if accepted<count {send.push(Entry::Item{prototype,amount:u64::from(count-accepted)});}
+                            }
+                            Entry::Fluid{key,amount}=>{
+                                let accepted=self.provider_target_fluid_insert(at,face,&key,amount,false);
+                                if accepted>amount{return Err("provider target overaccepted fluid".into());}
+                                if accepted<amount {send.push(Entry::Fluid{key,amount:amount-accepted});}
+                            }
                         }
                     }
-                    let mut send_fluids=Vec::new();
-                    for (key,amount) in &fluid_inputs {
-                        let accepted=self.provider_target_fluid_insert(at,face,key,*amount,false);
-                        if accepted>*amount {return Err("provider target overaccepted fluid".into());}
-                        if accepted<*amount {send_fluids.push(Tag::compound([("fluid",Tag::String(key.item_id.as_str().into())),("components",Tag::ByteArray(key.components.clone())),("amount",Tag::Long((*amount-accepted) as i64))]));}
-                    }
-                    if send_items.len()>8192 || send_fluids.len()>81 {return Err("provider send list exceeds physical bound".into());}
-                    if !send_items.is_empty() || !send_fluids.is_empty() {
+                    if !send.is_empty() {
                         let mut provider=self.provider_machine(spec.provider).ok_or("provider disappeared")?;
                         provider.config.insert("ae2_provider_send_face".into(),Tag::Byte(Self::provider_send_direction(face)));
-                        if !send_items.is_empty(){provider.config.insert("ae2_provider_send_items".into(),Tag::List(send_items));}
-                        if !send_fluids.is_empty(){provider.config.insert("ae2_provider_send_fluids".into(),Tag::List(send_fluids));}
+                        horizon_client::ae2_provider_queue::write(&mut provider.config,&send)?;
                         self.store_provider(spec.provider,&provider)?;
                     }
                     let mut positions = self.provider_neighbors(spec.provider);
@@ -4245,6 +4286,52 @@ mod recursive {
     #[cfg(test)]
     mod address_migration_tests {
         use super::*;
+        #[test]
+        fn bulk_processing_escrow_takes_exact_physical_counts_and_preserves_shortage() {
+            let mut variant=ItemStack::new("minecraft:stone",64);
+            variant.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("variant",Tag::String("kept".into()))])));
+            let key=canon(&variant);
+            let unrelated=ItemStack::new("minecraft:diamond",9);
+            let mut physical=vec![variant.clone();8193];physical.insert(2,unrelated.clone());
+            let requested=524_289u64;
+            let taken=take_physical_many(&mut physical,&key,requested).unwrap().unwrap();
+            assert_eq!(taken.len(),1);assert_eq!(u64::from(taken[0].count),requested);
+            assert!(taken[0].same_item_same_components(&variant));
+            assert_eq!(physical,vec![unrelated,ItemStack{count:63,..variant}]);
+            let before=physical.clone();
+            assert!(take_physical_many(&mut physical,&key,64).unwrap().is_none());
+            assert_eq!(physical,before);
+        }
+        #[test]
+        fn large_physical_cpu_reservation_survives_restart_and_cancellation() {
+            let mut item=ItemStack::new("minecraft:stone",1);
+            item.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("variant",Tag::String("exact".into()))])));
+            let key=canon(&item);let target=canon(&ItemStack::new("minecraft:diamond",1));
+            let mut registry=ExtendedRegistry::default();
+            registry.register(ExtendedPattern{id:"large".into(),inputs:vec![Ingredient{choices:Inventory::from([(key.clone(),999_999)])}],outputs:Inventory::from([(target.clone(),1)])}).unwrap();
+            let mut available=Inventory::from([(key.clone(),999_999)]);let plan=registry.plan(&available,&target,1).unwrap();
+            let mut cpu=Cpu::new(2_000_000,0);cpu.submit(plan,&mut available).unwrap();assert!(available.is_empty());
+            let mut session=Session{cpu,suspended:false,specs:BTreeMap::new(),flights:BTreeMap::new(),job_id:Some([3,4]),address_version:1,requester:None,export_requester:None,player_owner:None};
+            item.count=999_999;let mut machine=Machine::new(MachineKind::CraftingStorage256k);
+            write_session(&mut machine,&session,&[item.clone()]).unwrap();
+            let bytes=horizon_world::nbt::write_network(&Tag::Compound(machine.config.clone()),Default::default()).unwrap();
+            let (Tag::Compound(config),_)=horizon_world::nbt::read_network(&bytes,Default::default()).unwrap() else{panic!("compound config")};machine.config=config;
+            session=read_session(&machine,super::super::super::Dim::Overworld).unwrap();assert_eq!(session.cpu.escrow(),&Inventory::from([(key,999_999)]));
+            assert_eq!(read_escrow(&machine).unwrap(),vec![item.clone()]);session.cpu.cancel().unwrap();
+            write_session(&mut machine,&session,&[item.clone()]).unwrap();assert_eq!(read_escrow(&machine).unwrap(),vec![item]);
+        }
+        #[test]
+        fn processing_inputs_recover_source_sparse_mixed_order() {
+            let water=ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components:vec![]};
+            let mut input=vec![None;81];input[1]=Some(ItemStack::new("minecraft:iron_ingot",3));input[3]=Some(ItemStack::new("minecraft:iron_ingot",2));
+            let mut fluid=vec![None;81];fluid[0]=Some(ae2_processing::PatternFluid{key:water.clone(),amount:1000});fluid[2]=Some(ae2_processing::PatternFluid{key:water.clone(),amount:500});
+            let mut output=vec![None;27];output[0]=Some(ItemStack::new("minecraft:diamond",1));
+            let pattern=ae2_processing::ae2_encode_processing_positioned(&input,&output,&fluid,&vec![None;27]).unwrap();
+            let iron=canon(input[1].as_ref().unwrap());let water=fluid_name(&water);
+            let expected=vec![(water.clone(),1000),(iron.clone(),3),(water.clone(),500),(iron.clone(),2)];
+            assert_eq!(checked_processing_input_order(&pattern,&Inventory::from([(water.clone(),1500),(iron.clone(),5)])).unwrap(),expected);
+            assert!(checked_processing_input_order(&pattern,&Inventory::from([(water,1500),(iron,4)])).is_err());
+        }
         #[test]
         fn cpu_unloaded_waiting_owner_blocks_matching_key_but_not_unrelated_insertion() {
             let waiting=Inventory::from([("item:expected".to_owned(),2)]);

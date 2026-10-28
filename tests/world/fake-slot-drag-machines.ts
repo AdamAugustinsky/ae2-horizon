@@ -37,7 +37,7 @@ try {
     await fixture.raw('click-slot 0');
     await until(() => fixture.raw('inventory'), view => !view.carried && view.counts?.['minecraft:diamond'] === 4, 'real diamonds returned');
   };
-  await open(iface, 0, /Interface/i); await holdDiamond();
+  await open(iface, 0, /Interface|AE2 Machine/i); await holdDiamond();
   await drag(309, 310); await fixture.command(`data get block ${iface} ae2_lab_config`);
   let view = await until(() => fixture.raw('screen'), v => slot(v, 309)?.item === 'minecraft:diamond' && slot(v, 309)?.count === 4 && slot(v, 310)?.count === 4, 'Interface left drag copies full stack to each stock ghost');
   assert.equal(view.carried?.count, 4);

@@ -9,18 +9,21 @@ try {
   const start = await fixture.start(); const [px, py, pz] = start.player.position;
   const x = Math.floor(px) + 24, y = Math.ceil(py) + 5, z = Math.floor(pz) + 24;
   const at = (dx: number, dz = 0) => `${x + dx} ${y} ${z + dz}`;
-  await fixture.command(`fill ${x - 2} ${y} ${z - 3} ${x + 12} ${y + 4} ${z + 3} minecraft:air`);
-  await fixture.command(`fill ${x - 2} ${y - 1} ${z - 3} ${x + 12} ${y - 1} ${z + 3} minecraft:stone`);
+  await fixture.command(`fill ${x - 2} ${y} ${z - 3} ${x + 17} ${y + 4} ${z + 3} minecraft:air`);
+  await fixture.command(`fill ${x - 2} ${y - 1} ${z - 3} ${x + 17} ${y - 1} ${z + 3} minecraft:stone`);
   const machines = [[0, 'ae2:inscriber'], [3, 'ae2:io_port'], [6, 'ae2:cell_workbench']] as const;
   for (const [dx, id] of machines) {
     await fixture.command(`setblock ${at(dx)} ${id}`); await fixture.command(`setblock ${at(dx, -1)} ${id}`);
     await fixture.command(`data modify block ${at(dx, -1)} ae2_lab_config.menu_identity_fixture set value 1`);
   }
-  const part = at(9), donor = at(10);
-  await fixture.command(`setblock ${part} ae2:cable_bus`); await fixture.command(`setblock ${donor} ae2:cable_bus`);
+  const part = at(9), donor = at(10), bus = at(13), busDonor = at(14);
+  for (const target of [part, donor, bus, busDonor]) await fixture.command(`setblock ${target} ae2:cable_bus`);
   await fixture.command('clear @s'); await fixture.replace('hotbar.0', 'ae2:cable_interface'); await fixture.select(0, 'ae2:cable_interface');
   assert.equal((await fixture.ae(`grid part ${part} south`)).attached, true);
   assert.equal((await fixture.ae(`grid part ${donor} south`)).attached, true);
+  await fixture.replace('hotbar.0', 'ae2:import_bus'); await fixture.select(0, 'ae2:import_bus');
+  assert.equal((await fixture.ae(`grid part ${bus} south`)).attached, true);
+  assert.equal((await fixture.ae(`grid part ${busDonor} south`)).attached, true);
   await fixture.command('gamemode survival @s');
   const open = async (target: string, dx: number, name: RegExp) => {
     await fixture.command('clear @s'); await fixture.replace('hotbar.0', 'minecraft:diamond', 3); await fixture.replace('hotbar.8', 'minecraft:stick');
@@ -49,6 +52,10 @@ try {
   await fixture.command(`data modify block ${part} ae2_lab_config.parts[{face:"south"}] set from block ${donor} ae2_lab_config.parts[{face:"south"}]`);
   await closed(part, 'Interface face');
   fixture.mark('replacing the mounted Interface face closes its parent menu without transferring the carried stack');
+  await open(bus, 13, /AE2 Bus/i);
+  await fixture.command(`data modify block ${bus} ae2_lab_config.parts[{face:"south"}] set from block ${busDonor} ae2_lab_config.parts[{face:"south"}]`);
+  await closed(bus, 'Import Bus face');
+  fixture.mark('replacing a Bus face also closes the old owner session with its real cursor intact');
   await fixture.restart();
   const after = await fixture.raw('inventory'); assert.equal(after.counts?.['minecraft:diamond'], 3); assert(!after.carried);
   fixture.assertHidden(await fixture.raw('status')); fixture.mark('the final cursor sentinel survives restart'); fixture.report('passed');

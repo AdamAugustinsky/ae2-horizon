@@ -91,6 +91,9 @@ export class WorldFixture {
   async command(command: string): Promise<any> {
     const reply = await this.raw('command ' + command); assert.notEqual(reply.ok, false, JSON.stringify(reply));
     if (this.mode === 'in-frame' && reply.chat) reply.chat = reply.chat.slice(0, 1);
+    if (/^(?:execute in \S+ run )?(?:fill|setblock|item replace block|data (?:merge|modify|remove) block)\b/.test(command)) {
+      assert(!reply.chat?.some((line: string) => line.includes('That position is not loaded')), `Unloaded setup write: ${command}: ${JSON.stringify(reply.chat)}`);
+    }
     const teleport = command.match(/^(?:execute in (\S+) run )?tp @s (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)$/);
     if (teleport) {
       const dimension = teleport[1], [x, y, z] = teleport.slice(2).map(Number);

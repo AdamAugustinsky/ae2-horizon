@@ -1035,6 +1035,29 @@ impl Game<'_> {
         if simulate || result.is_err() { self.ae2_restore_blocks(snapshot); plan.truncate(previous); }
         result
     }
+    /// Reserve an aggregate quantity without rebuilding the grid and cloning
+    /// all block entities once per physical stack. The caller owns the outer
+    /// transaction across keys and commits the shared formation plan.
+    pub(super) fn ae2_grid_extract_bulk_staged(
+        &mut self, pos: WorldPos, k: &ItemKey, limit: u64,
+        plan: &mut super::ae2_buses::FormationPlan,
+    ) -> Result<u64, String> {
+        let address = self.ae2_local_address(pos).ok_or("invalid AE2 anchor")?;
+        self.ae2_grid_extract_bulk_staged_encoded(address, k, limit, true, false, plan)
+    }
+    pub(super) fn ae2_grid_extract_bulk_staged_encoded(
+        &mut self, pos: super::ae2_global::GridAddress, k: &ItemKey, limit: u64,
+        charge_power: bool, simulate: bool,
+        plan: &mut super::ae2_buses::FormationPlan,
+    ) -> Result<u64, String> {
+        // Validate the exact component-bearing key before any mutation.
+        ae2_lab::prototype(k)?;
+        let snapshot = self.ae2_snapshot_blocks();
+        let previous = plan.len();
+        let result = self.ae2_grid_extract_quantity_inner(pos, k, limit, charge_power, true, plan);
+        if simulate || result.is_err() { self.ae2_restore_blocks(snapshot); plan.truncate(previous); }
+        result
+    }
     fn ae2_grid_extract_inner(
         &mut self,
         pos: super::ae2_global::GridAddress,
@@ -1043,11 +1066,25 @@ impl Game<'_> {
         charge_power: bool,
         formation: &mut super::ae2_buses::FormationPlan,
     ) -> Result<Option<ItemStack>, String> {
-        let cells = self.ae2_cell_mounts_encoded(pos)?;
         let mut out = ae2_lab::prototype(k)?;
         let registry_max = self.res.items().get(&out.item).map_or(64, |i| i.max_stack).max(1);
         let cap = u64::from(super::ae2_formation::max_stack(&out, registry_max));
-        let mut left = limit.min(cap);
+        let got = self.ae2_grid_extract_quantity_inner(pos, k, limit.min(cap), charge_power, false, formation)?;
+        if got == 0 { return Ok(None); }
+        out.count = u32::try_from(got).map_err(|_| "physical extraction exceeds stack count")?;
+        Ok(Some(out))
+    }
+    fn ae2_grid_extract_quantity_inner(
+        &mut self,
+        pos: super::ae2_global::GridAddress,
+        k: &ItemKey,
+        limit: u64,
+        charge_power: bool,
+        bulk: bool,
+        formation: &mut super::ae2_buses::FormationPlan,
+    ) -> Result<u64, String> {
+        let cells = self.ae2_cell_mounts_encoded(pos)?;
+        let mut left = limit;
         if charge_power {
             left = left
                 .min((self.ae2_take_power_encoded(pos, left as f64, true) + 0.9).floor() as u64);
@@ -1061,7 +1098,13 @@ impl Game<'_> {
         for priority in priorities{
             for mount in mounts.iter().filter(|mount|mount.priority==priority){
                 if left==0{break}
-                if let Some(stack)=self.ae2_storage_extract(mount,k,left,false,formation)?{left-=u64::from(stack.count);}
+                let moved = if bulk {
+                    self.ae2_storage_extract_bulk(mount,k,left,formation)?
+                } else {
+                    self.ae2_storage_extract(mount,k,left,false,formation)?.map_or(0, |stack| u64::from(stack.count))
+                };
+                if moved > left { return Err("storage mount exceeded requested extraction".into()); }
+                left -= moved;
             }
             for mount in cells.iter().filter(|mount|mount.priority==priority){
                 if left==0{break}
@@ -1072,7 +1115,7 @@ impl Game<'_> {
         }
         let got = wanted - left;
         if got == 0 {
-            return Ok(None);
+            return Ok(0);
         }
         if charge_power {
             self.ae2_take_power_encoded(pos, got as f64, false);
@@ -1083,8 +1126,7 @@ impl Game<'_> {
             }
             self.ae2_mark_modified(p);
         }
-        out.count = got as u32;
-        Ok(Some(out))
+        Ok(got)
     }
     /// Give old physical part records an identity once, without replacing
     /// malformed existing IDs. This runs in each loaded level before grid work.

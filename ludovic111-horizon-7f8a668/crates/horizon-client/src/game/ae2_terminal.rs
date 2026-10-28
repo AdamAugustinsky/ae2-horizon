@@ -188,6 +188,8 @@ struct ChestTerminalSettings {
 struct PriorityEdit { value: i32, text: String, token:u64 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InterfaceMenuOwner { host:u64, part:Option<[i32;4]> }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MachineMenuOwner { host:u64, part:Option<[i32;4]>, kind:horizon_client::ae2_world::MachineKind }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum StockKey { Item(ae2_cell_core::ItemKey), Fluid(ae2_cell_core::ItemKey) }
 #[derive(Clone, Debug)]
@@ -661,6 +663,23 @@ impl Game<'_> {
         }
         self.res.recipes().find(&state.inputs[..9],3).map(|(_,mut result)|{result.data_mut().custom_name=Some("Click to encode pattern".into());result})
     }
+    pub(super) fn ae2_local_encoding_fake_slot(&self,slot:usize)->bool {
+        if !self.ae2_terminal_open() || !self.ae2_local_terminal.as_ref().is_some_and(|session|session.encoding && session.encoding_open) {return false;}
+        let Some((_,machine))=self.ae2_local_encoding_machine() else{return false};
+        let Ok(state)=super::ae2_encoding::EncodingState::load(&machine) else{return false};
+        (300..=308).contains(&slot) && (state.special_mode==0 || state.special_mode==1 && slot<303 || state.special_mode==2 && slot==300)
+            || state.processing && (318..=320).contains(&slot)
+    }
+    pub(super) fn ae2_local_encoding_drag(&mut self,slot:usize,single:bool) {
+        if !self.ae2_local_encoding_fake_slot(slot) || self.carried.is_none() {return;}
+        let physical=self.carried.clone();
+        if single {if let Some(item)=self.carried.as_mut(){item.count=1;}}
+        let mode=self.ae2_local_terminal.as_ref().map(|s|s.encoding_fluid_mode).unwrap_or(false);
+        if let Some(session)=self.ae2_local_terminal.as_mut(){session.encoding_fluid_mode=false;}
+        self.ae2_local_encoding_click(Some(slot),0,Input::Pickup);
+        if let Some(session)=self.ae2_local_terminal.as_mut(){session.encoding_fluid_mode=mode;}
+        self.carried=physical;
+    }
     fn ae2_local_encoding_slot_view(&self,slot:usize)->Option<Option<ItemStack>> {
         let session=self.ae2_local_terminal.as_ref().filter(|s|s.encoding)?;
         if slot==348 {return Some(Some(navigation(if session.encoding_open {"Back to storage"}else{"Encode crafting pattern"})));}
@@ -772,6 +791,18 @@ impl Game<'_> {
             if let Err(error)=self.ae2_local_encoding_physical_click(slot-349,button,input){self.system_message(Text::literal(format!("Encoding: {error}")));}
             return true;
         }
+        let fake=self.ae2_local_encoding_fake_slot(slot);
+        // AEBaseScreen permits inventory hotkeys only with an empty hand. Its
+        // overstacking Encoding slots cannot be picked up by SwapSlotsPacket.
+        if fake && matches!(input,Input::Swap|Input::Throw) && self.carried.is_some() {return true;}
+        if fake && input==Input::Swap && button!=40 {return true;}
+        if fake && input==Input::Clone {
+            let processing=self.ae2_local_encoding_machine().and_then(|(_,machine)|super::ae2_encoding::EncodingState::load(&machine).ok()).is_some_and(|state|state.processing);
+            if processing || self.ae2_local_encoding_slot_view(slot).flatten().is_some_and(|item|item.item.as_ref()=="ae2:wrapped_generic_stack") {return true;}
+        }
+        let (input,button)=if fake && !matches!(input,Input::Pickup|Input::QuickCraft) {
+            (Input::Pickup,i32::from(button==1))
+        } else {(input,button)};
         if input!=Input::Pickup || !matches!(button,0|1) {return true;}
         let Some((part,mut machine))=self.ae2_local_encoding_machine() else{return true;};
         let Ok(mut state)=super::ae2_encoding::EncodingState::load(&machine) else{return true;};
@@ -1726,6 +1757,16 @@ fn encoding_revision_matches(
             }
         })
 }
+// Fake-slot packets, like source InventoryActionPacket, act on the current
+// authoritative ghost; retain only the visible page and mode constraints.
+fn encoding_drag_revision_matches(
+    revisions:&std::collections::VecDeque<(i32,Option<horizon_client::ae2_world::Machine>,usize)>,
+    state:i32,current:Option<&horizon_client::ae2_world::Machine>,page:usize,
+)->bool {
+    revisions.iter().rev().find(|(revision,_,_)|*revision==state)
+        .and_then(|(_,shown,shown_page)|Some((super::ae2_encoding::EncodingState::load(shown.as_ref()?).ok()?,super::ae2_encoding::EncodingState::load(current?).ok()?,*shown_page)))
+        .is_some_and(|(shown,current,shown_page)|shown_page==page && shown.processing==current.processing && shown.special_mode==current.special_mode)
+}
 fn chest_revision_matches(revisions:&std::collections::VecDeque<(i32,ChestTerminalSettings)>, state:i32, current:ChestTerminalSettings)->bool {
     revisions.iter().rev().find(|(revision,_)|*revision==state).is_some_and(|(_,shown)|*shown==current)
 }
@@ -2076,9 +2117,16 @@ impl Game<'_> {
     fn lan_send_ae2_terminal(&mut self, host: &mut super::lan::LanHost, conn: u32) {
         if host.play.get(&conn).and_then(|p|p.ae2_terminal.as_ref()).is_some_and(|t|t.processing_amount_edit.is_some()){self.lan_send_processing_amount(host,conn);return;}
         if host.play.get(&conn).and_then(|p|p.ae2_terminal.as_ref()).is_some_and(|t|t.priority_edit.is_some()){self.lan_send_priority(host,conn);return;}
-        if let Some(t)=host.play.get(&conn).and_then(|p|p.ae2_terminal.as_ref()).filter(|t|t.encoding_part.is_some()) {
-            let mut data=t.window.to_be_bytes().to_vec();data.push(u8::from(t.encoding && t.processing));
+        if let Some((window,encoding,processing,special_mode))=host.play.get(&conn).and_then(|p|p.ae2_terminal.as_ref()).filter(|t|t.encoding_part.is_some()).map(|t|(t.window,t.encoding,t.processing,t.special_mode)) {
+            let mut data=window.to_be_bytes().to_vec();data.push(u8::from(encoding && processing));
             host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload{channel:"ae2:encoding_state".into(),data}));
+            let mut slots=Vec::new();
+            if encoding {
+                let inputs=match special_mode {1=>3,2=>1,_=>9};
+                slots.extend(0..inputs);
+                if processing {slots.extend(18..21);}
+            }
+            Self::lan_ae2_fake_slots(host,conn,window,&slots);
         }
         let chest = host.play.get(&conn).and_then(|p| p.ae2_terminal.as_ref())
             .and_then(|t| t.chest_identity.map(|identity| (t.pos, identity)));
@@ -3686,8 +3734,12 @@ impl Game<'_> {
             // revision, not merely the latest counter (which also advances on
             // harmless inventory refreshes).
             let stale=host.play.get(&conn).and_then(|p|p.ae2_terminal.as_ref()).is_none_or(|t|{
-                let ghost=(t.encoding && matches!(super::lan_crafting::input(p.input),Input::Pickup|Input::Clone)).then_some(p.slot);
-                !encoding_revision_matches(&t.encoding_revisions,p.state,current.as_ref(),t.processing_page,ghost)
+                let fake=t.encoding && matches!(super::lan_crafting::input(p.input),Input::Pickup|Input::QuickMove)
+                    && ((0..=8).contains(&p.slot)||(18..=20).contains(&p.slot));
+                if fake {!encoding_drag_revision_matches(&t.encoding_revisions,p.state,current.as_ref(),t.processing_page)} else {
+                    let ghost=(t.encoding && super::lan_crafting::input(p.input)==Input::Clone).then_some(p.slot);
+                    !encoding_revision_matches(&t.encoding_revisions,p.state,current.as_ref(),t.processing_page,ghost)
+                }
             });
             if stale && (0..=53).contains(&p.slot) {
                 if self.lan_load_encoding_state(host,conn){self.lan_send_ae2_terminal(host,conn);return true;}
@@ -4211,6 +4263,11 @@ impl Game<'_> {
             }
             self.lan_send_ae2_terminal(host,conn);return true;
         }
+        if encoding && matches!(p.button,2|3) && super::lan_crafting::input(p.input)==Input::Pickup
+            && ((0..=8).contains(&p.slot)||(18..=20).contains(&p.slot))
+            && host.hub.guests.iter().find(|g|g.conn==conn).is_none_or(|g|g.carried.is_none()) {
+            self.lan_send_ae2_terminal(host,conn);return true;
+        }
         if encoding && (0..=53).contains(&p.slot) {
             if (30..=40).contains(&p.slot) && super::lan_crafting::input(p.input) == Input::Pickup {
                 if let Some(t) = host
@@ -4289,14 +4346,16 @@ impl Game<'_> {
                     t.substitutes = !t.substitutes;
                 }
             } else if (0..=8).contains(&p.slot)
-                && super::lan_crafting::input(p.input) == Input::Pickup
+                && matches!(super::lan_crafting::input(p.input),Input::Pickup|Input::QuickMove)
             {
-                let held = host
+                let mut held = host
                     .hub
                     .guests
                     .iter()
                     .find(|g| g.conn == conn)
                     .and_then(|g| g.carried.clone());
+                if p.button==2 {if let Some(item)=held.as_mut(){item.count=1;}}
+                let drag=matches!(p.button,2|3);
                 let available_fluids = self.ae2_grid_fluids(pos).unwrap_or_default();
                 let cursor=super::ae2_encoding::cursor_ghost(held.as_ref(),&|id,fluid|fluid||self.res.items().get(id).is_some());
                 let allowed=host.play.get(&conn).and_then(|p|p.ae2_terminal.as_ref()).is_some_and(|t|t.special_mode==0 || (t.special_mode==1 && p.slot<3) || (t.special_mode==2 && p.slot==0));
@@ -4314,7 +4373,7 @@ impl Game<'_> {
                     let selected=encoding_selected_fluid(held.as_ref(),t.fluid_amount,t.selected_fluid,&available_fluids);
                     if let Some(fluid)=t.processing.then(||encoding_emptying_action(held.as_ref(),i32::from(p.button))).flatten() {
                         t.pattern_grid[index]=None;t.fluid_inputs[index]=Some(fluid);
-                    } else if let Some(value)=super::ae2_encoding::select_ghost(&cursor,t.processing && t.fluid_mode,selected,p.button==1) {
+                    } else if let Some(value)=super::ae2_encoding::select_ghost(&cursor,!drag && t.processing && t.fluid_mode,selected,p.button==1) {
                         let max=t.pattern_grid[index].as_ref().map_or(64,|item|self.ae2_config_item_max(item));
                         super::ae2_encoding::click_ghost(&mut t.pattern_grid[index],&mut t.fluid_inputs[index],value,p.button==1,max,i32::MAX as u32,i64::MAX as u64);
                     }
@@ -4322,14 +4381,16 @@ impl Game<'_> {
                 let special_input=host.play.get(&conn).and_then(|p|p.ae2_terminal.as_ref()).filter(|t|t.special_mode==2 && p.slot==0).and_then(|t|t.pattern_grid[0].clone());
                 if let Some(item)=special_input {let selected=self.res.stations().recipes.stonecutter(&item).first().map(|r|r.id.clone());if let Some(t)=host.play.get_mut(&conn).and_then(|p|p.ae2_terminal.as_mut()){t.stone_recipe=selected;}}
             } else if (18..=20).contains(&p.slot)
-                && super::lan_crafting::input(p.input) == Input::Pickup
+                && matches!(super::lan_crafting::input(p.input),Input::Pickup|Input::QuickMove)
             {
-                let held = host
+                let mut held = host
                     .hub
                     .guests
                     .iter()
                     .find(|g| g.conn == conn)
                     .and_then(|g| g.carried.clone());
+                if p.button==2 {if let Some(item)=held.as_mut(){item.count=1;}}
+                let drag=matches!(p.button,2|3);
                 let available_fluids = self.ae2_grid_fluids(pos).unwrap_or_default();
                 let cursor=super::ae2_encoding::cursor_ghost(held.as_ref(),&|id,fluid|fluid||self.res.items().get(id).is_some());
                 if let Some(t) = host
@@ -4342,7 +4403,7 @@ impl Game<'_> {
                         let selected=encoding_selected_fluid(held.as_ref(),t.fluid_amount,t.selected_fluid,&available_fluids);
                         if let Some(fluid)=encoding_emptying_action(held.as_ref(),i32::from(p.button)) {
                             t.processing_outputs[index]=None;t.fluid_outputs[index]=Some(fluid);
-                        } else if let Some(value)=super::ae2_encoding::select_ghost(&cursor,t.fluid_mode,selected,p.button==1) {
+                        } else if let Some(value)=super::ae2_encoding::select_ghost(&cursor,!drag && t.fluid_mode,selected,p.button==1) {
                             let max=t.processing_outputs[index].as_ref().map_or(64,|item|self.ae2_config_item_max(item));
                             super::ae2_encoding::click_ghost(&mut t.processing_outputs[index],&mut t.fluid_outputs[index],value,p.button==1,max,i32::MAX as u32,i64::MAX as u64);
                         }
@@ -4819,7 +4880,7 @@ pub(super) struct GuestMachine {
     snapshot: Vec<Option<ItemStack>>,
     provider_return_revisions: std::collections::VecDeque<(i32,Vec<Option<ProviderReturnSlot>>)>,
     workbench_page: usize,
-    workbench_owner: Option<u64>,
+    owner: MachineMenuOwner,
     workbench_revisions: std::collections::VecDeque<WorkbenchRevision>,
     owner_dim: String,
     provider_owner: Option<ProviderMenuOwner>,
@@ -4855,10 +4916,6 @@ impl Game<'_> {
     fn ae2_drive_window_valid(&self,pos:(i32,i32,i32),original:Option<u64>)->bool {
         original.is_none() || (self.world.block_entities.incarnation(&pos)==original
             && matches!(self.world.block_entities.get(&pos),Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.kind==horizon_client::ae2_world::MachineKind::Drive))
-    }
-    fn ae2_workbench_window_valid(&self,pos:(i32,i32,i32),original:Option<u64>)->bool {
-        original.is_none() || (self.world.block_entities.incarnation(&pos)==original
-            && matches!(self.world.block_entities.get(&pos),Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.kind==horizon_client::ae2_world::MachineKind::CellWorkbench))
     }
     /// PatternProviderBlock.useWithoutItem and PatternProviderPart's equivalent
     /// open the same menu, addressed to the actual block or the clicked face.
@@ -5419,18 +5476,24 @@ impl Game<'_> {
             if let Some(next)=super::ae2_number_entry::number_step(&edit.text,delta,0,edit.max/i64::from(edit.unit),'.'){self.lan_processing_amount_update(host,conn,&next,true);}
         } else {self.lan_send_processing_amount(host,conn);}true
     }
+    /// Window-scoped fake-slot metadata lets the client send source actions
+    /// without predicting physical movement in a vanilla generic container.
+    pub(super) fn lan_ae2_fake_slots(host:&mut super::lan::LanHost,conn:u32,window:i32,slots:&[u8]) {
+        let mut data=window.to_be_bytes().to_vec();data.extend_from_slice(slots);
+        host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload{channel:"ae2:fake_slots".into(),data}));
+    }
     /// Tell the local renderer this generic container is an AE2 base screen.
     pub(super) fn lan_mark_ae2_base_screen(host:&mut super::lan::LanHost,conn:u32,window:i32) {
         host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload{channel:"ae2:base_screen".into(),data:window.to_be_bytes().to_vec()}));
     }
-    /// Interface submenus retain the physical block incarnation and, for a
-    /// cable part, the mounted part's identity as well as its face.
-    fn ae2_interface_menu_owner(&self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>)->Option<InterfaceMenuOwner> {
-        use horizon_client::{ae2_world::MachineKind,containers::BlockEntity};
+    /// Every machine menu belongs to the original block entity and, for a
+    /// cable host, the original face part. Replacing a same-kind machine must
+    /// close the old menu rather than bind it to the new instance.
+    fn ae2_machine_menu_owner(&self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>)->Option<MachineMenuOwner> {
+        use horizon_client::containers::BlockEntity;
         let machine=if let Some(part)=part {self.ae2_part_machine(part).ok().flatten()?} else {
             let BlockEntity::Ae2(machine)=self.world.block_entities.get(&pos)? else{return None};(**machine).clone()
         };
-        if machine.kind!=MachineKind::Interface {return None;}
         let host=self.world.block_entities.incarnation(&pos)?;
         let identity=if let Some(part)=part {
             let BlockEntity::Ae2(host_machine)=self.world.block_entities.get(&pos)? else{return None};
@@ -5440,7 +5503,11 @@ impl Game<'_> {
             let record=matches.next()?;if matches.next().is_some(){return None;}
             Some(super::ae2_channels::part_identity(record)?)
         } else {None};
-        Some(InterfaceMenuOwner{host,part:identity})
+        Some(MachineMenuOwner{host,part:identity,kind:machine.kind})
+    }
+    fn ae2_interface_menu_owner(&self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>)->Option<InterfaceMenuOwner> {
+        let owner=self.ae2_machine_menu_owner(pos,part)?;
+        (owner.kind==horizon_client::ae2_world::MachineKind::Interface).then_some(InterfaceMenuOwner{host:owner.host,part:owner.part})
     }
     fn ae2_stock_machine(&self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>,owner:InterfaceMenuOwner)->Option<horizon_client::ae2_world::Machine> {
         use horizon_client::containers::BlockEntity;
@@ -5634,6 +5701,7 @@ impl Game<'_> {
             return false;
         }
         let Ok(provider_owner)=self.ae2_provider_menu_owner(pos,Some(part)) else{return false};
+        let Some(owner)=self.ae2_machine_menu_owner(pos,Some(part)) else{return false};
         self.lan_ae2_portable_closed(host, conn, None);
         self.lan_ae2_bus_closed(host, conn, None);
         self.lan_ae2_network_tool_closed(host, conn, None);
@@ -5665,7 +5733,7 @@ impl Game<'_> {
             snapshot: vec![],
             provider_return_revisions: std::collections::VecDeque::new(),
             workbench_page: 0,
-            workbench_owner: None,
+            owner,
             workbench_revisions: std::collections::VecDeque::new(),
             owner_dim: self.dim.id().to_owned(),
             provider_owner,
@@ -5769,9 +5837,7 @@ impl Game<'_> {
         let drive_owner = if matches!(self.world.block_entities.get(&pos),Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.kind==horizon_client::ae2_world::MachineKind::Drive) {
             let Some(identity)=self.world.block_entities.incarnation(&pos) else{return false};Some(identity)
         } else {None};
-        let workbench_owner = if matches!(self.world.block_entities.get(&pos),Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.kind==horizon_client::ae2_world::MachineKind::CellWorkbench) {
-            let Some(identity)=self.world.block_entities.incarnation(&pos) else{return false};Some(identity)
-        } else {None};
+        let Some(owner)=self.ae2_machine_menu_owner(pos,None) else{return false};
         self.lan_ae2_portable_closed(host, conn, None);
         self.lan_ae2_bus_closed(host, conn, None);
         self.lan_ae2_network_tool_closed(host, conn, None);
@@ -5813,7 +5879,7 @@ impl Game<'_> {
             snapshot: vec![],
             provider_return_revisions: std::collections::VecDeque::new(),
             workbench_page: 0,
-            workbench_owner,
+            owner,
             workbench_revisions: std::collections::VecDeque::new(),
             owner_dim: self.dim.id().to_owned(),
             provider_owner,
@@ -5831,16 +5897,16 @@ impl Game<'_> {
         if host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref()).is_some_and(|m|m.stock_edit.is_some()){self.lan_send_stock(host,conn);return;}
         if host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref()).is_some_and(|m|m.priority_edit.is_some()){self.lan_send_priority(host,conn);return;}
         use horizon_protocol::packets::play::{self, Clientbound as C};
-        let Some((pos, window, part, provider_owner, drive_owner, workbench_owner)) = host
+        let Some((pos, window, part, owner)) = host
             .play
             .get(&conn)
             .and_then(|p| p.ae2_machine.as_ref())
-            .map(|m| (m.pos, m.window, m.part, m.provider_owner, m.drive_owner, m.workbench_owner))
+            .map(|m| (m.pos, m.window, m.part, m.owner))
         else {
             return;
         };
         let snapshot=self.ae2_owned_machine_slots(pos,part)
-            .filter(|_|self.ae2_provider_window_valid(pos,part,provider_owner) && self.ae2_drive_window_valid(pos,drive_owner) && self.ae2_workbench_window_valid(pos,workbench_owner));
+            .filter(|_|self.ae2_machine_menu_owner(pos,part)==Some(owner));
         let Some(snapshot) = snapshot else {
             self.lan_ae2_machine_closed(host, conn, None);
             host.hub.send_to(
@@ -5871,6 +5937,13 @@ impl Game<'_> {
                 }
                 _ => None,
             }
+        };
+        let fake_slots:Vec<u8>=match displayed_machine.as_ref().map(|machine|machine.kind) {
+            Some(horizon_client::ae2_world::MachineKind::CellWorkbench)=>(0..63usize.saturating_sub(page*18).min(18)).map(|i|(5+i) as u8).collect(),
+            // The Interface config wrapper's registered item capacity is 64;
+            // unlike overstacking fake slots, its hotbar key is a fake click.
+            Some(horizon_client::ae2_world::MachineKind::Interface)=>(9..18).map(|slot|slot|0x80).collect(),
+            _=>Vec::new(),
         };
         let provider_return_snapshot=displayed_machine.as_ref().and_then(|machine|provider_return_slots(machine).ok());
         let workbench_keep=displayed_machine.as_ref().filter(|machine|machine.kind==horizon_client::ae2_world::MachineKind::CellWorkbench).map(workbench_copy_kept);
@@ -5955,6 +6028,7 @@ impl Game<'_> {
         }
         items.extend((9..36).chain(0..9).map(|i| g.inventory[i].clone()));
         let carried = g.carried.clone();
+        Self::lan_ae2_fake_slots(host,conn,window,&fake_slots);
         let Some(m) = host
             .play
             .get_mut(&conn)
@@ -6002,13 +6076,12 @@ impl Game<'_> {
                         m.snapshot.clone(),
                         m.owner_dim.clone(),
                         m.part,
-                        m.provider_owner,
-                        m.drive_owner,
+                        m.owner,
                     )
                 })
             })
             .collect();
-        for (conn, pos, window, old, owner_dim, part, provider_owner, drive_owner) in windows {
+        for (conn, pos, window, old, owner_dim, part, owner) in windows {
             let valid = host
                 .hub
                 .guests
@@ -6017,11 +6090,7 @@ impl Game<'_> {
                 .is_some_and(|g| {
                     !g.spectator() && g.within_block_range([pos.0, pos.1, pos.2], 4.0)
                 });
-            let stock_valid=host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref()).and_then(|m|m.stock_edit.as_ref())
-                .is_none_or(|edit|self.ae2_interface_menu_owner(pos,part)==Some(edit.owner));
-            let workbench_valid=host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref())
-                .is_none_or(|m|self.ae2_workbench_window_valid(pos,m.workbench_owner));
-            if !valid || !stock_valid || !workbench_valid || owner_dim != self.dim.id() || !self.ae2_provider_window_valid(pos,part,provider_owner) || !self.ae2_drive_window_valid(pos,drive_owner) {
+            if !valid || owner_dim != self.dim.id() || self.ae2_machine_menu_owner(pos,part)!=Some(owner) {
                 self.lan_ae2_machine_closed(host, conn, None);
                 host.hub.send_to(
                     conn,
@@ -6061,7 +6130,7 @@ impl Game<'_> {
             .play
             .get(&conn)
             .and_then(|p| p.ae2_machine.as_ref())
-            .is_some_and(|m| m.owner_dim == self.dim.id() && self.ae2_provider_window_valid(pos,part,m.provider_owner) && self.ae2_drive_window_valid(pos,m.drive_owner) && self.ae2_workbench_window_valid(pos,m.workbench_owner));
+            .is_some_and(|m| m.owner_dim == self.dim.id() && self.ae2_machine_menu_owner(pos,part)==Some(m.owner));
         if !valid || !owner_valid || self.ae2_owned_machine_slots(pos, part).is_none() {
             self.lan_ae2_machine_closed(host, conn, None);
             host.hub.send_to(
@@ -6088,6 +6157,10 @@ impl Game<'_> {
         let paged_ghost = part.is_none()
             && matches!(self.world.block_entities.get(&pos),Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.kind==horizon_client::ae2_world::MachineKind::CellWorkbench)
             && (5..23).contains(&p.slot);
+        if paged_ghost && matches!(p.button,2|3) && super::lan_crafting::input(p.input)==Input::Pickup
+            && host.hub.guests.iter().find(|g|g.conn==conn).is_none_or(|g|g.carried.is_none()) {
+            self.lan_send_ae2_machine(host,conn);return true;
+        }
         if paged_ghost {
             // AEBaseMenu receives a separate fake-slot action without a vanilla
             // state ID. A cursor-only refresh must not drop an ordered action,
@@ -6226,7 +6299,7 @@ impl Game<'_> {
         }
         if (9..18).contains(&p.slot)
             && super::lan_crafting::input(p.input) == Input::Pickup
-            && (0..=1).contains(&p.button)
+            && (0..=3).contains(&p.button)
         {
             let machine = if let Some(part) = part {
                 self.ae2_part_machine(part).ok().flatten()
@@ -6239,20 +6312,22 @@ impl Game<'_> {
             if let Some(mut machine) =
                 machine.filter(|m| m.kind == horizon_client::ae2_world::MachineKind::Interface)
             {
-                let cursor = host
+                let mut cursor = host
                     .hub
                     .guests
                     .iter()
                     .find(|g| g.conn == conn)
-                    .and_then(|g| g.carried.as_ref());
+                    .and_then(|g| g.carried.clone());
+                if matches!(p.button,2|3) && cursor.is_none() {self.lan_send_ae2_machine(host,conn);return true;}
+                if p.button==2 {if let Some(item)=cursor.as_mut(){item.count=1;}}
                 let configured=(||->Result<(),String>{
                     let index=(p.slot-9) as usize;
-                    if let Some(fluid)=encoding_emptying_action(cursor,i32::from(p.button)) {
+                    if let Some(fluid)=encoding_emptying_action(cursor.as_ref(),i32::from(p.button)) {
                         return super::ae2_interface::set_interface_fluid_config_amount(&mut machine,index,Some((&fluid.key,fluid.amount)));
                     }
                     let mut item=super::ae2_interface::interface_config(&machine)?[index].clone();
                     let mut fluid=super::ae2_interface::interface_fluid_config(&machine)?[index].as_ref().map(|(key,amount)|super::ae2_processing::PatternFluid{key:key.clone(),amount:*amount});
-                    let held=super::ae2_encoding::cursor_ghost(cursor,&|id,fluid|fluid||self.res.items().get(id).is_some())?;
+                    let held=super::ae2_encoding::cursor_ghost(cursor.as_ref(),&|id,fluid|fluid||self.res.items().get(id).is_some())?;
                     let max_for=|item:&ItemStack|self.ae2_config_item_max(item);
                     let displayed_max=item.as_ref().map_or(64,&max_for);
                     let item_capacity=held.as_ref().and_then(|(value,_)|if let super::ae2_encoding::WrappedGhost::Item(item)=value {Some(max_for(item))}else{None}).or_else(||item.as_ref().map(&max_for)).unwrap_or(64);
@@ -6429,8 +6504,9 @@ impl Game<'_> {
             54..=62 => Some(p.slot as usize - 54),
             _ => None,
         };
-        let input = super::lan_crafting::input(p.input);
-        let button = i32::from(p.button);
+        let raw_input=super::lan_crafting::input(p.input);
+        let input=if paged_ghost && raw_input==Input::QuickMove {Input::Pickup}else{raw_input};
+        let button = if paged_ghost && matches!(p.button,2|3) {0} else {i32::from(p.button)};
         let mut workbench_page = host
             .play
             .get(&conn)
@@ -7367,12 +7443,18 @@ mod terminal_filter_tests {
         let history=std::collections::VecDeque::from([(4,Some(original.clone()),0),(5,Some(original.clone()),0),(6,Some(changed.clone()),0)]);
         assert!(encoding_revision_matches(&history,4,Some(&original),0,None),"older unchanged views remain usable");
         assert!(encoding_revision_matches(&history,4,Some(&blank),0,None),"physical blank insertion does not change the viewed recipe");
-        assert!(!encoding_revision_matches(&history,4,Some(&changed),0,Some(0)),"a queued click cannot overwrite another viewer's changed ghost");
-        assert!(encoding_revision_matches(&history,4,Some(&changed),0,Some(3)),"independent ghost slots accept rapid queued clicks");
+        assert!(!encoding_revision_matches(&history,4,Some(&changed),0,Some(0)),"a queued editor open cannot bind a different ghost");
+        assert!(encoding_revision_matches(&history,4,Some(&changed),0,Some(3)),"an editor open tolerates a different slot changing");
         assert!(!encoding_revision_matches(&history,4,Some(&changed),0,Some(13)),"recipe controls require a current recipe");
         assert!(!encoding_revision_matches(&history,4,Some(&changed),1,Some(3)),"queued clicks cannot cross processing pages");
         assert!(encoding_revision_matches(&history,6,Some(&changed),0,None));
         assert!(!encoding_revision_matches(&history,3,Some(&changed),0,Some(3)),"expired revisions fail closed");
+        assert!(encoding_drag_revision_matches(&history,4,Some(&changed),0),"ordered fake drags apply to the current ghost");
+        assert!(!encoding_drag_revision_matches(&history,4,Some(&changed),1),"fake drags cannot cross pages");
+        let mut other_mode=changed.clone();let mut processing=recipe.clone();processing.processing=true;processing.save(&mut other_mode).unwrap();
+        assert!(!encoding_drag_revision_matches(&history,4,Some(&other_mode),0),"fake drags cannot cross modes");
+        assert!(!encoding_drag_revision_matches(&history,3,Some(&changed),0),"expired drag revisions fail closed");
+
     }
     #[test]
     fn search_sort_and_craftable_filter_keep_the_right_item_keys() {

@@ -57,6 +57,14 @@ try {
     throw failure;
   }
   assert.match(String(slot(configured, 306)?.components ?? ''), /minecraft:water/);
+  // Left click treats the bucket as an item; only EMPTY_ITEM on right click
+  // may copy its contained fluid into a fluid-only configuration slot.
+  await fixture.raw('click-slot 308');
+  await fixture.command('data get entity @s SelectedItem');
+  const afterLeft = await fixture.ae(`workbench status ${bench}`);
+  assert(!afterLeft.filters.some((entry: any) => entry.index === 3), 'server rejects a filled bucket as an item filter');
+  const rejectedBucket = await until(() => fixture.raw('screen'), view => !slot(view, 308)?.item && view.carried?.item === 'minecraft:water_bucket', 'left-click bucket rejected by fluid filter');
+  assert(!slot(rejectedBucket, 308)?.item); assert.equal(rejectedBucket.carried?.item, 'minecraft:water_bucket');
   await fixture.raw('click-slot 3'); await fixture.command('data get entity @s SelectedItem');
   await until(() => fixture.raw('inventory'), view => !view.carried && view.hotbar?.[3]?.item === 'minecraft:water_bucket', 'water bucket returned to its slot');
 

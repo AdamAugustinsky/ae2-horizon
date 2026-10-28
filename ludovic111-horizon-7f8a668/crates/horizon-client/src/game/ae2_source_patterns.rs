@@ -38,7 +38,18 @@ pub(super) fn crafting(stack:&ItemStack)->Option<Result<SourceCrafting,String>> 
         let mut grid=Vec::with_capacity(9);
         for entry in inputs {
             if matches!(entry,Tag::Compound(data) if data.is_empty()){grid.push(None);}else{
-                let item=item(entry)?;if item.count!=1 {return Err("crafting input is not singular".into());}grid.push(Some(item));
+                let item=item(entry)?;
+                // AECraftingPattern.getCraftingInputs uses
+                // GenericStack.fromItemStack, which unwraps item keys before
+                // the recipe sees them. Non-unit and fluid wrappers need a
+                // separate execution model; never fabricate an input for them.
+                let item=if let Some(value)=ae2_generic_stack::unwrap_item_stack(&item)? {
+                    if value.fluid || value.amount!=1 {return Err("unsupported wrapped crafting input".into());}
+                    horizon_client::ae2_cell_codec::prototype(&value.key)?
+                } else {
+                    if item.count!=1 {return Err("crafting input is not singular".into());}item
+                };
+                grid.push(Some(item));
             }
         }
         grid.resize(9,None);
@@ -106,6 +117,25 @@ pub(super) fn encode_special(kind:&str,grid:&[Option<ItemStack>],output:&ItemSta
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapped_singular_source_crafting_input_uses_the_inner_item_key() {
+        let mut input=ItemStack::new("minecraft:oak_log",1);
+        input.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("variant",Tag::String("wrapped".into()))])));
+        let key=horizon_client::ae2_cell_codec::key(&input).unwrap();
+        let wrapped=ae2_generic_stack::wrap(&GenericStack{key:key.clone(),fluid:false,amount:1}).unwrap();
+        let mut grid=vec![None;9];grid[0]=Some(wrapped.clone());
+        let output=ItemStack::new("minecraft:oak_planks",4);
+        let mut pattern=ItemStack::new("ae2:crafting_pattern",1);
+        pattern.data_mut().set_other("ae2:encoded_crafting_pattern",Some(encode_crafting(&grid,&output,"minecraft:oak_planks",false,false).unwrap()));
+        let decoded=crafting(&pattern).unwrap().unwrap();
+        assert_eq!(decoded.grid[0],Some(input));assert_eq!(decoded.output,output);
+        let mut too_many=wrapped.clone();too_many.data_mut().set_other("ae2:wrapped_stack",Some(ae2_generic_stack::encode(&GenericStack{key,fluid:false,amount:2}).unwrap()));
+        grid[0]=Some(too_many);pattern.data_mut().set_other("ae2:encoded_crafting_pattern",Some(encode_crafting(&grid,&decoded.output,"minecraft:oak_planks",false,false).unwrap()));
+        assert!(crafting(&pattern).unwrap().is_err());
+        let fluid=GenericStack{key:horizon_client::ae2_cell_codec::fluid_key("minecraft:water"),fluid:true,amount:1000};
+        grid[0]=Some(ae2_generic_stack::wrap(&fluid).unwrap());pattern.data_mut().set_other("ae2:encoded_crafting_pattern",Some(encode_crafting(&grid,&decoded.output,"minecraft:oak_planks",false,false).unwrap()));
+        assert!(crafting(&pattern).unwrap().is_err());
+    }
     #[test]
     fn raw_source_flags_follow_dynamic_ops_number_byte_value() {
         // NbtOps.getNumberValue returns the Java Number; DynamicOps reads its

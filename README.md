@@ -28,9 +28,9 @@ These areas contain implemented behavior and targeted tests; none is a blanket c
 
 ## Status
 
-**Experimental; full AE2 parity remains unfinished.** The source comparison now covers persistent AE2 components, cells and patterns, asynchronous crafting, physical machine settings, wireless terminals, links and selected local menus. Coordinated host gates and hidden native-world regressions exercise named behaviors and restart custody. See [validation evidence](docs/VALIDATION.md), [project status](docs/STATUS.md) and the parity ledgers for exact scope. Java-world and ATM10 compatibility have not been established. Use a new, disposable world while exploring.
+**Experimental; full AE2 parity remains unfinished.** The source comparison now covers persistent AE2 components, cells and patterns, asynchronous crafting, physical machine settings, wireless terminals, links and selected local menus. Coordinated host gates and hidden native-world regressions exercise named behaviors and restart custody, including a 999,999-item processing reservation and partial Provider delivery. See [validation evidence](docs/VALIDATION.md), [project status](docs/STATUS.md) and the parity ledgers for exact scope. Java-world and ATM10 compatibility have not been established. Use a new, disposable world while exploring.
 
-The default server-thread gameplay path has the strongest coverage. The alternate in-frame path has a known Pattern Provider menu/session issue. Details and the scope of the checks are in [docs/STATUS.md](docs/STATUS.md).
+The default server-thread gameplay path has the strongest coverage. Provider and selected terminal/encoding sessions also pass hidden in-frame tests; several other in-frame machine and part menus remain incomplete. Details and the scope of the checks are in [docs/STATUS.md](docs/STATUS.md).
 
 ## Build and play
 
@@ -60,7 +60,7 @@ bun run scripts/play.ts
 
 Substitute the paths for your own installation. The content preparation step obtains the pinned AE2 source and NeoForge conventional tag data; it does not make this client a NeoForge mod. Do not commit Minecraft JARs, prepared resources or generated assets.
 
-The tested default build disables audio and controller support. To enable audio in a separate build, use `bun run scripts/build.ts --features audio`; that configuration was not part of the stated Stage 83 checks.
+The tested default build disables audio and controller support. To enable audio in a separate build, use `bun run scripts/build.ts --features audio`; that configuration was not part of the stated native-world checks.
 
 The play command opens a visible title screen with an isolated fresh profile; the illustrated hall is not bundled. To start a new creative test world directly, use:
 

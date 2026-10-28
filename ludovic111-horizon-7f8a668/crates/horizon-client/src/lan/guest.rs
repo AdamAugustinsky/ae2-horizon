@@ -544,10 +544,42 @@ fn network_stack(
     if let Some(d) = s.data() {
         // CUSTOM_DATA is an NBT compound on the wire. It may contain storage
         // cells' real contents; omitting it silently changes item identity.
-        if let Some(tag @ horizon_world::nbt::Tag::Compound(_)) = d.other("minecraft:custom_data") {
+        let mut custom_data = d.other("minecraft:custom_data").cloned();
+        // The vanilla wire registry has no AE2 component codecs. Carry all
+        // source-registered AE2 components in one versioned transport-only
+        // envelope, independent of item type. Escape an occupied key even if
+        // no AE2 components are present so arbitrary custom data roundtrips.
+        #[cfg(feature = "ae2-lab")]
+        {
+            use horizon_world::nbt::Tag;
+            let mut components = horizon_world::nbt::Compound::new();
+            for (id, value) in &d.other {
+                if crate::ae2_components::PERSISTENT_IDS.contains(&id.as_str()) {
+                    components.insert(id.as_str().into(), value.clone());
+                }
+            }
+            let key = "horizon:wire_ae2_components";
+            let occupied = matches!(&custom_data, Some(Tag::Compound(map)) if map.contains_key(&key.into()));
+            if !components.is_empty() || occupied {
+                let had_custom_data = matches!(&custom_data, Some(Tag::Compound(_)));
+                let mut envelope = match custom_data.take() {
+                    Some(Tag::Compound(map)) => map,
+                    _ => Default::default(),
+                };
+                let previous = envelope.remove(&key.into());
+                let mut wrapped = horizon_world::nbt::Compound::new();
+                wrapped.insert("version".into(), Tag::Byte(1));
+                wrapped.insert("had_custom_data".into(), Tag::Byte(i8::from(had_custom_data)));
+                wrapped.insert("components".into(), Tag::Compound(components));
+                if let Some(previous) = previous { wrapped.insert("previous".into(), previous); }
+                envelope.insert(key.into(), Tag::Compound(wrapped));
+                custom_data = Some(Tag::Compound(envelope));
+            }
+        }
+        if let Some(tag @ horizon_world::nbt::Tag::Compound(_)) = custom_data {
             stack.added.push((
                 horizon_protocol::item::component::CUSTOM_DATA,
-                horizon_protocol::item::Component::Nbt(tag.clone()),
+                horizon_protocol::item::Component::Nbt(tag),
             ));
         }
         if let Some(horizon_world::nbt::Tag::List(lines)) = d.other("minecraft:lore") {
@@ -678,7 +710,8 @@ fn network_stack(
     if let Some(name) = s.custom_name() {
         stack.added.push((
             horizon_protocol::item::component::CUSTOM_NAME,
-            horizon_protocol::item::Component::Text(horizon_protocol::text::literal(name)),
+            horizon_protocol::item::Component::Text(s.custom_name_component().cloned()
+                .unwrap_or_else(|| horizon_protocol::text::literal(name))),
         ));
     }
     // The component as loaded, so a translatable name stays one.

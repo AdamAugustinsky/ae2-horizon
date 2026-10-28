@@ -111,51 +111,13 @@ fn portable_energy_cards(stack: &ItemStack) -> Result<u32, String> {
     if !["1k", "4k", "16k", "64k", "256k"].contains(&suffix) {
         return Err("unsupported portable cell".into());
     }
-    let Some(custom) = stack.data().and_then(|d| d.other("minecraft:custom_data")) else {
-        return Ok(0);
-    };
-    let horizon_world::nbt::Tag::Compound(map) = custom else {
-        return Err("invalid portable custom data".into());
-    };
-    let Some(settings) = map.get(&"ae2_cell_settings".into()) else {
-        return Ok(0);
-    };
-    let Some(horizon_world::nbt::Tag::List(cards)) = settings.get("upgrades") else {
-        return Err("invalid portable cards".into());
-    };
-    let mut count = 0;
-    for card in cards {
-        if card.get("count") != Some(&horizon_world::nbt::Tag::Int(1)) {
-            return Err("invalid portable card count".into());
-        }
-        if card.get("id") == Some(&horizon_world::nbt::Tag::String("ae2:energy_card".into())) {
-            count += 1;
-        }
-    }
-    if count > 2 {
-        return Err("too many portable energy cards".into());
-    }
-    Ok(count)
+    let cards=horizon_client::ae2_upgrade_inventory::Inventory::read(stack)?;
+    Ok(cards.slots.iter().flatten().filter(|card|card.item.as_ref()=="ae2:energy_card").count() as u32)
 }
 pub(super) fn portable_energy(stack: &ItemStack) -> Result<(f64, f64), String> {
     let _=portable_energy_cards(stack)?;
-    let mut max = horizon_client::ae2_common_config::batteries().portable_cell;
-    if let Some(value)=stack.data().and_then(|data|data.other("minecraft:custom_data")).and_then(|data|data.get("ae2:energy_capacity")) {
-        let horizon_world::nbt::Tag::Double(bits)=value else {return Err("invalid portable capacity".into());};
-        max=f64::from_bits(*bits);if !max.is_finite() {return Err("invalid portable capacity".into());}
-    }
-    let power = match stack
-        .data()
-        .and_then(|d| d.other("minecraft:custom_data"))
-        .and_then(|t| t.get("ae2_portable_energy"))
-    {
-        None => 0.0,
-        Some(horizon_world::nbt::Tag::Double(bits)) => f64::from_bits(*bits),
-        _ => return Err("invalid portable energy".into()),
-    };
-    if !power.is_finite() || power < 0.0 {
-        return Err("invalid portable energy".into());
-    }
+    let max = horizon_client::ae2_powered_items::component_power_value(stack, "ae2:energy_capacity", "ae2:energy_capacity", horizon_client::ae2_common_config::batteries().portable_cell)?;
+    let power = horizon_client::ae2_powered_items::component_power_value(stack, "ae2:stored_energy", "ae2_portable_energy", 0.0)?;
     Ok((power, max))
 }
 pub(super) fn portable_charge_rate(stack: &ItemStack) -> Result<f64, String> {
@@ -166,18 +128,7 @@ fn set_portable_energy(stack: &mut ItemStack, power: f64) -> Result<(), String> 
     if !power.is_finite() {
         return Err("invalid portable energy".into());
     }
-    let mut data = match stack.data().and_then(|d| d.other("minecraft:custom_data")) {
-        None => Default::default(),
-        Some(horizon_world::nbt::Tag::Compound(m)) => m.clone(),
-        _ => return Err("invalid portable custom data".into()),
-    };
-    if power<0.0001 {data.remove(&"ae2_portable_energy".into());}
-    else {data.insert("ae2_portable_energy".into(),horizon_world::nbt::Tag::Double(power.to_bits()));}
-    stack.data_mut().set_other(
-        "minecraft:custom_data",
-        Some(horizon_world::nbt::Tag::Compound(data)),
-    );
-    Ok(())
+    horizon_client::ae2_powered_items::set_component_power_value(stack, "ae2:stored_energy", "ae2_portable_energy", (power>=0.0001).then_some(power))
 }
 /// Returns accepted AE; simulation does not mutate the item. Charger must
 /// debit exactly this amount from its real buffer/grid and respect charge rate.
@@ -219,6 +170,20 @@ pub(super) fn clamp_portable_energy(stack: &mut ItemStack) -> Result<(), String>
 #[cfg(test)]
 mod portable_tests {
     use super::*;
+    #[test]
+    fn source_portable_power_overrides_legacy_and_updates_on_transfer() {
+        use horizon_world::nbt::Tag;
+        let mut cell=ItemStack::new("ae2:portable_item_cell_1k",1);
+        cell.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2_portable_energy",Tag::Double(90.0f64.to_bits()))])));
+        cell.data_mut().set_other("ae2:stored_energy",Some(Tag::Double(20.0f64.to_bits())));
+        cell.data_mut().set_other("ae2:energy_capacity",Some(Tag::Double(50.0f64.to_bits())));
+        assert_eq!(portable_energy(&cell).unwrap(),(20.0,50.0));
+        portable_insert_energy(&mut cell,10.0,false).unwrap();
+        assert_eq!(portable_energy(&cell).unwrap(),(30.0,50.0));
+        assert_eq!(cell.data().unwrap().other("ae2:stored_energy"),Some(&Tag::Double(30.0f64.to_bits())));
+        let restored=horizon_client::save::item_from_nbt(&horizon_client::save::item_to_nbt(&cell)).unwrap();
+        assert_eq!(portable_energy(&restored).unwrap(),(30.0,50.0));
+    }
     #[test]
     fn portable_battery_simulation_limits_and_item_persistence() {
         let mut cell = ItemStack::new("ae2:portable_item_cell_1k", 1);

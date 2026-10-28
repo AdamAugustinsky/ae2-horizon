@@ -23,6 +23,42 @@ pub(super) fn is_wireless(stack: &ItemStack) -> bool {
             "ae2:wireless_terminal" | "ae2:wireless_crafting_terminal"
         )
 }
+/// KeyTypeSelection.forStack: absence enables every native type; an explicit
+/// empty selection stays empty until the player selects a type.
+pub(super) fn enabled_key_types(stack: &ItemStack) -> Result<(bool, bool), String> {
+    if !is_wireless(stack) { return Err("not a wireless terminal".into()); }
+    let Some(value) = stack.data().and_then(|data|data.other("ae2:enabled_key_types")) else {return Ok((true,true));};
+    let Tag::List(entries)=value else {return Err("invalid enabled key types".into());};
+    let mut enabled=(false,false);
+    for entry in entries {
+        let Tag::String(name)=entry else {return Err("invalid enabled key type".into());};
+        match name.to_string().map_err(|e|e.to_string())?.as_str() {
+            "ae2:i" => enabled.0=true,
+            "ae2:f" => enabled.1=true,
+            _ => {},
+        }
+    }
+    Ok(enabled)
+}
+pub(super) fn store_enabled_key_types(stack: &mut ItemStack, enabled:(bool,bool)) -> Result<(),String> {
+    if !is_wireless(stack) { return Err("not a wireless terminal".into()); }
+    let mut values=Vec::new();
+    if enabled.0 {values.push(Tag::String("ae2:i".into()));}
+    if enabled.1 {values.push(Tag::String("ae2:f".into()));}
+    stack.data_mut().set_other("ae2:enabled_key_types",Some(Tag::List(values)));
+    horizon_client::ae2_stack_identity::synchronize_tracked(stack);
+    Ok(())
+}
+/// Clicking a checkbox cannot disable the final selected type.
+pub(super) fn toggle_key_type(enabled:(bool,bool), fluid:bool) -> (bool,bool) {
+    let (item,liquid)=enabled;
+    if fluid {(item, if liquid && !item {true} else {!liquid})}
+    else {(if item && !liquid {true} else {!item},liquid)}
+}
+/// KeyTypeSelectionButton's shift-click cycles all, item, fluid, all.
+pub(super) fn cycle_key_types(enabled:(bool,bool)) -> (bool,bool) {
+    match enabled {(true,true)=>(true,false),(true,false)=>(false,true),(false,true)=>(true,true),(false,false)=>(true,false)}
+}
 fn custom(stack: &ItemStack) -> Result<horizon_world::nbt::Compound, String> {
     match stack.data().and_then(|d| d.other("minecraft:custom_data")) {
         Some(Tag::Compound(c)) => Ok(c.clone()),
@@ -31,15 +67,24 @@ fn custom(stack: &ItemStack) -> Result<horizon_world::nbt::Compound, String> {
     }
 }
 
-/// The nine physical slots travel in the wireless item's synchronized custom
-/// data, alongside its link, charge and cards. The engine does not yet send
-/// AE2's custom data-component codecs over the vanilla container protocol.
+/// AE2 stores the nine physical crafting slots in ItemContainerContents; old
+/// native saves also carry the legacy custom-data envelope.
 const CRAFTING_GRID: &str = "ae2_wireless_crafting_grid";
 pub(super) fn crafting_grid(stack: &ItemStack) -> Result<Vec<Option<ItemStack>>, String> {
     if stack.item.as_ref() != "ae2:wireless_crafting_terminal" || stack.count != 1 {
         return Err("wireless crafting terminal moved".into());
     }
     let mut slots = vec![None; 9];
+    if let Some(source)=stack.data().and_then(|d|d.other("ae2:crafting_inv")) {
+        let Tag::List(entries)=source else{return Err("invalid source wireless crafting grid".into());};
+        for entry in entries {
+            let Some(Tag::Int(index))=entry.get("slot") else{return Err("invalid source wireless crafting slot".into());};
+            let index=usize::try_from(*index).ok().filter(|index|*index<slots.len()).ok_or("invalid source wireless crafting slot")?;
+            let item=entry.get("item").and_then(horizon_client::save::item_from_nbt).filter(|item|item.count>0 && item.count<=99).ok_or("invalid source wireless crafting item")?;
+            if slots[index].replace(item).is_some(){return Err("duplicate source wireless crafting slot".into());}
+        }
+        return Ok(slots);
+    }
     let data = custom(stack)?;
     let Some(encoded) = data.get(&CRAFTING_GRID.into()) else { return Ok(slots); };
     let Tag::List(entries) = encoded else { return Err("invalid wireless crafting grid".into()); };
@@ -57,13 +102,17 @@ pub(super) fn crafting_grid(stack: &ItemStack) -> Result<Vec<Option<ItemStack>>,
 }
 pub(super) fn store_crafting_grid(stack: &mut ItemStack, slots: &[Option<ItemStack>]) -> Result<(), String> {
     if stack.item.as_ref() != "ae2:wireless_crafting_terminal" || stack.count != 1 || slots.len() != 9
-        || slots.iter().flatten().any(|s| s.count == 0 || s.count > i32::MAX as u32)
+        || slots.iter().flatten().any(|s| s.count == 0 || s.count > 99)
     {
         return Err("invalid wireless crafting owner or grid".into());
     }
     let mut data = custom(stack)?;
     data.insert(CRAFTING_GRID.into(), horizon_client::save::encode_items(slots));
     stack.data_mut().set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+    let source=slots.iter().enumerate().filter_map(|(slot,item)|item.as_ref().map(|item|Tag::compound([
+        ("slot",Tag::Int(slot as i32)),("item",horizon_client::save::item_to_nbt(item)),
+    ]))).collect();
+    stack.data_mut().set_other("ae2:crafting_inv",Some(Tag::List(source)));
     horizon_client::ae2_stack_identity::synchronize_tracked(stack);
     Ok(())
 }
@@ -72,23 +121,20 @@ pub(super) fn link(stack: &mut ItemStack, dim: &str, pos: Pos) -> Result<(), Str
         return Err("not a wireless terminal".into());
     }
     let mut data = custom(stack)?;
-    data.insert(
-        "ae2_wireless_link".into(),
-        Tag::compound([
-            ("dimension", Tag::String(dim.into())),
-            ("pos", Tag::IntArray(vec![pos.0, pos.1, pos.2])),
-        ]),
-    );
+    let target=Tag::compound([("dimension",Tag::String(dim.into())),("pos",Tag::IntArray(vec![pos.0,pos.1,pos.2]))]);
+    data.insert("ae2_wireless_link".into(),target.clone());
     stack
         .data_mut()
         .set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+    stack.data_mut().set_other("ae2:wireless_link_target",Some(target));
     Ok(())
 }
-fn target(stack: &ItemStack) -> Option<(String, Pos)> {
-    let data = stack
-        .data()?
-        .other("minecraft:custom_data")?
-        .get("ae2_wireless_link")?;
+pub(super) fn target(stack: &ItemStack) -> Option<(String, Pos)> {
+    let components=stack.data()?;
+    let data=match components.other("ae2:wireless_link_target") {
+        Some(value)=>value,
+        None=>components.other("minecraft:custom_data")?.get("ae2_wireless_link")?,
+    };
     let Tag::String(dim) = data.get("dimension")? else {
         return None;
     };
@@ -104,37 +150,15 @@ fn cards(stack: &ItemStack) -> Result<u32, String> {
     if !is_wireless(stack) {
         return Err("not a wireless terminal".into());
     }
-    let data = custom(stack)?;
-    let Some(upgrades) = data.get(&"ae2_wireless_upgrades".into()) else {
-        return Ok(0);
-    };
-    let Tag::List(upgrades) = upgrades else {
-        return Err("invalid wireless upgrades".into());
-    };
-    horizon_client::ae2_upgrade_inventory::decode(upgrades, 2)?;
-    if upgrades.len() > 2 {
-        return Err("too many wireless energy cards".into());
-    }
-    for item in upgrades {
-        if item.get("id") != Some(&Tag::String("ae2:energy_card".into()))
-            || item.get("count") != Some(&Tag::Int(1))
-        {
-            return Err("invalid wireless energy card".into());
-        }
-    }
-    Ok(upgrades.len() as u32)
+    let upgrades=horizon_client::ae2_upgrade_inventory::Inventory::read(stack)?;
+    Ok(upgrades.slots.iter().flatten().count() as u32)
 }
 pub(super) fn energy(stack: &ItemStack) -> Result<(f64, f64), String> {
-    let max = horizon_client::ae2_common_config::wireless().terminal_capacity
-        * (1.0 + f64::from(cards(stack)?));
-    let power = match custom(stack)?.get(&"ae2_wireless_energy".into()) {
-        None => 0.0,
-        Some(Tag::Double(bits)) => f64::from_bits(*bits),
-        _ => return Err("invalid wireless energy".into()),
-    };
-    if !power.is_finite() || power < 0.0 {
-        return Err("invalid wireless energy".into());
-    }
+    let base = horizon_client::ae2_common_config::wireless().terminal_capacity;
+    let legacy_max = base * (1.0 + f64::from(cards(stack)?));
+    let default = if stack.data().and_then(|data|data.other("ae2:upgrades")).is_some() {base} else {legacy_max};
+    let max = horizon_client::ae2_powered_items::component_power_value(stack,"ae2:energy_capacity","ae2:energy_capacity",default)?;
+    let power = horizon_client::ae2_powered_items::component_power_value(stack,"ae2:stored_energy","ae2_wireless_energy",0.0)?;
     Ok((power, max))
 }
 pub(super) fn charge_rate(stack: &ItemStack) -> Result<f64, String> {
@@ -156,25 +180,15 @@ pub(super) fn transfer_energy(
         current
     });
     if !simulate && (moved > 0.0 || (insert && current > max)) {
-        let mut data = custom(stack)?;
-        data.insert(
-            "ae2_wireless_energy".into(),
-            Tag::Double(
-                (current
-                    + if insert {
-                        amount.min(max - current)
-                    } else {
-                        -moved
-                    })
-                .max(0.0)
-                .to_bits(),
-            ),
-        );
-        stack
-            .data_mut()
-            .set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+        let next = (current + if insert {amount.min(max-current)} else {-moved}).max(0.0);
+        horizon_client::ae2_powered_items::set_component_power_value(stack,"ae2:stored_energy","ae2_wireless_energy",(next>=0.0001).then_some(next))?;
     }
     Ok(moved)
+}
+/// ItemMenuHost charges CONFIG-scaled energy but converts back to nominal
+/// energy when it computes the number of buffered menu ticks.
+fn extract_menu_energy(stack: &mut ItemStack, amount: f64, multiplier: f64) -> Result<f64, String> {
+    Ok(transfer_energy(stack, (amount * multiplier).min(f64::MAX), false, false)? / multiplier)
 }
 impl Game<'_> {
     pub(super) fn ae2_wireless_nearest(
@@ -333,12 +347,13 @@ impl Game<'_> {
         if drain <= 0.0 {
             return self.ae2_wireless_validate(host, conn, ctx);
         }
+        let multiplier = horizon_client::ae2_common_config::gameplay().usage_multiplier;
         let extracted = self
             .as_guest(host, conn, |game| {
                 let Some(stack) = game.stack_in_mut(ctx.source).as_mut() else {
                     return 0.0;
                 };
-                transfer_energy(stack, drain * 10.0, false, false).unwrap_or(0.0)
+                extract_menu_energy(stack, drain * 10.0, multiplier).unwrap_or(0.0)
             })
             .unwrap_or(0.0);
         ctx.idle = (extracted / drain).ceil().clamp(0.0, 10.0) as u8;
@@ -428,6 +443,34 @@ impl Game<'_> {
 mod tests {
     use super::*;
     #[test]
+    fn source_key_types_default_empty_toggle_cycle_and_persist() {
+        let mut terminal=ItemStack::new("ae2:wireless_terminal",1);
+        assert_eq!(enabled_key_types(&terminal).unwrap(),(true,true));
+        let owner=horizon_client::ae2_stack_identity::StackRef::capture(&mut terminal);
+        store_enabled_key_types(&mut terminal,(false,false)).unwrap();
+        assert!(owner.tracks(&terminal));
+        assert_eq!(enabled_key_types(&terminal).unwrap(),(false,false));
+        assert_eq!(toggle_key_type((false,false),false),(true,false));
+        assert_eq!(toggle_key_type((true,false),false),(true,false));
+        assert_eq!(toggle_key_type((true,false),true),(true,true));
+        assert_eq!(cycle_key_types((true,true)),(true,false));
+        assert_eq!(cycle_key_types((true,false)),(false,true));
+        assert_eq!(cycle_key_types((false,true)),(true,true));
+        store_enabled_key_types(&mut terminal,(false,true)).unwrap();
+        let saved=horizon_client::save::item_to_nbt(&terminal);
+        let restored=horizon_client::save::item_from_nbt(&saved).unwrap();
+        assert_eq!(enabled_key_types(&restored).unwrap(),(false,true));
+        terminal.data_mut().set_other("ae2:enabled_key_types",Some(Tag::Int(2)));
+        assert!(enabled_key_types(&terminal).is_err());
+    }
+    #[test]
+    fn menu_buffer_debits_configured_energy_and_returns_nominal_ticks() {
+        let mut terminal = ItemStack::new("ae2:wireless_terminal", 1);
+        transfer_energy(&mut terminal, 25.0, true, false).unwrap();
+        assert_eq!(extract_menu_energy(&mut terminal, 10.0, 3.0).unwrap(), 25.0 / 3.0);
+        assert_eq!(energy(&terminal).unwrap().0, 0.0);
+    }
+    #[test]
     fn wireless_crafting_grid_keeps_real_owner_and_power_across_save() {
         let mut terminal = ItemStack::new("ae2:wireless_crafting_terminal", 1);
         link(&mut terminal, "minecraft:overworld", (1, 64, 2)).unwrap();
@@ -457,7 +500,32 @@ mod tests {
             ("Slot", Tag::Byte(9)), ("id", Tag::String("minecraft:diamond".into())), ("count", Tag::Int(1))
         ])]));
         invalid.data_mut().set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+        assert_eq!(crafting_grid(&invalid).unwrap(),grid,"registered source inventory takes precedence over stale legacy data");
+        invalid.data_mut().set_other("ae2:crafting_inv",None);
         assert!(crafting_grid(&invalid).is_err());
+    }
+    #[test]
+    fn wireless_source_components_are_authoritative_and_survive_roundtrip() {
+        let mut item=ItemStack::new("ae2:wireless_crafting_terminal",1);
+        item.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2_wireless_link",Tag::compound([
+            ("dimension",Tag::String("minecraft:the_nether".into())),("pos",Tag::IntArray(vec![7,8,9]))
+        ]))])));
+        item.data_mut().set_other("ae2:wireless_link_target",Some(Tag::compound([
+            ("dimension",Tag::String("minecraft:overworld".into())),("pos",Tag::IntArray(vec![1,64,2]))
+        ])));
+        item.data_mut().set_other("ae2:crafting_inv",Some(Tag::List(vec![Tag::compound([
+            ("slot",Tag::Int(7)),("item",horizon_client::save::item_to_nbt(&ItemStack::new("minecraft:oak_log",3)))
+        ])])));
+        assert_eq!(target(&item),Some(("minecraft:overworld".into(),(1,64,2))));
+        let grid=crafting_grid(&item).unwrap();assert_eq!(grid[7],Some(ItemStack::new("minecraft:oak_log",3)));
+        let restored=horizon_client::save::item_from_nbt(&horizon_client::save::item_to_nbt(&item)).unwrap();
+        assert_eq!(target(&restored),target(&item));assert_eq!(crafting_grid(&restored).unwrap(),grid);
+        item.data_mut().set_other("ae2:wireless_link_target",Some(Tag::String("malformed".into())));
+        assert!(target(&item).is_none(),"malformed source data cannot silently fall back to a different legacy target");
+        item.data_mut().set_other("ae2:crafting_inv",Some(Tag::List(vec![Tag::compound([
+            ("slot",Tag::Int(9)),("item",horizon_client::save::item_to_nbt(&ItemStack::new("minecraft:diamond",1)))
+        ])])));
+        assert!(crafting_grid(&item).is_err());
     }
     #[test]
     fn wireless_over_capacity_read_and_refill_match_source_power_sink() {
@@ -473,6 +541,19 @@ mod tests {
         assert_eq!(energy(&item).unwrap().0, cap);
         let restored = horizon_client::save::item_from_nbt(&horizon_client::save::item_to_nbt(&item)).unwrap();
         assert_eq!(energy(&restored).unwrap().0, cap);
+    }
+    #[test]
+    fn source_wireless_energy_and_capacity_override_native_aliases() {
+        let mut item=ItemStack::new("ae2:wireless_terminal",1);
+        item.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2_wireless_energy",Tag::Double(90.0f64.to_bits()))])));
+        item.data_mut().set_other("ae2:stored_energy",Some(Tag::Double(20.0f64.to_bits())));
+        item.data_mut().set_other("ae2:energy_capacity",Some(Tag::Double(50.0f64.to_bits())));
+        assert_eq!(energy(&item).unwrap(),(20.0,50.0));
+        transfer_energy(&mut item,10.0,true,false).unwrap();
+        assert_eq!(energy(&item).unwrap(),(30.0,50.0));
+        assert_eq!(item.data().unwrap().other("ae2:stored_energy"),Some(&Tag::Double(30.0f64.to_bits())));
+        let restored=horizon_client::save::item_from_nbt(&horizon_client::save::item_to_nbt(&item)).unwrap();
+        assert_eq!(energy(&restored).unwrap(),(30.0,50.0));
     }
     #[test]
     fn wireless_link_and_power_are_physical_components() {

@@ -277,14 +277,24 @@ impl Game<'_> {
     ) -> ItemRenderState {
         #[cfg(feature="ae2-lab")]
         if stack.item.as_ref()=="ae2:facade" {
-            if let Some(horizon_world::nbt::Tag::String(id))=stack.data().and_then(|data|data.other("minecraft:custom_data")).and_then(|data|data.get("ae2:facade_item")) {
-                let id=id.to_string_lossy();
-                if id!="ae2:facade" && self.res.items().get(&id).is_some() {
-                    let texture=ItemStack::new(&id,1);
-                    let resolved=self.resolve_item(&texture,display,owner,seed);
-                    return self.pack.item_renderer.ae2_facade(&id,resolved);
+            if let Some(id)=horizon_client::item_tooltip::ae2_facade_texture(stack).filter(|id|self.res.items().get(id).is_some()) {
+                let texture=ItemStack::new(&id,1);
+                let resolved=self.resolve_item(&texture,display,owner,seed);
+                return self.pack.item_renderer.ae2_facade(&id,resolved);
+            }
+        }
+        #[cfg(feature="ae2-lab")]
+        if stack.item.as_ref()=="ae2:wrapped_generic_stack" {
+            // AEBaseScreen renders the contained key in GUI slots; the
+            // upstream wrapped item itself has an empty ordinary model.
+            if display==DisplayContext::Gui {
+                match item_render::wrapped_key(stack) {
+                    Some(item_render::WrappedKey::Item(item)) if self.res.items().get(item.item.as_ref()).is_some() => return self.resolve_item(&item,display,owner,seed),
+                    Some(item_render::WrappedKey::Fluid(id)) => if let Some(state)=self.pack.item_renderer.ae2_wrapped_fluid(display,&id) {return state;},
+                    _ => {}
                 }
             }
+            return ItemRenderState{display,layers:Vec::new(),oversized_in_gui:false,animated:false};
         }
         let level = self.item_level();
         let mut view = item_render::stack_view(stack);
@@ -302,6 +312,10 @@ impl Game<'_> {
             seed,
             &self.item_env(),
         );
+        #[cfg(feature="ae2-lab")]
+        if stack.item.as_ref()=="ae2:memory_card" {
+            state=self.pack.item_renderer.ae2_memory_card(stack,state);
+        }
         #[cfg(feature = "ae2-lab")]
         if stack.item.as_ref()=="ae2:meteorite_compass" && state.layers.len()>=2 {
             let pointer=&mut state.layers[1];

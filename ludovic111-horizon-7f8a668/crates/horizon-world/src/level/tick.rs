@@ -1662,6 +1662,18 @@ impl Behaviours {
     ) {
         self.sim(level, ticks).random_tick_at(pos);
     }
+    /// Invoke the block's random tick directly, without a fluid tick or the
+    /// chunk random-tick eligibility check. Used by AE2's growth accelerator.
+    pub fn random_tick_block<L: LevelAccess + ?Sized>(
+        &self,
+        level: &mut L,
+        ticks: &mut Ticks,
+        pos: BlockPos,
+    ) {
+        let mut sim = self.sim(level, ticks);
+        let state = sim.state(pos);
+        sim.random_tick_block(state, pos);
+    }
     /// Run one scheduled block tick at `pos` immediately (no queue check).
     pub fn scheduled_block_tick<L: LevelAccess + ?Sized>(
         &self,

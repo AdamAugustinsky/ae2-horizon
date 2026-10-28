@@ -42,17 +42,76 @@ fn write(s: &mut ItemStack, c: &Cell) -> Result<(), String> {
         ae2_lab::write_cell(s, c)
     }
 }
+/// FuzzyPriorityList queries KeyCounter with the incoming key. Damageable
+/// items use FuzzySearch's integer bounds based on that query's max damage;
+/// unordered keys (including all fluids) ignore their components.
+fn storage_fuzzy_match(
+    filter:&ae2_cell_core::ItemKey,candidate:&ae2_cell_core::ItemKey,
+    mode:&str,fluid:bool,base_max:u32,
+)->bool {
+    if filter.item_id!=candidate.item_id {return false;}
+    if fluid {return true;}
+    let Ok(filter)=ae2_lab::prototype(filter) else {return false;};
+    let Ok(candidate)=ae2_lab::prototype(candidate) else {return false;};
+    let max=|stack:&ItemStack| match stack.data().and_then(|d|d.other("minecraft:max_damage")) {
+        Some(Tag::Int(n)) if *n>=0=>*n as u32,
+        _=>base_max,
+    };
+    // KeyCounter selected an unordered variant map when the configured key
+    // did not support a positive fuzzy range.
+    if max(&filter)==0 {return true;}
+    let query_max=max(&candidate);
+    if query_max==0 {return false;}
+    let breakpoint=match mode {
+        "ignore_all"=>None,
+        "percent_99"=>Some(0),
+        "percent_75"=>Some((25f32*query_max as f32/100.0) as u32),
+        "percent_50"=>Some((50f32*query_max as f32/100.0) as u32),
+        "percent_25"=>Some((75f32*query_max as f32/100.0) as u32),
+        _=>return false,
+    };
+    match breakpoint {
+        None=>filter.damage<=query_max,
+        Some(point) if candidate.damage<=point=>filter.damage<=point,
+        Some(point)=>filter.damage>point && filter.damage<=query_max,
+    }
+}
 impl Game<'_> {
+    // Horizon exposes an installed item registry, but not a mod-fluid
+    // registry. Preserve all syntactically valid fluid IDs until one exists.
+    fn ae2_known_cell_key(&self, id:&str, fluid:bool)->bool {
+        fluid || self.res.items().get(id).is_some()
+    }
+    pub(super) fn ae2_read_item_cell(&self, stack:&ItemStack)->Result<Cell,String> {
+        horizon_client::ae2_cell_codec::read_cell_checked(stack,&|id,fluid|self.ae2_known_cell_key(id,fluid))
+    }
+    pub(super) fn ae2_read_fluid_cell(&self, stack:&ItemStack)->Result<Cell,String> {
+        horizon_client::ae2_cell_codec::read_fluid_cell_checked(stack,&|id,fluid|self.ae2_known_cell_key(id,fluid))
+    }
+    pub(super) fn ae2_read_cell(&self, stack:&ItemStack)->Result<Cell,String> {
+        if is_fluid(stack) {self.ae2_read_fluid_cell(stack)} else {self.ae2_read_item_cell(stack)}
+    }
+    pub(super) fn ae2_creative_cell_keys(&self, stack:&ItemStack)->Result<Vec<CreativeCellKey>,String> {
+        horizon_client::ae2_cell_codec::creative_cell_keys_checked(stack,&|id,fluid|self.ae2_known_cell_key(id,fluid))
+    }
+    fn ae2_checked_cell_settings(&self, stack:&ItemStack)->Result<Compound,String> {
+        horizon_client::ae2_cell_codec::cell_settings_checked(stack,&|id,fluid|self.ae2_known_cell_key(id,fluid))
+    }
+    fn ae2_checked_view_cell(&self, stack:&ItemStack)->Result<horizon_client::ae2_cell_codec::ViewCellSettings,String> {
+        horizon_client::ae2_cell_codec::read_view_cell_checked(stack,&|id,fluid|self.ae2_known_cell_key(id,fluid))
+    }
+    pub(super) fn ae2_workbench_cell_changed(&self, before:&horizon_client::ae2_world::Machine, after:&mut horizon_client::ae2_world::Machine)->Result<(),String> {
+        workbench_cell_changed_checked(before,after,&|id,fluid|self.ae2_known_cell_key(id,fluid))
+    }
     /// A single source View Cell contributes its raw match and inversion flag;
     /// callers combine configured cells with MergedPriorityList semantics.
     pub(super) fn ae2_view_cell_match(&self, stack: &ItemStack, key: &ae2_cell_core::ItemKey,
         fluid: bool, scope: horizon_client::ae2_cell_codec::ViewCellScope)
         -> Result<horizon_client::ae2_cell_codec::ViewCellMatch, String> {
-        let settings = horizon_client::ae2_cell_codec::read_view_cell(stack)?;
+        let settings = self.ae2_checked_view_cell(stack)?;
         Ok(settings.evaluate(key, fluid, scope, |filter, candidate, mode| {
             let maximum = self.res.items().get(&filter.item_id).map_or(0, |item| item.max_damage);
-            super::ae2_buses::fuzzy_key_match(&ae2_machines_core::Key::from(filter),
-                &ae2_machines_core::Key::from(candidate), mode, maximum)
+            storage_fuzzy_match(filter,candidate,mode,false,maximum)
         }))
     }
     /// Resolve AEKey durability partitions using actual stack components and item registry defaults.
@@ -122,6 +181,7 @@ impl Game<'_> {
         {
             return 0;
         }
+        let fluid=cell.config().channel==ae2_cell_core::Channel::Fluid;
         cell.insert_with_fuzzy_match(key, amount, action, |filter, candidate, mode| {
             use ae2_cell_core::FuzzyMode;
             let name = match mode {
@@ -136,7 +196,7 @@ impl Game<'_> {
                 .items()
                 .get(&filter.item_id)
                 .map_or(0, |item| item.max_damage);
-            super::ae2_buses::fuzzy_key_match(&filter.into(), &candidate.into(), name, max)
+            storage_fuzzy_match(filter,candidate,name,fluid,max)
         })
     }
 }
@@ -235,7 +295,7 @@ impl Game<'_> {
                 },
                 _ => return Err("I/O port disappeared".into()),
             };
-            let mut cell = match read(&item) {
+            let mut cell = match self.ae2_read_cell(&item) {
                 Ok(c) => c,
                 Err(_) => {
                     urgent |= self.io_move_output(pos, slot)?;
@@ -757,6 +817,35 @@ mod storage_tests {
     use super::*;
     use horizon_client::ae2_world::{Machine, MachineKind};
     #[test]
+    fn fuzzy_cell_partitions_follow_candidate_range_and_fluid_identity() {
+        let fluid=|components|ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components};
+        for mode in ["ignore_all","percent_99","percent_75","percent_50","percent_25"] {
+            assert!(storage_fuzzy_match(&fluid(vec![0,1]),&fluid(vec![2,3]),mode,true,0));
+        }
+        let mut config=ae2_cell_core::CellConfig::fluid(ae2_cell_core::Tier::K1);
+        config.fuzzy=true;
+        config.fuzzy_mode=ae2_cell_core::FuzzyMode::Percent50;
+        config.filter=Some(ae2_cell_core::Filter {
+            mode:ae2_cell_core::FilterMode::Whitelist,
+            keys:std::collections::BTreeSet::from([fluid(vec![0,1])]),
+        });
+        let mut cell=Cell::new(config);
+        assert_eq!(cell.insert_with_fuzzy_match(&fluid(vec![2,3]),1000,Action::Modulate,
+            |filter,candidate,_|storage_fuzzy_match(filter,candidate,"percent_50",true,0)),1000);
+        let item=|damage,max_damage| {
+            let mut stack=ItemStack::new("minecraft:test_tool",1);
+            stack.damage=damage;
+            stack.data_mut().set_other("minecraft:max_damage",Some(Tag::Int(max_damage)));
+            ae2_lab::key(&stack).unwrap()
+        };
+        let filter=item(75,100);
+        let candidate=item(120,200);
+        assert!(!storage_fuzzy_match(&filter,&candidate,"percent_50",false,100));
+        assert!(storage_fuzzy_match(&item(120,100),&candidate,"percent_50",false,100));
+        assert!(!storage_fuzzy_match(&item(201,300),&candidate,"ignore_all",false,100));
+        assert!(storage_fuzzy_match(&item(0,0),&candidate,"percent_50",false,0));
+    }
+    #[test]
     fn cell_settings_validate_physical_cards_and_ghost_filter() {
         let mut item = ItemStack::new("ae2:item_storage_cell_1k", 1);
         let card = horizon_client::save::item_to_nbt(&ItemStack::new("ae2:inverter_card", 1));
@@ -842,6 +931,25 @@ mod storage_tests {
 /// A cell item retains its cards in its own NBT when moved or dropped.
 
 fn set_cell_settings(stack: &mut ItemStack, settings: Compound) -> Result<(), String> {
+    let Some(Tag::List(cards))=settings.get(&"upgrades".into()) else{return Err("invalid cell upgrades".into());};
+    let max=horizon_client::ae2_upgrade_inventory::capacity(&stack.item).ok_or("unsupported upgrade owner")?;
+    let slots=horizon_client::ae2_upgrade_inventory::decode(cards,max)?;
+    let source_cards=horizon_client::ae2_components::normalize("ae2:upgrades",Tag::List(horizon_client::ae2_upgrade_inventory::encode_source(&slots)?))?;
+    let Some(Tag::List(filters))=settings.get(&"filters".into()) else{return Err("invalid cell filters".into());};
+    let source_filters=match horizon_client::ae2_cell_codec::encode_source_filters(filters) {
+        Ok(filters)=>Some(Tag::List(filters)),
+        Err(error) if stack.data().and_then(|data|data.other("ae2:storage_cell_config_inv")).is_some()=>return Err(error),
+        Err(_)=>None,
+    };
+    let source_mode=match settings.get(&"fuzzy_mode".into()) {
+        None=>None,
+        Some(Tag::String(mode))=>{
+            let mode=mode.to_string().map_err(|_|"invalid fuzzy mode")?.to_ascii_uppercase();
+            if !["IGNORE_ALL","PERCENT_99","PERCENT_75","PERCENT_50","PERCENT_25"].contains(&mode.as_str()) {return Err("invalid fuzzy mode".into());}
+            Some(Tag::String(mode.as_str().into()))
+        }
+        _=>return Err("invalid fuzzy mode".into()),
+    };
     let mut data = match stack.data().and_then(|d| d.other("minecraft:custom_data")) {
         None => Compound::new(),
         Some(Tag::Compound(m)) => m.clone(),
@@ -851,6 +959,9 @@ fn set_cell_settings(stack: &mut ItemStack, settings: Compound) -> Result<(), St
     stack
         .data_mut()
         .set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+    stack.data_mut().set_other("ae2:upgrades",Some(source_cards));
+    stack.data_mut().set_other("ae2:storage_cell_fuzzy_mode",source_mode);
+    if let Some(filters)=source_filters {stack.data_mut().set_other("ae2:storage_cell_config_inv",Some(filters));}
     Ok(())
 }
 impl Game<'_> {
@@ -879,7 +990,7 @@ impl Game<'_> {
         if !is_valid_workbench_cell(&cell) {
             return Err("unsupported workbench cell".into());
         }
-        let mut settings = cell_settings(&cell)?;
+        let mut settings = self.ae2_checked_cell_settings(&cell)?;
         if args[0] == "status" && args.len() == 4 {
             let cards = match settings.get(&"upgrades".into()) {
                 Some(Tag::List(v)) => v,
@@ -931,22 +1042,8 @@ impl Game<'_> {
                 let held = self.inventory[self.selected]
                     .as_ref()
                     .ok_or("hold an item or fluid bucket for a filter")?;
-                let filter = if fluid || (cell.item.as_ref() == "ae2:view_cell" && args[0] == "filter_add_fluid") {
-                    let id = ae2_fluids::bucket_fluid(&held.item)
-                        .ok_or("use a supported fluid bucket for the filter")?;
-                    Tag::compound([
-                        ("fluid", Tag::String(id.into())),
-                        ("components", Tag::ByteArray(vec![])),
-                    ])
-                } else {
-                    Tag::compound([(
-                        "item",
-                        horizon_client::save::item_to_nbt(&ItemStack {
-                            count: 1,
-                            ..held.clone()
-                        }),
-                    )])
-                };
+                let fluid_mode=fluid || (cell.item.as_ref() == "ae2:view_cell" && args[0] == "filter_add_fluid");
+                let filter = workbench_ghost_from_carried(Some(&cell),held,fluid_mode,&|id,fluid|self.ae2_known_cell_key(id,fluid))?;
                 let Some(Tag::List(filters)) = settings.get_mut(&"filters".into()) else {
                     return Err("invalid cell filters".into());
                 };
@@ -990,13 +1087,13 @@ impl Game<'_> {
         // Validate settings against this exact cell's profile, including tool
         // upgrade slots and card types, before exchanging physical cards.
         if cell.item.as_ref() == "ae2:view_cell" {
-            horizon_client::ae2_cell_codec::read_view_cell(&cell)?;
+            self.ae2_checked_view_cell(&cell)?;
         } else {
-            read(&cell)?;
+            self.ae2_read_cell(&cell)?;
         }
         // Finish validating and encoding the template before moving any
         // physical cards or mutating the workbench.
-        let slots = match cell_settings(&cell)?.get(&"filters".into()) {
+        let slots = match self.ae2_checked_cell_settings(&cell)?.get(&"filters".into()) {
             Some(Tag::List(filters)) => workbench_decode(filters)?,
             _ => return Err("invalid cell filters".into()),
         };
@@ -1041,7 +1138,7 @@ impl Game<'_> {
         if machine.kind!=MachineKind::CellWorkbench{return None}
         let mut slots=vec![None;27];slots[0]=machine.slots.first()?.clone();
         let cell=slots[0].clone();
-        let settings=cell.as_ref().map(cell_settings).transpose().ok()?;
+        let settings=cell.as_ref().map(|cell|self.ae2_checked_cell_settings(cell)).transpose().ok()?;
         if let (Some(cell),Some(settings))=(cell.as_ref(),settings.as_ref()){
             if let Some(Tag::List(cards))=settings.get(&"upgrades".into()){
                 let max=horizon_client::ae2_upgrade_inventory::capacity(&cell.item)?;
@@ -1049,12 +1146,16 @@ impl Game<'_> {
             }
         }
         if cell.is_some()||workbench_keep(machine){
-            let entries=workbench_filters(machine).ok()?;
+            let entries=workbench_filters_checked(machine,&|id,fluid|self.ae2_known_cell_key(id,fluid)).ok()?;
             for (i,entry) in entries.iter().skip(page.min(3)*18).take(18).enumerate(){
                 let Some(entry)=entry else{continue};
                 slots[5+i]=if let Some(item)=entry.get("item").and_then(horizon_client::save::item_from_nbt){Some(item)}
-                else if let Some(Tag::String(id))=entry.get("fluid"){id.to_string().ok().and_then(|id|ae2_fluids::fluid_bucket(&id).map(|id|ItemStack::new(id,1)))}
-                else{None};
+                else if let (Some(Tag::String(id)),Some(Tag::ByteArray(components)))=(entry.get("fluid"),entry.get("components")) {
+                    id.to_string().ok().and_then(|id| {
+                        let value=horizon_client::ae2_generic_stack::GenericStack {key:ae2_cell_core::ItemKey{item_id:id.clone(),components:components.clone()},fluid:true,amount:0};
+                        horizon_client::ae2_generic_stack::wrap(&value).ok().or_else(||ae2_fluids::fluid_bucket(&id).map(|id|ItemStack::new(id,1)))
+                    })
+                } else{None};
             }
         }
         let label=|item:&str,name:String|{let mut s=ItemStack::new(item,1);s.data_mut().custom_name=Some(name);Some(s)};
@@ -1085,22 +1186,22 @@ impl Game<'_> {
                 }
                 323=>{
                     let Some(cell)=next.slots.first_mut().and_then(Option::as_mut)else{return Ok(())};
-                    let mut settings=cell_settings(cell)?;
+                    let mut settings=self.ae2_checked_cell_settings(cell)?;
                     let modes=["ignore_all","percent_99","percent_75","percent_50","percent_25"];
                     let old=text(&settings,"fuzzy_mode").unwrap_or_else(||"ignore_all".into());
                     let i=modes.iter().position(|v|*v==old).unwrap_or(0);
                     settings.insert("fuzzy_mode".into(),Tag::String(modes[(i+1)%modes.len()].into()));set_cell_settings(cell,settings)?;
                     if !is_valid_workbench_cell(cell){return Err("invalid fuzzy setting".into())}
                 }
-                324 if button==1=>workbench_partition(&mut next)?,
+                324 if button==1=>workbench_partition_checked(&mut next,&|id,fluid|self.ae2_known_cell_key(id,fluid))?,
                 324=>{
                     let mut filters=vec![None;63];
-                    if let Some(cell)=next.slots.first_mut().and_then(Option::as_mut){filters=workbench_apply_filters(cell,&filters)?;}
+                    if let Some(cell)=next.slots.first_mut().and_then(Option::as_mut){filters=workbench_apply_filters_checked(cell,&filters,&|id,fluid|self.ae2_known_cell_key(id,fluid))?;}
                     workbench_store_filters(&mut next,&filters)?;
                 }
                 301..=304=>{
                     let Some(cell)=next.slots.first_mut().and_then(Option::as_mut)else{return Ok(())};
-                    let mut settings=cell_settings(cell)?;
+                    let mut settings=self.ae2_checked_cell_settings(cell)?;
                     let Some(Tag::List(cards))=settings.get_mut(&"upgrades".into())else{return Err("invalid upgrades".into())};
                     let max=horizon_client::ae2_upgrade_inventory::capacity(&cell.item).ok_or("invalid upgrade owner")?;
                     let mut cards=horizon_client::ae2_upgrade_inventory::decode(cards,max)?;
@@ -1121,20 +1222,16 @@ impl Game<'_> {
                 }
                 305..=322=>{
                     if next.slots.first().and_then(Option::as_ref).is_none()&&!workbench_keep(&next){return Ok(())}
-                    let mut filters=workbench_filters(&next)?;let index=(*page).min(3)*18+(slot-305);
+                    let mut filters=workbench_filters_checked(&next,&|id,fluid|self.ae2_known_cell_key(id,fluid))?;let index=(*page).min(3)*18+(slot-305);
                     if index>=63{return Ok(())}
                     let fluid=next.slots.first().and_then(Option::as_ref).is_some_and(is_fluid)
                         ||(button==1&&next.slots.first().and_then(Option::as_ref).is_none_or(|cell|matches!(cell.item.as_ref(),"ae2:view_cell"|"ae2:creative_storage_cell")));
                     filters[index]=if let Some(held)=next_cursor.as_ref(){
-                        if fluid {
-                            let Some(id)=ae2_fluids::bucket_fluid(&held.item)else{return Ok(())};
-                            Some(Tag::compound([("fluid",Tag::String(id.into())),("components",Tag::ByteArray(vec![]))]))
-                        }else{
-                            let mut item=held.clone();item.count=1;
-                            Some(Tag::compound([("item",horizon_client::save::item_to_nbt(&item))]))
+                        match workbench_ghost_from_carried(next.slots.first().and_then(Option::as_ref),held,fluid,&|id,fluid|self.ae2_known_cell_key(id,fluid)) {
+                            Ok(ghost)=>Some(ghost),Err(_)=>return Ok(()),
                         }
                     }else{None};
-                    if let Some(cell)=next.slots.first_mut().and_then(Option::as_mut){filters=workbench_apply_filters(cell,&filters)?;}
+                    if let Some(cell)=next.slots.first_mut().and_then(Option::as_mut){filters=workbench_apply_filters_checked(cell,&filters,&|id,fluid|self.ae2_known_cell_key(id,fluid))?;}
                     workbench_store_filters(&mut next,&filters)?;
                 }
                 _=>return Ok(()),

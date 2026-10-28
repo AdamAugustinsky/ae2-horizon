@@ -23,7 +23,7 @@ impl Game<'_> {
                 continue;
             };
             for item in machine.slots.iter().flatten() {
-                if let Ok(keys) = super::ae2_storage_devices::creative_cell_keys(item) {
+                if let Ok(keys) = self.ae2_creative_cell_keys(item) {
                     for key in keys {
                         if let super::ae2_storage_devices::CreativeCellKey::Fluid(k) = key {
                             let total = totals.entry(k).or_default();
@@ -36,7 +36,7 @@ impl Game<'_> {
                 if !item.item.starts_with("ae2:fluid_storage_cell_") {
                     continue;
                 }
-                let cell = ae2_fluids::read_fluid_cell(item)?;
+                let cell = self.ae2_read_fluid_cell(item)?;
                 for (key, amount) in cell.entries() {
                     let total = totals.entry(key.clone()).or_default();
                     *total = total.checked_add(*amount).ok_or("fluid amount overflow")?;

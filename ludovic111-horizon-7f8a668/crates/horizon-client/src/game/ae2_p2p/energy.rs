@@ -7,6 +7,13 @@ use horizon_core::geometry::Direction;
 use std::collections::BTreeSet;
 type Guard = BTreeSet<(Pos, u8, u8)>;
 
+// FEP2PTunnelPart.InputEnergyStorage sums Java int readbacks, which wrap
+// rather than clamp when multiple large adjacent handlers are present.
+fn accumulate_readbacks(total: &mut FeStorage, handler: FeStorage) {
+    total.stored = total.stored.wrapping_add(handler.stored);
+    total.capacity = total.capacity.wrapping_add(handler.capacity);
+}
+
 impl Game<'_> {
     fn ae2_fe_receive_inner(
         &mut self,
@@ -55,7 +62,7 @@ impl Game<'_> {
         guard.remove(&key);
         let accepted = amount - left;
         if !simulate && accepted > 0 {
-            self.ae2_p2p_tax(&port, f64::from(accepted) * 0.5);
+            self.ae2_p2p_energy_tax(&port, f64::from(accepted));
         }
         accepted
     }
@@ -95,7 +102,7 @@ impl Game<'_> {
             .min(amount);
         guard.remove(&key);
         if !simulate && accepted > 0 {
-            self.ae2_p2p_tax(&port, f64::from(accepted) * 0.5);
+            self.ae2_p2p_energy_tax(&port, f64::from(accepted));
         }
         accepted
     }
@@ -142,14 +149,7 @@ impl Game<'_> {
                         guard,
                     )
                 }) {
-                    storage.stored = storage
-                        .stored
-                        .saturating_add(handler.stored)
-                        .min(i32::MAX as u32);
-                    storage.capacity = storage
-                        .capacity
-                        .saturating_add(handler.capacity)
-                        .min(i32::MAX as u32);
+                    accumulate_readbacks(&mut storage, handler);
                 }
             }
             storage
@@ -206,5 +206,22 @@ impl Game<'_> {
         face: Direction,
     ) -> Option<FeStorage> {
         self.ae2_fe_storage_inner(address, face, &mut Guard::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fe_p2p_input_readback_wraps_like_java_int() {
+        let mut total = FeStorage::default();
+        let large = FeStorage { stored: i32::MAX, capacity: i32::MAX, ..Default::default() };
+        accumulate_readbacks(&mut total, large);
+        assert_eq!((total.stored, total.capacity), (i32::MAX, i32::MAX));
+        accumulate_readbacks(&mut total, FeStorage { stored: 1, capacity: i32::MAX, ..Default::default() });
+        assert_eq!((total.stored, total.capacity), (i32::MIN, -2));
+        // An already-wrapped nested tunnel contributes its signed result too.
+        accumulate_readbacks(&mut total, FeStorage { stored: -1, capacity: 3, ..Default::default() });
+        assert_eq!((total.stored, total.capacity), (i32::MAX, 1));
     }
 }

@@ -7,7 +7,7 @@ use horizon_client::{
     item_data,
     items::ItemStack,
 };
-use horizon_world::nbt::Tag;
+use horizon_world::nbt::{Compound, Tag};
 use serde_json::{Value, json};
 /// Source PatternProviderBlock.PUSH_DIRECTION; absent means the legacy ALL state.
 pub(super) fn provider_push_direction(state:&horizon_world::chunk::BlockState)->Result<Option<horizon_core::geometry::Direction>,()> {
@@ -17,6 +17,21 @@ pub(super) fn provider_push_direction(state:&horizon_world::chunk::BlockState)->
     })
 }
 type Pos = (i32, i32, i32);
+const CARD_GENERATION: &str = "ae2_crafting_card_generation";
+/// A pending future belongs to the installed crafting card instance. The
+/// generation also distinguishes removal followed by reinsertion between ticks.
+pub(super) fn crafting_card_generation(data: &Compound) -> Option<i64> {
+    match data.get(&CARD_GENERATION.into()) {
+        None => Some(0),
+        Some(Tag::Long(value)) if *value >= 0 => Some(*value),
+        _ => None,
+    }
+}
+pub(super) fn advance_crafting_card_generation(data: &mut Compound) {
+    let next = crafting_card_generation(data).and_then(|value| value.checked_add(1));
+    let value = next.map_or_else(|| Tag::String("invalid".into()), Tag::Long);
+    data.insert(CARD_GENERATION.into(), value);
+}
 fn adjacent(a: Pos, b: Pos) -> bool {
     (i64::from(a.0) - i64::from(b.0)).abs()
         + (i64::from(a.1) - i64::from(b.1)).abs()
@@ -118,7 +133,7 @@ impl Game<'_> {
                         grid.push(Some(ItemStack::new(id, 1)));
                     }
                 }
-                let (_, out) = self
+                let (recipe, out) = self
                     .res
                     .recipes()
                     .find(&grid, 3)
@@ -126,7 +141,7 @@ impl Game<'_> {
                 if self.res.items().get("ae2:crafting_pattern").is_none() {
                     return Err("crafting pattern item not registered".into());
                 }
-                let pattern = ae2_processing::ae2_encode_pattern(&grid, &out)?;
+                let pattern = ae2_processing::ae2_encode_pattern_source(&grid, &out, recipe, false, false)?;
                 self.inventory[self.selected] = Some(pattern);
                 Ok(json!({"encoded":true,"output":out.item.to_string(),"count":out.count}))
             }
@@ -180,12 +195,16 @@ impl Game<'_> {
                     .get(slot)
                     .and_then(Option::as_ref)
                     .ok_or("missing pattern")?;
-                let (grid, expected) =
+                let (grid, encoded_output) =
                     ae2_processing::decode_pattern(pattern).ok_or("invalid laboratory pattern")?;
-                let (_, actual) = self.res.recipes().find(&grid, 3).ok_or("recipe missing")?;
-                if expected != actual {
-                    return Err("pattern result changed".into());
-                }
+                let source_recipe = super::ae2_source_patterns::crafting(pattern).and_then(Result::ok).map(|source| source.recipe);
+                let actual = match source_recipe.as_deref() {
+                    Some(recipe) => self.res.recipes().assemble_named(recipe, &grid, 3),
+                    None => self.res.recipes().find(&grid, 3).map(|(_, result)| result),
+                }.ok_or("recipe missing")?;
+                if source_recipe.is_none() && encoded_output != actual { return Err("pattern result changed".into()); }
+                let expected=actual;
+                let pattern_data = ae2_processing::assembler_pattern_data(pattern).ok_or("invalid pattern")?;
                 let Some(BlockEntity::Ae2(m)) = self.world.block_entities.get(&assembler) else {
                     return Err("missing assembler".into());
                 };
@@ -246,7 +265,6 @@ impl Game<'_> {
                         moved.push(None);
                     }
                 }
-                let pattern_data = pattern_data(&grid, &expected);
                 if let Some(BlockEntity::Ae2(m)) = self.world.block_entities.get_mut(&assembler) {
                     m.slots[..9].clone_from_slice(&moved);
                     m.progress = 0.0;
@@ -441,6 +459,18 @@ fn pattern_data(grid: &[Option<ItemStack>], out: &ItemStack) -> Tag {
 mod tests {
     use super::*;
     #[test]
+    fn card_generation_changes_without_a_link_and_fails_closed_on_overflow() {
+        let mut config = Compound::new();
+        assert_eq!(crafting_card_generation(&config), Some(0));
+        advance_crafting_card_generation(&mut config);
+        assert_eq!(crafting_card_generation(&config), Some(1));
+        advance_crafting_card_generation(&mut config);
+        assert_eq!(crafting_card_generation(&config), Some(2));
+        config.insert(CARD_GENERATION.into(), Tag::Long(i64::MAX));
+        advance_crafting_card_generation(&mut config);
+        assert_eq!(crafting_card_generation(&config), None);
+    }
+    #[test]
     fn cpu_waiting_job_round_trips_in_world_config() {
         let mut reg = Registry::default();
         let output=canon(&ItemStack::new("minecraft:gold_ingot",1));
@@ -473,10 +503,11 @@ mod tests {
 
 // Recursive execution uses physical item stacks in `ae2_cpu_escrow`; the CPU
 // planner's counters are only metadata and are never emitted as drops.
+pub(super) use recursive::PendingMachineCraft;
 mod recursive {
     use super::*;
     use ae2_crafting_core::extended::{
-        Cpu, Ingredient, Pattern as ExtendedPattern, Registry as ExtendedRegistry,
+        Cpu, Ingredient, Pattern as ExtendedPattern, Registry as ExtendedRegistry, SourceInput,
     };
     use horizon_core::random::RandomSource;
     use serde::{Deserialize, Serialize};
@@ -513,6 +544,9 @@ mod recursive {
         /// retain their original physical provider and slot.
         #[serde(default)]
         definition: Option<String>,
+        /// Optional source crafting recipe ID, absent in legacy saved jobs.
+        #[serde(default)]
+        crafting_recipe: Option<String>,
         grid: Vec<String>,
         #[serde(default)]
         choices: Vec<Vec<String>>,
@@ -547,6 +581,15 @@ mod recursive {
         requester: Option<InterfaceRequester>,
         #[serde(default)]
         export_requester: Option<ExportRequester>,
+        #[serde(default)]
+        player_owner: Option<[i64;2]>,
+    }
+    fn job_status(session:&Session,status:horizon_client::ae2_job_status::Status)->Option<(u128,horizon_client::ae2_job_status::CraftingJobStatus)> {
+        let owner=super::super::ae2_job_events::owner_uuid(session.player_owner?);
+        let (key,requested,remaining)=session.cpu.requested_output()?;
+        Some((owner,horizon_client::ae2_job_status::CraftingJobStatus {
+            job_id:session.job_id?,key:key.to_owned(),requested,remaining,status,
+        }))
     }
     fn selection_policy(mode:Option<&str>,machine_request:bool)->Option<bool> {
         match (mode,machine_request) {
@@ -588,10 +631,35 @@ mod recursive {
         target: String,
         amount: u64,
     }
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RequestOwner {
         Interface(super::super::ae2_interface::InterfaceCraftOwner),
         Export(super::super::ae2_buses::ExportBusCraftOwner),
+    }
+    impl RequestOwner {
+        fn anchor(self) -> GridAddress {
+            match self { Self::Interface(owner) => owner.anchor(), Self::Export(owner) => owner.anchor() }
+        }
+        fn identity(self, network: &ae2_network_core::Network) -> Option<ae2_network_core::NodeIdentity> {
+            let pos = self.anchor().network_pos();
+            match self {
+                Self::Interface(super::super::ae2_interface::InterfaceCraftOwner::Block(_)) => network.node_identities.get(&pos),
+                Self::Interface(super::super::ae2_interface::InterfaceCraftOwner::Part { face, .. }) => network.part_identities.get(&(pos, face)),
+                Self::Export(owner) => network.part_identities.get(&(pos, owner.face)),
+            }.copied()
+        }
+    }
+    /// One source MultiCraftingTracker future per physical requester slot.
+    pub(in crate::game) struct PendingMachineCraft {
+        owner: RequestOwner,
+        slot: usize,
+        key: ae2_cell_core::ItemKey,
+        fluid: bool,
+        identity: ae2_network_core::NodeIdentity,
+        generation: i64,
+        registry: ExtendedRegistry,
+        calculation: Option<ae2_crafting_core::calculation::Calculation>,
+        result: Option<Result<(ae2_crafting_core::extended::Plan, Inventory), ae2_crafting_core::Error>>,
     }
     struct Request {
         owner: RequestOwner,
@@ -761,11 +829,12 @@ mod recursive {
         Ok(out)
     }
     fn read_session(machine: &Machine, cpu_dim: super::super::Dim) -> Result<Session, String> {
-        let Some(Tag::String(raw)) = machine.config.get(&JOB.into()) else {
-            return Err("CPU has no recursive job".into());
-        };
-        let mut session: Session =
-            serde_json::from_str(&raw.to_string_lossy()).map_err(|_| "invalid CPU job")?;
+        let mut session: Session = match machine.config.get(&JOB.into()) {
+            Some(Tag::String(raw))=>serde_json::from_str(&raw.to_string_lossy()),
+            Some(Tag::ByteArray(raw))=>serde_json::from_slice(raw),
+            None=>return Err("CPU has no recursive job".into()),
+            _=>return Err("invalid CPU job".into()),
+        }.map_err(|_| "invalid CPU job")?;
         // Older prototype jobs used unquoted namespaced SNBT keys. Normalize
         // every item identity together before checking physical ownership.
         let normalize=|value:&str| -> Result<String,String> {
@@ -817,6 +886,16 @@ mod recursive {
         }
         Ok(session)
     }
+    // NBT strings use modified UTF-8 and are limited to 65535 bytes. Keep the
+    // legacy representation when it fits, and use a byte array for larger
+    // valid plans so the chunk can be saved and reloaded without truncation.
+    fn job_payload(data:String)->Result<Tag,String> {
+        let len=data.encode_utf16().try_fold(0usize,|n,c|n.checked_add(match c {1..=127=>1,0..=2047=>2,_=>3}))
+            .ok_or("CPU job size overflow")?;
+        if len<=u16::MAX as usize {Ok(Tag::String(data.as_str().into()))}
+        else if data.len()<=horizon_world::nbt::Limits::default().max_bytes {Ok(Tag::ByteArray(data.into_bytes()))}
+        else {Err("CPU job exceeds save size".into())}
+    }
     fn write_session(
         machine: &mut Machine,
         session: &Session,
@@ -828,7 +907,7 @@ mod recursive {
         let data = serde_json::to_string(session).map_err(|e| e.to_string())?;
         machine
             .config
-            .insert(JOB.into(), Tag::String(data.as_str().into()));
+            .insert(JOB.into(), job_payload(data)?);
         machine.config.insert(
             ESCROW.into(),
             Tag::List(
@@ -1080,6 +1159,10 @@ mod recursive {
                 .ok_or("network offline")?
                 .component;
             let mut registry = ExtendedRegistry::default();
+            registry.set_resource_classifier(|key| {
+                if parse_fluid(key).is_some() {ae2_crafting_core::extended::ResourceKind::Fluid}
+                else {ae2_crafting_core::extended::ResourceKind::Item}
+            });
             if super::super::ae2_event_live::cpu_formation_enabled() {
                 registry.set_emittable(self.ae2_crafting_emittable_keys(pos)?)
                     .map_err(|e| format!("emittable registration: {e:?}"))?;
@@ -1144,10 +1227,16 @@ mod recursive {
             for (_, provider, _) in &providers {
                 for pattern in provider.slots.iter().flatten() {
                     let mut outputs = Vec::new();
-                    if let Some((_, output)) = ae2_processing::decode_pattern(pattern) {
-                        outputs.push(output);
+                    if let Some((grid, encoded)) = ae2_processing::decode_pattern(pattern) {
+                        if let Some(source)=super::super::ae2_source_patterns::crafting(pattern) {
+                            if let Ok(source)=source {if let Some(output)=self.res.recipes().assemble_named(&source.recipe,&grid,3) {outputs.push(output);}}
+                        } else {outputs.push(encoded);}
                     }
-                    if let Some(special)=ae2_processing::ae2_decode_special_pattern(pattern){outputs.push(special.output);}
+                    if let Some(special)=ae2_processing::ae2_decode_special_pattern(pattern){
+                        if super::super::ae2_source_patterns::special(pattern).is_some() {
+                            if let Some(output)=ae2_processing::special_recipe_result(self.res.stations(),&special.kind,&special.recipe,&special.grid){outputs.push(output);}
+                        } else {outputs.push(special.output);}
+                    }
                     if let Some((_, items)) = ae2_processing::ae2_decode_processing_pattern(pattern)
                     {
                         outputs.extend(items.into_iter().flatten());
@@ -1170,7 +1259,11 @@ mod recursive {
                         |(definition,_)| format!("ordered:{definition}"));
                     let definition = source.as_ref().map(|(definition,_)| definition.clone());
                     if let Some(special)=pattern.as_ref().and_then(ae2_processing::ae2_decode_special_pattern) {
-                        if ae2_processing::special_recipe_result(self.res.stations(),&special.kind,&special.recipe,&special.grid)!=Some(special.output.clone()){continue;}
+                        if special.output.item.as_ref()=="ae2:missing_content" || self.res.items().get(&special.output.item).is_none()
+                            || special.grid.iter().flatten().any(|item|item.item.as_ref()=="ae2:missing_content"||self.res.items().get(&item.item).is_none()){continue;}
+                        let Some(actual)=ae2_processing::special_recipe_result(self.res.stations(),&special.kind,&special.recipe,&special.grid) else{continue};
+                        if self.res.items().get(&actual.item).is_none() {continue;}
+                        if pattern.as_ref().and_then(super::super::ae2_source_patterns::special).is_none() && actual!=special.output {continue;}
                         let Some(physical_grid)=ae2_processing::special_assembler_grid(&special.kind,&special.grid) else{continue};
                         let mut choices=vec![Vec::new();9];
                         for (i,original) in physical_grid.iter().enumerate() {
@@ -1178,19 +1271,20 @@ mod recursive {
                             if special.substitutes {for candidate in &candidates {
                                 let key=canon(candidate);if choices[i].contains(&key){continue;}
                                 let mut trial=physical_grid.clone();let mut item=candidate.clone();item.count=1;trial[i]=Some(item);
-                                if ae2_processing::special_logical_grid(&special.kind,&trial).and_then(|logical|ae2_processing::special_recipe_result(self.res.stations(),&special.kind,&special.recipe,&logical))==Some(special.output.clone()){choices[i].push(key);}
+                                if ae2_processing::special_logical_grid(&special.kind,&trial).and_then(|logical|ae2_processing::special_recipe_result(self.res.stations(),&special.kind,&special.recipe,&logical))==Some(actual.clone()){choices[i].push(key);}
                             }}
                         }
                         let inputs=choices.iter().filter(|c|!c.is_empty()).map(|c|Ingredient{choices:c.iter().cloned().map(|key|(key,1)).collect()}).collect();
-                        let mut outputs=Inventory::new();output_add(&mut outputs,&special.output)?;
+                        let mut outputs=Inventory::new();output_add(&mut outputs,&actual)?;
                         register_source_pattern(&mut registry, ExtendedPattern{id:id.clone(),inputs,outputs}, source)?;
-                        specs.insert(id,Spec{provider:owner,slot,definition:definition.clone(),grid:physical_grid.iter().map(|item|item_data::canon_stack(item.as_ref())).collect(),choices,fluid_slots:BTreeMap::new(),processing:false,special:Some((special.kind,special.recipe)),special_grid_version:1,fluid_inputs:Vec::new(),fluid_outputs:Vec::new(),extra_outputs:Vec::new(),output:item_data::canon_stack(Some(&special.output))});
+                        specs.insert(id,Spec{provider:owner,slot,definition:definition.clone(),crafting_recipe:None,grid:physical_grid.iter().map(|item|item_data::canon_stack(item.as_ref())).collect(),choices,fluid_slots:BTreeMap::new(),processing:false,special:Some((special.kind,special.recipe)),special_grid_version:1,fluid_inputs:Vec::new(),fluid_outputs:Vec::new(),extra_outputs:Vec::new(),output:item_data::canon_stack(Some(&actual))});
                         continue;
                     }
                     if let Some((inputs, outputs)) = pattern
                         .as_ref()
                         .and_then(ae2_processing::ae2_decode_processing_pattern)
                     {
+                        if inputs.iter().chain(&outputs).flatten().any(|item|item.item.as_ref()=="ae2:missing_content"||self.res.items().get(&item.item).is_none()){continue;}
                         let (fluid_inputs, fluid_outputs) = pattern
                             .as_ref()
                             .and_then(ae2_processing::ae2_decode_processing_fluids)
@@ -1207,6 +1301,12 @@ mod recursive {
                                 choices: Inventory::from([(fluid_name(&fluid.key), fluid.amount)]),
                             });
                         }
+                        // Source processing patterns condense identical keys
+                        // into one input node while keeping actual slots for dispatch.
+                        let source_inputs:Vec<_>=ingredients.iter().map(|input| {
+                            let key=input.choices.keys().next().expect("processing input key").clone();
+                            SourceInput{encoded:key.clone(),primary:key,remaining:BTreeMap::new()}
+                        }).collect();
                         let mut produced = Inventory::new();
                         for item in outputs.iter().flatten() {
                             output_add(&mut produced, item)?;
@@ -1221,6 +1321,7 @@ mod recursive {
                         register_source_pattern(&mut registry, ExtendedPattern {
                             id:id.clone(), inputs:ingredients, outputs:produced,
                         }, source)?;
+                        registry.set_source_inputs(&id,source_inputs).map_err(|error|format!("{error:?}"))?;
                         let (output, extra_outputs) = processing_spec_outputs(
                             pattern.as_ref().ok_or("missing processing pattern")?, &outputs, &fluid_outputs)?;
                         specs.insert(
@@ -1229,6 +1330,7 @@ mod recursive {
                                 provider: owner,
                                 slot,
                                 definition: definition.clone(),
+                                crafting_recipe: None,
                                 grid: inputs
                                     .iter()
                                     .map(|s| item_data::canon_stack(s.as_ref()))
@@ -1252,39 +1354,41 @@ mod recursive {
                         );
                         continue;
                     }
-                    let Some((grid, expected)) =
+                    let Some((grid, encoded_output)) =
                         pattern.as_ref().and_then(ae2_processing::decode_pattern)
                     else {
                         continue;
                     };
-                    let Some((name, actual)) = self.res.recipes().find(&grid, 3) else {
-                        continue;
+                    if encoded_output.item.as_ref()=="ae2:missing_content" || self.res.items().get(&encoded_output.item).is_none()
+                        || grid.iter().flatten().any(|item|item.item.as_ref()=="ae2:missing_content"||self.res.items().get(&item.item).is_none()){continue;}
+                    let source_recipe = pattern.as_ref().and_then(|p| super::super::ae2_source_patterns::crafting(p))
+                        .and_then(Result::ok).map(|source| source.recipe);
+                    let (name, actual) = if let Some(recipe) = source_recipe.as_deref() {
+                        let Some(actual) = self.res.recipes().assemble_named(recipe, &grid, 3) else { continue; };
+                        (recipe.strip_prefix("minecraft:").unwrap_or(recipe), actual)
+                    } else {
+                        let Some(result) = self.res.recipes().find(&grid, 3) else { continue; };
+                        result
                     };
-                    if actual != expected {
-                        continue;
-                    }
+                    if source_recipe.is_none() && actual != encoded_output { continue; }
+                    if self.res.items().get(&actual.item).is_none() {continue;}
+                    let expected=actual.clone();
+                    let base_remainders=self.res.recipes().remainders(name,&grid,3);
                     let mut outputs = Inventory::new();
                     output_add(&mut outputs, &actual)?;
-                    for s in self
-                        .res
-                        .recipes()
-                        .remainders(name, &grid, 3)
-                        .iter()
-                        .flatten()
-                    {
-                        output_add(&mut outputs, s)?;
-                    }
-                    let substitutions = pattern
-                        .as_ref()
-                        .and_then(|p| p.data())
-                        .and_then(|d| d.other("minecraft:custom_data"))
-                        .and_then(|t| t.get("ae2_lab_pattern"))
-                        .and_then(|t| t.get("substitutes"))
-                        == Some(&Tag::Byte(1));
+                    for s in base_remainders.iter().flatten() {output_add(&mut outputs,s)?;}
+                    let substitutions = pattern.as_ref().and_then(ae2_processing::ae2_crafting_pattern_options)
+                        .is_some_and(|options| options.0);
                     let mut choices = vec![Vec::new(); 9];
+                    let mut source_inputs:Vec<Option<SourceInput>>=vec![None;9];
                     for (i, original) in grid.iter().enumerate() {
                         let Some(original) = original else { continue };
-                        choices[i].push(canon(original));
+                        let primary=canon(original);
+                        choices[i].push(primary.clone());
+                        let mut remaining=BTreeMap::new();
+                        if let Some(remainder)=base_remainders.get(i).and_then(Option::as_ref) {
+                            remaining.insert(primary.clone(),canon(remainder));
+                        }
                         if substitutions {
                             for candidate in &candidates {
                                 let key = canon(candidate);
@@ -1295,150 +1399,89 @@ mod recursive {
                                 let mut candidate = candidate.clone();
                                 candidate.count = 1;
                                 trial[i] = Some(candidate);
-                                let Some((candidate_name, candidate_result)) =
-                                    self.res.recipes().find(&trial, 3)
-                                else {
-                                    continue;
+                                let (candidate_name, candidate_result) = if source_recipe.is_some() {
+                                    let Some(result) = self.res.recipes().assemble_named(name, &trial, 3) else { continue; };
+                                    (name, result)
+                                } else {
+                                    let Some(result) = self.res.recipes().find(&trial, 3) else { continue; };
+                                    result
                                 };
                                 if candidate_name != name || candidate_result != actual {
                                     continue;
                                 }
-                                let mut candidate_outputs = Inventory::new();
-                                output_add(&mut candidate_outputs, &candidate_result)?;
-                                for remainder in self
-                                    .res
-                                    .recipes()
-                                    .remainders(candidate_name, &trial, 3)
-                                    .iter()
-                                    .flatten()
-                                {
-                                    output_add(&mut candidate_outputs, remainder)?;
+                                let candidate_remainders=self.res.recipes().remainders(candidate_name,&trial,3);
+                                // AECraftingPattern.isItemValid compares the
+                                // matching recipe's assembled result, not its
+                                // remaining containers. Track each candidate's
+                                // actual return for the physical CPU flight.
+                                if let Some(remainder)=candidate_remainders.get(i).and_then(Option::as_ref) {
+                                    remaining.insert(key.clone(),canon(remainder));
                                 }
-                                if candidate_outputs == outputs {
-                                    choices[i].push(key);
-                                }
+                                choices[i].push(key);
+                            }
+                        }
+                        source_inputs[i]=Some(SourceInput{encoded:primary.clone(),primary,remaining});
+                    }
+                    let allow_fluid = pattern.as_ref().and_then(ae2_processing::ae2_crafting_pattern_options)
+                        .is_some_and(|options| options.1);
+                    let mut fluid_slots = BTreeMap::new();
+                    if allow_fluid {
+                        // AECraftingPattern compresses identical encoded keys,
+                        // then chooses its fluid template from the first slot.
+                        let mut grouped = BTreeMap::<String, Option<String>>::new();
+                        for (index, item) in grid.iter().enumerate() {
+                            let Some(item) = item else { continue; };
+                            let encoded = canon(item);
+                            let fluid = grouped.entry(encoded).or_insert_with(|| {
+                                let fluid = super::super::ae2_fluids::bucket_fluid(&item.item)?;
+                                let remainder = base_remainders.get(index)?.as_ref()?;
+                                (remainder.item.as_ref() == "minecraft:bucket" && remainder.count == 1)
+                                    .then(|| fluid_name(&super::super::ae2_fluids::fluid_key(fluid)))
+                            }).clone();
+                            let Some(fluid) = fluid else { continue; };
+                            let Some(input) = source_inputs[index].as_mut() else { return Err("missing source fluid slot".into()); };
+                            input.primary = fluid.clone();
+                            if !substitutions { choices[index].clear(); input.remaining.clear(); }
+                            choices[index].insert(0, fluid.clone());
+                            fluid_slots.insert(index, (fluid, 1000));
+                            // Any physical remainder from this encoded slot is
+                            // absent when its primary input is a fluid stack.
+                            if let Some(remainder) = base_remainders.get(index).and_then(Option::as_ref) {
+                                let key = canon(remainder);
+                                let n = outputs.get_mut(&key).ok_or("missing fluid-slot remainder")?;
+                                *n = n.checked_sub(u64::from(remainder.count)).ok_or("bad fluid-slot remainder")?;
+                                if *n == 0 { outputs.remove(&key); }
                             }
                         }
                     }
-                    let inputs: Vec<_> = choices
-                        .iter()
-                        .filter(|c| !c.is_empty())
-                        .map(|c| Ingredient {
-                            choices: c.iter().cloned().map(|key| (key, 1)).collect(),
-                        })
-                        .collect();
+                    let inputs: Vec<_> = choices.iter().enumerate().filter(|(_, choices)|!choices.is_empty())
+                        .map(|(index, choices)| Ingredient {
+                            choices: choices.iter().cloned().map(|key| {
+                                let amount = fluid_slots.get(&index).filter(|(fluid,_)| fluid == &key).map_or(1, |(_, amount)| *amount);
+                                (key, amount)
+                            }).collect(),
+                        }).collect();
                     register_source_pattern(&mut registry, ExtendedPattern {
-                        id:id.clone(), inputs, outputs:outputs.clone(),
+                        id:id.clone(), inputs, outputs,
                     }, source)?;
-                    let original_spec = Spec {
+                    registry.set_source_inputs(&id,source_inputs.into_iter().flatten().collect()).map_err(|error|format!("{error:?}"))?;
+                    registry.set_source_outputs(&id,[canon(&actual)]).map_err(|error|format!("{error:?}"))?;
+                    specs.insert(id, Spec {
                         provider: owner,
                         slot,
                         definition: definition.clone(),
-                        grid: grid
-                            .iter()
-                            .map(|s| item_data::canon_stack(s.as_ref()))
-                            .collect(),
-                        choices: choices.clone(),
-                        fluid_slots: BTreeMap::new(),
+                        crafting_recipe: source_recipe.clone(),
+                        grid: grid.iter().map(|s| item_data::canon_stack(s.as_ref())).collect(),
+                        choices,
+                        fluid_slots,
                         processing: false,
-                        special:None,
-                        special_grid_version:0,
+                        special: None,
+                        special_grid_version: 0,
                         fluid_inputs: Vec::new(),
                         fluid_outputs: Vec::new(),
                         extra_outputs: Vec::new(),
                         output: item_data::canon_stack(Some(&expected)),
-                    };
-                    let allow_fluid = pattern
-                        .as_ref()
-                        .and_then(|p| p.data())
-                        .and_then(|d| d.other("minecraft:custom_data"))
-                        .and_then(|t| t.get("ae2_lab_pattern"))
-                        .and_then(|t| t.get("fluid_substitutes"))
-                        == Some(&Tag::Byte(1));
-                    if allow_fluid {
-                        let remainder = self.res.recipes().remainders(name, &grid, 3);
-                        let eligible: Vec<_> = grid
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, stack)| {
-                                let item = stack.as_ref()?;
-                                let fluid = super::super::ae2_fluids::bucket_fluid(&item.item)?;
-                                let rem = remainder.get(i)?.as_ref()?;
-                                if rem.item.as_ref() != "minecraft:bucket" || rem.count != 1 {
-                                    return None;
-                                }
-                                Some((
-                                    i,
-                                    fluid_name(&super::super::ae2_fluids::fluid_key(fluid)),
-                                    canon(rem),
-                                ))
-                            })
-                            .collect();
-                        for mask in 1usize..(1usize << eligible.len()) {
-                            let mut spec = original_spec.clone();
-                            let mut variant_outputs = outputs.clone();
-                            for (bit, (index, fluid, remainder_key)) in eligible.iter().enumerate()
-                            {
-                                if mask & (1 << bit) == 0 {
-                                    continue;
-                                }
-                                spec.fluid_slots.insert(*index, (fluid.clone(), 1000));
-                                spec.choices[*index] = vec![fluid.clone()];
-                                let Some(n) = variant_outputs.get_mut(remainder_key) else {
-                                    return Err("missing bucket remainder".into());
-                                };
-                                *n -= 1;
-                                if *n == 0 {
-                                    variant_outputs.remove(remainder_key);
-                                }
-                            }
-                            let inputs = spec
-                                .choices
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, c)| !c.is_empty())
-                                .map(|(i, c)| Ingredient {
-                                    choices: c
-                                        .iter()
-                                        .cloned()
-                                        .map(|key| {
-                                            let amount = spec
-                                                .fluid_slots
-                                                .get(&i)
-                                                .map_or(1, |(_, amount)| *amount);
-                                            (key, amount)
-                                        })
-                                        .collect(),
-                                })
-                                .collect();
-                            let variant_id = format!("{id}/fluid-{mask}");
-                            register_source_pattern(&mut registry, ExtendedPattern {
-                                id:variant_id.clone(), inputs, outputs:variant_outputs,
-                            }, source)?;
-                            specs.insert(variant_id, spec);
-                        }
-                    }
-                    specs.insert(
-                        id,
-                        Spec {
-                            provider: owner,
-                            slot,
-                            definition: definition.clone(),
-                            grid: grid
-                                .iter()
-                                .map(|s| item_data::canon_stack(s.as_ref()))
-                                .collect(),
-                            choices,
-                            fluid_slots: BTreeMap::new(),
-                            processing: false,
-                        special:None,
-                        special_grid_version:0,
-                            fluid_inputs: Vec::new(),
-                            fluid_outputs: Vec::new(),
-                            extra_outputs: Vec::new(),
-                            output: item_data::canon_stack(Some(&expected)),
-                        },
-                    );
+                    });
                 }
             }
             Ok((registry, specs))
@@ -1499,7 +1542,7 @@ mod recursive {
                 pos,
                 canon(&ae2_lab::prototype(key)?),
                 amount,
-                Some(cpu), false,
+                Some(cpu), false, None, None,
             )
         }
         /// Eligible physical CPU clusters on this network, one stable address
@@ -1612,7 +1655,8 @@ mod recursive {
             missing: &Inventory,
         ) -> Vec<String> {
             let mut lines = Vec::new();
-            for (name, count) in &plan.reserved {
+            let keys:BTreeSet<_>=plan.reserved.keys().chain(missing.keys()).collect();
+            for name in keys {
                 let label = if let Some(fluid) = parse_fluid(name) {
                     format!("{} mB", fluid.item_id)
                 } else {
@@ -1621,7 +1665,7 @@ mod recursive {
                         .unwrap_or_else(|_| "Unknown item".into())
                 };
                 let shortage = missing.get(name).copied().unwrap_or(0);
-                let present = count.saturating_sub(shortage);
+                let present = plan.reserved.get(name).copied().unwrap_or(0);
                 if present > 0 {
                     lines.push(format!("Stored {present} x {label}"));
                 }
@@ -1647,6 +1691,25 @@ mod recursive {
                 lines.push(format!("Planned {count} x {label}"));
             }
             lines
+        }
+        /// Capture only owned data for the worker; physical resources remain
+        /// in the world and are checked again when the player submits.
+        pub(in crate::game) fn ae2_craft_calculation_snapshot(
+            &self,pos:Pos,key:&ae2_cell_core::ItemKey,fluid:bool,amount:u64,
+        )->Result<(ExtendedRegistry,Inventory,String),String> {
+            if amount==0 {return Err("craft amount must be positive".into());}
+            let target=if fluid {fluid_name(key)} else {canon(&ae2_lab::prototype(key)?)};
+            let (registry,_)=self.recursive_patterns(pos)?;
+            let mut available=Inventory::new();
+            for (key,count) in self.ae2_grid_inventory(pos)? {
+                let entry=available.entry(canon(&ae2_lab::prototype(&key)?)).or_default();
+                *entry=entry.checked_add(count).ok_or("inventory overflow")?;
+            }
+            for (key,count) in self.ae2_grid_fluids(pos)? {
+                available.insert(fluid_name(&key),count);
+            }
+            available.remove(&target);
+            Ok((registry,available,target))
         }
         /// Build a hypothetical report without touching the actual grid.
         pub(in crate::game) fn ae2_craft_report(
@@ -1692,7 +1755,7 @@ mod recursive {
             amount: u64,
             cpu: GridAddress,
         ) -> Result<GridAddress, String> {
-            self.ae2_begin_recursive_target_on(pos, fluid_name(key), amount, Some(cpu), false)
+            self.ae2_begin_recursive_target_on(pos, fluid_name(key), amount, Some(cpu), false, None, None)
         }
         fn ae2_request_valid(
             &self,
@@ -1767,45 +1830,70 @@ mod recursive {
                 }
             }
         }
-        fn ae2_request_feasible_amount(
-            &self,
-            pos: Pos,
-            target: &str,
-            amount: u64,
-        ) -> Result<u64, String> {
-            if amount == 0 {
-                return Err("craft amount must be positive".into());
+        fn ae2_machine_request_generation(&self, owner: RequestOwner, slot: usize, key: &ae2_cell_core::ItemKey, fluid: bool) -> Option<i64> {
+            match owner {
+                RequestOwner::Interface(owner) => self.ae2_interface_pending_craft_generation(owner, slot, key, fluid),
+                RequestOwner::Export(owner) => self.ae2_export_pending_craft_generation(owner, slot, key),
             }
-            let (registry, _) = self.recursive_patterns(pos)?;
-            let mut available = Inventory::new();
-            for (key, count) in self.ae2_grid_inventory(pos)? {
-                let item = ae2_lab::prototype(&key)?;
-                let entry = available.entry(canon(&item)).or_default();
-                *entry = entry.checked_add(count).ok_or("inventory overflow")?;
-            }
-            for (key, count) in self.ae2_grid_fluids(pos)? {
-                available.insert(fluid_name(&key), count);
-            }
-            available.remove(target);
-            let feasible = |n| {
-                registry
-                    .plan(&available, target, n)
-                    .is_ok_and(|p| !p.steps.is_empty())
-            };
-            let mut low = 0u64;
-            let mut high = amount;
-            while low < high {
-                let mid = low + (high - low) / 2 + (high - low) % 2;
-                if feasible(mid) {
-                    low = mid;
-                } else {
-                    high = mid - 1;
+        }
+        /// Cancel stale futures on owner replacement, card removal or a changed
+        /// ghost request before dividing this level's next calculation budget.
+        pub(in crate::game) fn ae2_prune_machine_craft_calculations(&mut self) {
+            if self.ae2_pending_machine_crafts.is_empty() { return; }
+            let network = self.ae2_network();
+            let pending = std::mem::take(&mut self.ae2_pending_machine_crafts);
+            self.ae2_pending_machine_crafts = pending.into_iter().filter(|work| {
+                work.owner.identity(&network) == Some(work.identity)
+                    && self.ae2_machine_request_generation(work.owner, work.slot, &work.key, work.fluid) == Some(work.generation)
+            }).collect();
+        }
+        pub(in crate::game) fn ae2_active_machine_craft_calculations(&self) -> usize {
+            self.ae2_pending_machine_crafts.iter().filter(|work| work.calculation.is_some()
+                && self.ae2_address_parts(work.owner.anchor()).is_some_and(|(dim, _)| dim == self.dim)).count()
+        }
+        pub(in crate::game) fn ae2_tick_machine_craft_calculations(&mut self) {
+            if self.ae2_active_machine_craft_calculations() == 0 { return; }
+            let allowance = self.ae2_craft_tick_allowance();
+            let dim = self.dim;
+            for work in &mut self.ae2_pending_machine_crafts {
+                if !work.owner.anchor().local_parts().is_some_and(|(level, _)| level == dim) { continue; }
+                let Some(calculation) = work.calculation.as_mut() else { continue; };
+                if !calculation.run_slice(allowance) {
+                    work.result = Some(calculation.take_result().unwrap_or(Err(ae2_crafting_core::Error::WorkerPanicked)));
+                    work.calculation = None;
                 }
             }
-            if low == 0 {
-                return Err("no feasible craft".into());
+        }
+        /// First call starts the owned CRAFT_LESS future; a later requester
+        /// tick polls it and commits only after identity and stock rechecks.
+        fn ae2_prepare_machine_craft(
+            &mut self, owner: RequestOwner, slot: usize, key: &ae2_cell_core::ItemKey,
+            fluid: bool, amount: u64, pos: Pos,
+        ) -> Result<(ExtendedRegistry, ae2_crafting_core::extended::Plan), String> {
+            if amount == 0 { return Err("craft amount must be positive".into()); }
+            let identity = owner.identity(&self.ae2_network()).ok_or("crafting requester missing")?;
+            let generation = self.ae2_machine_request_generation(owner, slot, key, fluid).ok_or("crafting requester changed")?;
+            if let Some(index) = self.ae2_pending_machine_crafts.iter().position(|work| work.owner == owner && work.slot == slot) {
+                let work = &self.ae2_pending_machine_crafts[index];
+                if work.identity != identity || work.generation != generation || work.key != *key || work.fluid != fluid {
+                    self.ae2_pending_machine_crafts.remove(index);
+                } else {
+                    if work.calculation.is_some() { return Err("craft calculation pending".into()); }
+                    let work = self.ae2_pending_machine_crafts.remove(index);
+                    let (plan, _) = work.result.ok_or("craft calculation missing result")?.map_err(|error| format!("craft planning: {error:?}"))?;
+                    if plan.simulated || (plan.steps.is_empty() && plan.emitted.is_empty()) { return Err("no feasible craft".into()); }
+                    return Ok((work.registry, plan));
+                }
             }
-            Ok(low)
+            let (registry, inventory, target) = self.ae2_craft_calculation_snapshot(pos, key, fluid, amount)?;
+            let calculation = ae2_crafting_core::calculation::Calculation::with_strategy(
+                registry.clone(), inventory, target, amount, ae2_crafting_core::calculation::Strategy::CraftLess,
+            );
+            self.ae2_pending_machine_crafts.push(PendingMachineCraft {
+                owner, slot, key: key.clone(), fluid, identity, generation, registry,
+                calculation: Some(calculation), result: None,
+            });
+            Err("craft calculation pending".into())
         }
         pub(in crate::game) fn ae2_begin_interface_craft(
             &mut self,
@@ -1829,12 +1917,11 @@ mod recursive {
             } else {
                 canon(&ae2_lab::prototype(key)?)
             };
-            // MultiCraftingTracker requests CRAFT_LESS: find the largest
-            // feasible amount, without reserving anything during planning.
-            let low = self.ae2_request_feasible_amount(pos, &target, amount)?;
+            let (registry, plan) = self.ae2_prepare_machine_craft(RequestOwner::Interface(owner), slot, key, fluid, amount, pos)?;
+            let low = plan.amount;
             let before = snapshot(self);
             let result = (|| {
-                let cpu = self.ae2_begin_recursive_target_on(pos, target.clone(), low, None, true)?;
+                let cpu = self.ae2_begin_recursive_target_on(pos, target.clone(), low, None, true, None, Some((&registry, &plan)))?;
                 self.ae2_interface_set_craft_link(owner, slot, None, Some(cpu))?;
                 if !self.ae2_interface_craft_link_valid(owner, slot, cpu, key, fluid) {
                     return Err("interface crafting configuration changed".into());
@@ -1889,10 +1976,11 @@ mod recursive {
             } else {
                 canon(&ae2_lab::prototype(key)?)
             };
-            let amount = self.ae2_request_feasible_amount(pos, &target, amount)?;
+            let (registry, plan) = self.ae2_prepare_machine_craft(RequestOwner::Export(owner), slot, key, fluid, amount, pos)?;
+            let amount = plan.amount;
             let before = snapshot(self);
             let result = (|| {
-                let cpu = self.ae2_begin_recursive_target_on(pos, target.clone(), amount, None, true)?;
+                let cpu = self.ae2_begin_recursive_target_on(pos, target.clone(), amount, None, true, None, Some((&registry, &plan)))?;
                 self.ae2_export_set_craft_link(owner, slot, None, Some(cpu))?;
                 if !self.ae2_export_craft_link_valid(owner, slot, cpu, key, fluid) {
                     return Err("export bus configuration changed".into());
@@ -1927,7 +2015,13 @@ mod recursive {
             target: String,
             amount: u64,
         ) -> Result<GridAddress, String> {
-            self.ae2_begin_recursive_target_on(pos, target, amount, None, false)
+            let owner=(!self.serving() && self.remote.is_none()).then(||self.ae2_local_player_uuid());
+            self.ae2_begin_recursive_target_on(pos, target, amount, None, false, owner, None)
+        }
+        /// Submit for the actual player whose terminal requested the job.
+        pub(in crate::game) fn ae2_begin_player_craft(&mut self,pos:Pos,key:&ae2_cell_core::ItemKey,fluid:bool,amount:u64,cpu:Option<GridAddress>,owner:u128,registry:&ExtendedRegistry,plan:&ae2_crafting_core::extended::Plan)->Result<GridAddress,String> {
+            let target=if fluid {fluid_name(key)} else {canon(&ae2_lab::prototype(key)?)};
+            self.ae2_begin_recursive_target_on(pos,target,amount,cpu,false,Some(owner),Some((registry,plan)))
         }
         fn ae2_begin_recursive_target_on(
             &mut self,
@@ -1936,6 +2030,8 @@ mod recursive {
             amount: u64,
             requested_cpu: Option<GridAddress>,
             machine_request: bool,
+            player_owner: Option<u128>,
+            prepared: Option<(&ExtendedRegistry,&ae2_crafting_core::extended::Plan)>,
         ) -> Result<GridAddress, String> {
             if amount == 0 {
                 return Err("craft amount must be positive".into());
@@ -1952,9 +2048,14 @@ mod recursive {
             }
             // AE2 ignores the target already in the network when crafting.
             available.remove(&target);
-            let plan = registry
-                .plan(&available, &target, amount)
-                .map_err(|e| format!("craft planning: {e:?}"))?;
+            let plan=if let Some((previous,plan))=prepared {
+                if plan.simulated || plan.target!=target || plan.amount!=amount || !previous.same_definitions(&registry) {
+                    return Err("crafting patterns changed; recalculate the request".into());
+                }
+                plan.clone()
+            } else {
+                registry.plan(&available,&target,amount).map_err(|e|format!("craft planning: {e:?}"))?
+            };
             if plan.steps.is_empty() && plan.emitted.is_empty() {
                 return Err("no craft steps".into());
             }
@@ -2080,7 +2181,9 @@ mod recursive {
                 address_version: 1,
                 requester: None,
                 export_requester: None,
+                player_owner: player_owner.map(super::super::ae2_job_events::owner_words),
             };
+            let started=job_status(&session,horizon_client::ae2_job_status::Status::Started);
             if let Some(BlockEntity::Ae2(m)) = self.ae2_block_entity_mut(cpu_pos) {
                 if let Err(e) =
                     write_fluids(m, &fluids).and_then(|_| write_session(m, &session, &physical))
@@ -2097,6 +2200,7 @@ mod recursive {
                 return Err(e);
             }
             self.ae2_mark_modified(cpu_pos);
+            if let Some((owner,event))=started {self.ae2_emit_job_status(owner,event);}
             Ok(cpu_pos)
         }
     }
@@ -2129,14 +2233,16 @@ mod recursive {
         step: &ae2_crafting_core::extended::Step,
         recipes: &horizon_client::crafting::Recipes,
         stations: &horizon_client::stations::StationData,
-    ) -> Option<Vec<Option<ItemStack>>> {
+    ) -> Option<(Vec<Option<ItemStack>>, BTreeMap<usize, (String, u64)>)> {
         let template = pattern_grid(spec).ok()?;
         let choices: Vec<Vec<String>> = if spec.choices.len() == 9 {
             spec.choices.clone()
         } else {
             template
                 .iter()
-                .map(|s| s.as_ref().map(|s| vec![canon(s)]).unwrap_or_default())
+                .enumerate()
+                .map(|(i,s)| spec.fluid_slots.get(&i).map(|(name,_)|vec![name.clone()])
+                    .unwrap_or_else(||s.as_ref().map(|s| vec![canon(s)]).unwrap_or_default()))
                 .collect()
         };
         fn assign(
@@ -2145,6 +2251,7 @@ mod recursive {
             template: &[Option<ItemStack>],
             remaining: &mut Inventory,
             grid: &mut [Option<ItemStack>],
+            active_fluids: &mut BTreeMap<usize, (String, u64)>,
             spec: &Spec,
             step: &ae2_crafting_core::extended::Step,
             recipes: &horizon_client::crafting::Recipes,
@@ -2160,8 +2267,12 @@ mod recursive {
                     let Ok(Some(expected))=item_data::parse_stack(&spec.output) else{return false;};
                     let mut output=Inventory::new();return result==expected && output_add(&mut output,&result).is_ok() && output==step.outputs;
                 }
-                let Some((name, result)) = recipes.find(grid, 3) else {
-                    return false;
+                let (name, result) = if let Some(name) = spec.crafting_recipe.as_deref() {
+                    let Some(result) = recipes.assemble_named(name, grid, 3) else { return false; };
+                    (name.strip_prefix("minecraft:").unwrap_or(name), result)
+                } else {
+                    let Some(result) = recipes.find(grid, 3) else { return false; };
+                    result
                 };
                 let Ok(Some(expected)) = item_data::parse_stack(&spec.output) else {
                     return false;
@@ -2174,7 +2285,7 @@ mod recursive {
                     return false;
                 }
                 for (index, remainder) in recipes.remainders(name, grid, 3).iter().enumerate() {
-                    if !spec.fluid_slots.contains_key(&index)
+                    if !active_fluids.contains_key(&index)
                         && remainder
                             .as_ref()
                             .is_some_and(|s| output_add(&mut output, s).is_err())
@@ -2191,6 +2302,7 @@ mod recursive {
                     template,
                     remaining,
                     grid,
+                    active_fluids,
                     spec,
                     step,
                     recipes,
@@ -2201,12 +2313,14 @@ mod recursive {
                 let Some(n) = remaining.get_mut(key) else {
                     continue;
                 };
-                let amount = spec.fluid_slots.get(&i).map_or(1, |(_, amount)| *amount);
+                let fluid = spec.fluid_slots.get(&i).filter(|(name,_)| name == key);
+                let amount = fluid.map_or(1, |(_, amount)| *amount);
                 if *n < amount {
                     continue;
                 }
                 *n -= amount;
-                grid[i] = if spec.fluid_slots.contains_key(&i) {
+                grid[i] = if let Some(fluid) = fluid {
+                    active_fluids.insert(i, fluid.clone());
                     template[i].clone()
                 } else {
                     from_key(key).ok()
@@ -2218,6 +2332,7 @@ mod recursive {
                         template,
                         remaining,
                         grid,
+                        active_fluids,
                         spec,
                         step,
                         recipes,
@@ -2228,23 +2343,25 @@ mod recursive {
                 }
                 *remaining.get_mut(key).unwrap() += amount;
                 grid[i] = None;
+                active_fluids.remove(&i);
             }
             false
         }
         let mut remaining = step.inputs.clone();
         let mut grid = vec![None; 9];
-        assign(
+        let mut active_fluids = BTreeMap::new();
+        if assign(
             0,
             &choices,
             &template,
             &mut remaining,
             &mut grid,
+            &mut active_fluids,
             spec,
             step,
             recipes,
             stations,
-        )
-        .then_some(grid)
+        ) {Some((grid,active_fluids))} else {None}
     }
     impl Game<'_> {
         fn recursive_neighbors(&self, address: GridAddress) -> Vec<GridAddress> {
@@ -2614,9 +2731,14 @@ mod recursive {
             let (grid,output)=if let Some((kind,recipe))=&spec.special {
                 let pattern=ae2_processing::ae2_decode_special_pattern(stored)?;
                 if &pattern.kind!=kind || &pattern.recipe!=recipe {return None;}
+                let output=ae2_processing::special_recipe_result(self.res.stations(),kind,recipe,&pattern.grid)?;
                 let grid=if spec.special_grid_version==0 {pattern.grid}else{ae2_processing::special_assembler_grid(kind,&pattern.grid)?};
-                (grid,pattern.output)
-            } else {ae2_processing::decode_pattern(stored)?};
+                (grid,output)
+            } else {
+                let (grid,encoded)=ae2_processing::decode_pattern(stored)?;
+                let output=if let Some(recipe)=spec.crafting_recipe.as_deref(){self.res.recipes().assemble_named(recipe,&grid,3)?}else{encoded};
+                (grid,output)
+            };
             if grid
                 .iter()
                 .map(|s| item_data::canon_stack(s.as_ref()))
@@ -2627,12 +2749,7 @@ mod recursive {
                 return None;
             }
             if !spec.fluid_slots.is_empty()
-                && stored
-                    .data()?
-                    .other("minecraft:custom_data")?
-                    .get("ae2_lab_pattern")?
-                    .get("fluid_substitutes")
-                    != Some(&Tag::Byte(1))
+                && !ae2_processing::ae2_crafting_pattern_options(stored).is_some_and(|options| options.1)
             {
                 return None;
             }
@@ -3233,6 +3350,11 @@ mod recursive {
                     for item in drops {
                         self.pop_resource([pos.0, pos.1, pos.2], item);
                     }
+                    for (_,_,session,_,_) in &jobs {
+                        if !session.cpu.is_cancelled() {
+                            if let Some((owner,event))=job_status(session,horizon_client::ae2_job_status::Status::Cancelled) {self.ae2_emit_job_status(owner,event);}
+                        }
+                    }
                     Ok(())
                 }
                 Err(error) => {
@@ -3251,11 +3373,14 @@ mod recursive {
             };
             let mut session = read_session(machine, dim)?;
             let physical = read_escrow(machine)?;
+            if session.cpu.is_cancelled() {return Ok(());}
             session.cpu.cancel().map_err(|e| format!("{e:?}"))?;
+            let cancelled=job_status(&session,horizon_client::ae2_job_status::Status::Cancelled);
             if let Some(BlockEntity::Ae2(machine)) = self.ae2_block_entity_mut(pos) {
                 write_session(machine, &session, &physical)?;
             }
             self.ae2_mark_modified(pos);
+            if let Some((owner,event))=cancelled {self.ae2_emit_job_status(owner,event);}
             Ok(())
         }
         pub(in crate::game) fn ae2_recursive_toggle_suspended(&mut self, pos: GridAddress) -> Result<bool, String> {
@@ -3607,9 +3732,22 @@ mod recursive {
         }
         fn tick_recursive_one(&mut self, pos: Pos) -> Result<(), String> {
             let before = snapshot(self);
+            let prior=self.world.block_entities.get(&pos).and_then(|entity|match entity {
+                BlockEntity::Ae2(machine)=>read_session(machine,self.dim).ok(),_=>None,
+            });
             let mut formation = super::super::ae2_buses::FormationPlan::default();
             match self.tick_recursive_inner(pos, &mut formation).and_then(|()|self.ae2_commit_formation(formation)) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    let remains=matches!(self.world.block_entities.get(&pos),Some(BlockEntity::Ae2(machine)) if machine.config.contains_key(&JOB.into()));
+                    if !remains {
+                        if let Some(session)=prior.filter(|session|!session.cpu.is_cancelled()) {
+                            if let Some((owner,mut event))=job_status(&session,horizon_client::ae2_job_status::Status::Finished) {
+                                event.remaining=0;self.ae2_emit_job_status(owner,event);
+                            }
+                        }
+                    }
+                    Ok(())
+                },
                 Err(error) => {
                     restore(self, before);
                     Err(error)
@@ -3867,7 +4005,7 @@ mod recursive {
                 let Some(job_id) = session.job_id else {
                     break;
                 };
-                let Some(template) = choose_grid(&spec, &step, self.res.recipes(), self.res.stations()) else {
+                let Some((template, active_fluids)) = choose_grid(&spec, &step, self.res.recipes(), self.res.stations()) else {
                     break;
                 };
                 let mut staged = vec![None; 9];
@@ -3875,7 +4013,7 @@ mod recursive {
                 let mut next_fluids = fluids.clone();
                 let mut assembler_fluids = Vec::new();
                 for (i, expected) in template.iter().enumerate() {
-                    if let Some((name, amount)) = spec.fluid_slots.get(&i) {
+                    if let Some((name, amount)) = active_fluids.get(&i) {
                         let key = parse_fluid(name).ok_or("invalid assembler fluid key")?;
                         let n = next_fluids.get_mut(&key).ok_or("missing assembler fluid")?;
                         if *n < *amount {
@@ -3913,6 +4051,7 @@ mod recursive {
                     item_data::parse_stack(&spec.output)?.ok_or("missing pattern output")?;
                 let mut data=pattern_data(&template,&output);
                 if let Some((kind,recipe))=&spec.special {if let Tag::Compound(values)=&mut data {values.insert("special_kind".into(),Tag::String(kind.as_str().into()));values.insert("recipe".into(),Tag::String(recipe.as_str().into()));}}
+                if let (Some(recipe), Tag::Compound(values))=(&spec.crafting_recipe, &mut data) { values.insert("crafting_recipe".into(),Tag::String(recipe.as_str().into())); }
                 updated.config.insert("ae2_assembler_pattern".into(),data);
                 let flight_owner = AssemblerFlightOwner {
                     cpu: cpu_address,
@@ -4136,7 +4275,7 @@ mod recursive {
             let result=canon(&ItemStack::new("minecraft:netherite_sword",1));
             let mut registry=ExtendedRegistry::default();registry.register(ExtendedPattern{id:"legacy".into(),inputs:vec![Ingredient{choices:Inventory::from([(old.clone(),1)])}],outputs:Inventory::from([(result.clone(),1)])}).unwrap();
             let mut inventory=Inventory::from([(old.clone(),1)]);let plan=registry.plan(&inventory,&result,1).unwrap();let mut cpu=Cpu::new(1024,0);cpu.submit(plan,&mut inventory).unwrap();
-            let session=Session{cpu,suspended:false,specs:BTreeMap::new(),flights:BTreeMap::new(),job_id:None,address_version:1,requester:None,export_requester:None};
+            let session=Session{cpu,suspended:false,specs:BTreeMap::new(),flights:BTreeMap::new(),job_id:None,address_version:1,requester:None,export_requester:None,player_owner:None};
             let mut machine=Machine::new(MachineKind::CraftingStorage1k);let json=serde_json::to_string(&session).unwrap();machine.config.insert(JOB.into(),Tag::String(json.as_str().into()));machine.config.insert(ESCROW.into(),Tag::List(vec![horizon_client::save::item_to_nbt(&item)]));
             let loaded=read_session(&machine,super::super::super::Dim::Overworld).unwrap();assert_eq!(loaded.cpu.escrow(),&Inventory::from([(modern,1)]));
         }
@@ -4150,7 +4289,7 @@ mod recursive {
             registry.set_emittable(vec![input_key.clone()]).unwrap();
             let mut available=Inventory::new();let plan=registry.plan(&available,&output_key,4).unwrap();
             let mut cpu=Cpu::new(1024,0);cpu.submit(plan,&mut available).unwrap();
-            let mut session=Session{cpu,suspended:false,specs:BTreeMap::new(),flights:BTreeMap::new(),job_id:None,address_version:1,requester:None,export_requester:None};
+            let mut session=Session{cpu,suspended:false,specs:BTreeMap::new(),flights:BTreeMap::new(),job_id:None,address_version:1,requester:None,export_requester:None,player_owner:None};
             let mut machine=Machine::new(MachineKind::CraftingStorage1k);
             write_fluids(&mut machine,&BTreeMap::new()).unwrap();write_session(&mut machine,&session,&[]).unwrap();
             session=read_session(&machine,super::super::super::Dim::Overworld).unwrap();
@@ -4183,6 +4322,7 @@ mod recursive {
                 address_version: 1,
                 requester: None,
                 export_requester: None,
+                player_owner: None,
             };
             assert!(matching_assembler_flight(&owner, &session, assembler));
             session.job_id = Some([42, 74]);
@@ -4195,11 +4335,44 @@ mod recursive {
         }
         #[test]
         fn suspended_job_roundtrips_and_legacy_jobs_resume_by_default() {
-            let session=Session { cpu:Cpu::new(1024,0), suspended:true, specs:BTreeMap::new(), flights:BTreeMap::new(), job_id:Some([1,2]), address_version:1, requester:None, export_requester:None };
+            let session=Session { cpu:Cpu::new(1024,0), suspended:true, specs:BTreeMap::new(), flights:BTreeMap::new(), job_id:Some([1,2]), address_version:1, requester:None, export_requester:None, player_owner:None };
             let mut saved=serde_json::to_value(&session).unwrap();
             assert!(serde_json::from_value::<Session>(saved.clone()).unwrap().suspended);
             saved.as_object_mut().unwrap().remove("suspended");
             assert!(!serde_json::from_value::<Session>(saved).unwrap().suspended);
+        }
+        #[test]
+        fn player_job_events_preserve_owner_output_and_legacy_saves() {
+            use horizon_client::ae2_job_status::Status;
+            let owner=0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
+            let mut registry=ExtendedRegistry::default();
+            registry.register(ExtendedPattern {
+                id:"boards".into(),
+                inputs:vec![Ingredient{choices:Inventory::from([("wood".into(),1)])}],
+                outputs:Inventory::from([("board".into(),4)]),
+            }).unwrap();
+            let mut available=Inventory::from([("wood".into(),2)]);
+            let plan=registry.plan(&available,"board",8).unwrap();
+            let mut cpu=Cpu::new(1024,0);cpu.submit(plan,&mut available).unwrap();
+            let mut session=Session {
+                cpu,suspended:false,specs:BTreeMap::new(),flights:BTreeMap::new(),
+                job_id:Some([i64::MIN,i64::MAX]),address_version:1,requester:None,
+                export_requester:None,player_owner:Some(super::super::super::ae2_job_events::owner_words(owner)),
+            };
+            let (recipient,started)=job_status(&session,Status::Started).unwrap();
+            assert_eq!(recipient,owner);
+            assert_eq!(started.job_id,[i64::MIN,i64::MAX]);
+            assert_eq!((&*started.key,started.requested,started.remaining,started.status),("board",8,8,Status::Started));
+            let mut saved=serde_json::to_value(&session).unwrap();
+            let loaded:Session=serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(job_status(&loaded,Status::Started).unwrap().0,owner);
+            saved.as_object_mut().unwrap().remove("player_owner");
+            assert!(job_status(&serde_json::from_value::<Session>(saved).unwrap(),Status::Started).is_none());
+            let (flight,_)=session.cpu.dispatch().unwrap();
+            session.cpu.receive(flight,"board",4).unwrap();
+            session.cpu.cancel().unwrap();
+            let (_,cancelled)=job_status(&session,Status::Cancelled).unwrap();
+            assert_eq!((cancelled.requested,cancelled.remaining,cancelled.status),(8,4,Status::Cancelled));
         }
         #[test]
         fn cpu_selection_policy_filters_and_prefers_the_request_source() {
@@ -4212,12 +4385,77 @@ mod recursive {
             assert_eq!(selection_policy(None,false),None);
         }
         #[test]
+        fn fluid_slots_follow_each_selected_flight_and_legacy_spec() {
+            let resources=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/resources/26.3");
+            if !resources.join("items.json").exists(){return;}
+            let items=horizon_client::items::Items::catalog(&resources).unwrap();
+            let root=std::env::temp_dir().join(format!("ae2-fluid-grid-{}",std::process::id()));
+            let dir=root.join("data/minecraft/recipe");std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("fluid_grid.json"),r#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:water_bucket","minecraft:water_bucket"],"result":{"id":"minecraft:diamond","count":1}}"#).unwrap();
+            let recipes=horizon_client::crafting::Recipes::load(&root,&items).unwrap();
+            let stations=horizon_client::stations::StationData::load(&resources,&items);
+            let water=fluid_name(&super::super::super::ae2_fluids::fluid_key("minecraft:water"));
+            let filled=canon(&ItemStack::new("minecraft:water_bucket",1));let empty=canon(&ItemStack::new("minecraft:bucket",1));
+            let result=canon(&ItemStack::new("minecraft:diamond",1));let mut grid=vec!["-".to_string();9];grid[0]=filled.clone();grid[1]=filled.clone();
+            let mut choices=vec![Vec::new();9];choices[0]=vec![water.clone(),filled.clone()];choices[1]=choices[0].clone();
+            let spec=Spec{provider:ProviderOwner::Block(GridAddress::from_local(super::super::super::Dim::Overworld,(0,64,0)).unwrap()),slot:0,definition:None,
+                crafting_recipe:Some("minecraft:fluid_grid".into()),grid,choices,fluid_slots:BTreeMap::from([(0,(water.clone(),1000)),(1,(water.clone(),1000))]),
+                processing:false,special:None,special_grid_version:0,fluid_inputs:Vec::new(),fluid_outputs:Vec::new(),extra_outputs:Vec::new(),output:result.clone()};
+            let step=ae2_crafting_core::extended::Step{pattern:"p".into(),inputs:Inventory::from([(water.clone(),1000),(filled.clone(),1)]),outputs:Inventory::from([(result.clone(),1),(empty,1)]),runs:1};
+            let (grid,fluids)=choose_grid(&spec,&step,&recipes,&stations).unwrap();
+            assert_eq!(grid[0].as_ref().unwrap().item.as_ref(),"minecraft:water_bucket");
+            assert_eq!(grid[1].as_ref().unwrap().item.as_ref(),"minecraft:water_bucket");
+            assert_eq!(fluids,BTreeMap::from([(0,(water.clone(),1000))]));
+            let mut legacy:Spec=serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+            legacy.choices[0]=vec![water.clone()];legacy.choices[1]=vec![filled];legacy.fluid_slots.remove(&1);
+            let (_,fluids)=choose_grid(&legacy,&step,&recipes,&stations).unwrap();assert_eq!(fluids,BTreeMap::from([(0,(water.clone(),1000))]));
+            let mut value=serde_json::to_value(&legacy).unwrap();value.as_object_mut().unwrap().remove("choices");
+            let oldest:Spec=serde_json::from_value(value).unwrap();
+            let (_,fluids)=choose_grid(&oldest,&step,&recipes,&stations).unwrap();assert_eq!(fluids,BTreeMap::from([(0,(water,1000))]));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        #[test]
         fn legacy_job_identity_migration_is_persistable_and_never_rotates() {
-            let mut session=Session {cpu:Cpu::new(1024,0),suspended:false,specs:BTreeMap::new(),flights:BTreeMap::new(),job_id:None,address_version:1,requester:None,export_requester:None};
+            let mut session=Session {cpu:Cpu::new(1024,0),suspended:false,specs:BTreeMap::new(),flights:BTreeMap::new(),job_id:None,address_version:1,requester:None,export_requester:None,player_owner:None};
             assert!(migrate_job_identity(&mut session,[13,17]));
             let mut restored:Session=serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
             assert!(!migrate_job_identity(&mut restored,[19,23]));
             assert_eq!(restored.job_id,Some([13,17]));
+        }
+        #[test]
+        fn large_cpu_jobs_round_trip_nbt_without_the_string_limit() {
+            assert!(matches!(job_payload("x".repeat(65_535)).unwrap(),Tag::String(_)));
+            assert!(matches!(job_payload("x".repeat(65_536)).unwrap(),Tag::ByteArray(_)));
+            // One Unicode scalar becomes two modified-UTF-8 encoded UTF-16
+            // units; ordinary UTF-8 length alone undercounts this boundary.
+            assert!(matches!(job_payload("😀".repeat(10_923)).unwrap(),Tag::ByteArray(_)));
+            let provider=ProviderOwner::Block(GridAddress::from_local(super::super::super::Dim::Overworld,(0,64,0)).unwrap());
+            let mut inputs=Vec::new();let mut stock=Inventory::new();
+            for i in 0..4097 {
+                let mut input=ItemStack::new("minecraft:stone",1);input.data_mut().custom_name=Some(format!("variant-{i:04}"));
+                stock.insert(canon(&input),1);inputs.push(input);
+            }
+            let primary=stock.keys().next().unwrap().clone();let result=canon(&ItemStack::new("minecraft:diamond",1));
+            let mut grid=vec!["-".to_string();9];grid[0]=primary.clone();let mut choices=vec![Vec::new();9];choices[0]=stock.keys().cloned().collect();
+            let spec=Spec{provider,slot:0,definition:None,crafting_recipe:None,grid,choices,fluid_slots:BTreeMap::new(),
+                processing:false,special:None,special_grid_version:0,fluid_inputs:Vec::new(),fluid_outputs:Vec::new(),extra_outputs:Vec::new(),
+                output:result.clone()};
+            let specs=BTreeMap::from([("pattern".into(),spec)]);
+            let mut registry=ExtendedRegistry::default();
+            registry.register(ExtendedPattern{id:"pattern".into(),inputs:vec![Ingredient{choices:stock.clone()}],outputs:Inventory::from([(result.clone(),1)])}).unwrap();
+            registry.set_source_inputs("pattern",vec![SourceInput{encoded:primary.clone(),primary,remaining:BTreeMap::new()}]).unwrap();
+            let mut network=stock.clone();let plan=registry.plan(&network,&result,4097).unwrap();assert_eq!(plan.steps.len(),4097);
+            let mut cpu=Cpu::new(16384,0);cpu.submit(plan,&mut network).unwrap();assert!(network.is_empty());
+            let session=Session{cpu,suspended:false,specs,flights:BTreeMap::new(),job_id:Some([7,11]),address_version:1,requester:None,export_requester:None,player_owner:None};
+            let mut machine=Machine::new(MachineKind::CraftingStorage16k);write_session(&mut machine,&session,&inputs).unwrap();
+            assert!(matches!(machine.config.get(&JOB.into()),Some(Tag::ByteArray(v)) if v.len()>65_535));
+            let root=Tag::Compound(machine.config.clone());
+            let bytes=horizon_world::nbt::write_network(&root,horizon_world::nbt::Limits::default()).unwrap();
+            let (Tag::Compound(config),_)=horizon_world::nbt::read_network(&bytes,horizon_world::nbt::Limits::default()).unwrap() else{panic!("compound config")};
+            machine.config=config;
+            let loaded=read_session(&machine,super::super::super::Dim::Overworld).unwrap();
+            assert_eq!(loaded.specs.len(),1);assert_eq!(loaded.job_id,Some([7,11]));assert_eq!(loaded.cpu.pending().len(),4097);assert_eq!(loaded.cpu.escrow(),&stock);
+            assert_eq!(read_escrow(&machine).unwrap().len(),4097);
         }
         #[test]
         fn provider_owner_keeps_legacy_block_and_separate_part_faces() {
@@ -4263,6 +4501,7 @@ mod recursive {
                 provider: ProviderOwner::Block(legacy),
                 slot: 0,
                 definition: None,
+                crafting_recipe: None,
                 grid: vec![],
                 choices: vec![],
                 fluid_slots: BTreeMap::new(),
@@ -4283,10 +4522,12 @@ mod recursive {
                 address_version: 0,
                 requester: None,
                 export_requester: None,
+                player_owner: None,
             };
             let mut machine = Machine::new(MachineKind::CraftingStorage1k);
             let mut value = serde_json::to_value(&session).unwrap();
             value.as_object_mut().unwrap().remove("address_version");
+            value["specs"]["pattern"].as_object_mut().unwrap().remove("crafting_recipe");
             let json = serde_json::to_string(&value).unwrap();
             machine
                 .config

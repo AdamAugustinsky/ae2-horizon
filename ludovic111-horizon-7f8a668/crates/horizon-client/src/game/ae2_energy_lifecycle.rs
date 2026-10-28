@@ -34,17 +34,22 @@ impl EnergyLifecycle {
     /// Caller stages this object with topology and provider observers, then
     /// commits all only after replay succeeds. The registration callback runs
     /// before restoring saved energy, matching EnergyService.addNode order.
-    pub fn membership(&mut self,change:MembershipChange,mut on_add:impl FnMut(&mut EnergyService,NodeIdentity)->Result<(),&'static str>)->Result<MembershipEffect,&'static str>{
+    pub fn membership(&mut self,change:MembershipChange,on_add:impl FnMut(&mut EnergyService,NodeIdentity)->Result<(),&'static str>)->Result<MembershipEffect,&'static str>{
+        self.membership_with_capacity(change,25.0,on_add)
+    }
+    pub fn membership_with_capacity(&mut self,change:MembershipChange,per_node_capacity:f64,mut on_add:impl FnMut(&mut EnergyService,NodeIdentity)->Result<(),&'static str>)->Result<MembershipEffect,&'static str>{
         let mut trial=self.clone();let node=trial.nodes.get(&change.node).ok_or("membership for unknown energy owner")?;
         if node.service!=change.from{return Err("energy service ownership mismatch")}
         let mut store=node.initial_store.clone();let mut share=node.saved_share;
         if let Some(from)=change.from {
             let service=trial.services.get_mut(&from).ok_or("missing old energy service")?;
             store=service.stores.get(&change.node).cloned();share=service.remove_node(change.node)?;
+            service.reconfigure_node_capacity(per_node_capacity)?;
         }
         let mut result=MembershipEffect{transferred:0.0,discarded:0.0,rejected:0.0};
         if let Some(to)=change.to {
             let service=trial.services.entry(to).or_default();service.add_node(change.node,store.clone())?;
+            service.reconfigure_node_capacity(per_node_capacity)?;
             on_add(service,change.node)?;
             let accepted=service.restore_node_share(change.node,share)?;result.transferred=accepted;result.rejected=share-accepted;
         } else {result.discarded=share;}
@@ -101,6 +106,21 @@ mod tests {
         let mut x=EnergyLifecycle::default();x.register(n(1),EnergyNode::new(None,9.0).unwrap()).unwrap();
         x.membership(MembershipChange{node:n(1),from:None,to:Some(3)},|service,_|{assert_eq!(service.local(),0.0);Ok(())}).unwrap();
         assert_eq!(x.saved_share(n(1)).unwrap(),9.0);
+    }
+    #[test]
+    fn configured_grid_capacity_is_applied_on_each_membership_change(){
+        let mut x=EnergyLifecycle::default();
+        x.register(n(1),EnergyNode::new(None,0.0).unwrap()).unwrap();
+        x.membership_with_capacity(MembershipChange{node:n(1),from:None,to:Some(3)},100.0,|_,_|Ok(())).unwrap();
+        assert_eq!(x.services[&3].local_capacity(),100.0);
+        assert_eq!(x.services.get_mut(&3).unwrap().inject(80.0,false).unwrap(),0.0);
+        x.register(n(2),EnergyNode::new(None,0.0).unwrap()).unwrap();
+        x.membership_with_capacity(MembershipChange{node:n(2),from:None,to:Some(3)},60.0,|_,_|Ok(())).unwrap();
+        assert_eq!(x.services[&3].local_capacity(),120.0);
+        assert_eq!(x.services[&3].local(),80.0);
+        x.membership_with_capacity(MembershipChange{node:n(1),from:Some(3),to:None},10.0,|_,_|Ok(())).unwrap();
+        assert_eq!(x.services[&3].local_capacity(),10.0);
+        assert_eq!(x.services[&3].local(),10.0);
     }
     #[test]
     fn failed_callback_rolls_back_membership_and_buffer(){

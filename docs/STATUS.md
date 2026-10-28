@@ -11,32 +11,32 @@ This is an experimental, unofficial native integration. The target is AE2 19.2.1
 
 Horizon and AE2 target different Minecraft versions here. The port maps selected AE2 behavior into Horizon; it does not load the upstream Java mod.
 
-## What has been exercised
+## Current checkpoint and evidence
 
-The current implementation includes paths for ME storage and fluids, power and channels, physical machines and upgrades, terminal and wireless interfaces, pattern encoding and crafting, links, spatial storage and the Guide. Individual paths have different levels of completeness.
+The latest completed host checkpoint and its binary/source hashes are recorded in [VALIDATION.md](VALIDATION.md). Tests are evidence for their named scenarios, not a percentage of AE2 completed. The three requirement ledgers separate implementation, physical/source checks, and open work:
 
-The Stage 83 source checkpoint recorded 241 changed files in the Horizon tree and 26 files across five AE2 core crates. One historical `.orig` backup was intentionally omitted from the public export; the manifest records the 25 retained checkpoint files and that omission. A coordinated host gate reported **80 library tests and 245 client tests passing**, with **three library tests ignored** for resource prerequisites. These totals are a point-in-time test result, not a measure of overall feature coverage. The checkpoint source hashes and references are recorded in [SOURCE_MANIFEST.json](../SOURCE_MANIFEST.json).
+- [Storage, crafting and network](parity-storage-crafting.md)
+- [Machines, links and progression](parity-machines-links.md)
+- [Menus, Guide and items](parity-ui-items.md)
 
-A separate check of the exported source passed 128 standalone core tests (12, 38, 10, 7 and 61 across the five crates), and locked offline Cargo metadata resolution passed. This export check is separate from the earlier coordinated client/host gate and native-world runs.
+The implementation now has source-format readers/writers for all 35 persistent AE2 component identifiers and a command/transport bridge. Specific native-world checks cover source-only cells and patterns, recoverable missing items, recipe identity, physical upgrades and Memory Cards, wireless ownership, spatial plot reuse, quantum chamber/hopper callbacks, large crafting previews and restart. Component registration or round-trip transport alone does not establish the consumer's full behavior.
 
-Bounded world checks include:
+Selected local in-frame menus now work: Provider block/part, ME/Crafting/Encoding terminals, amount/confirmation and CPU status. The normal server-thread runtime has broader menu coverage. Physical crafting, refill, drag, source pattern encoding, search operators, owner-only notifications and cursor custody have named hidden regressions.
 
-- A finite-powered network with Drive cells, import/export, an external Storage Bus, a crafting CPU, a Pattern Provider and an assembler. It produced an additional 128 sticks from 16 logs through a real two-recipe chain; the resulting stock, player tools and an export barrel survived restart.
-- Physical wireless terminal and Network Tool ownership and gesture checks, plus crafting terminal and encoded-pattern workflows.
-- Selected ordinary-container Storage Bus access and sided slot limits, including brewing and furnace cases, and a separate multiple-bus scenario.
-- Selected quantum, spatial, machine, emitter, memory-card, Guide and item-action scenarios.
+A private copy of the existing 31-node native hall retained seven emeralds, sixteen iron, 256 sticks and power through another restart. Its source save was command-seeded for integration tests; this is not a survival playthrough or Java save import. The README's original hall images belong to the prior checkpoint unless a caption explicitly states otherwise.
 
-The hall and terminal screenshots in the README come from a command-seeded copy of the integrated test world. The seed placed machines and supplied items for a focused integration check; it is not a survival playthrough or proof that every placement and progression path works.
+The initial public Stage 83 export is retained in Git history: its coordinated gate reported 80 library and 245 client tests passing, with three library tests ignored. Later gates and source changes supersede those counts; the earlier totals are not current working-tree validation.
 
 ## Known boundaries
 
-- **Full AE2 parity is unfinished.** Many blocks, item interactions, menus, recipes, upgrades, edge cases and combinations still need implementation or verification.
-- **No Java mod loader or modpack support is implied.** This is not a `.jar` or `.hmod`; ATM10 and other Java modpacks are unsupported.
-- **Java-world migration has not been established.** Horizon targets a different Minecraft version and runtime. Do not assume an existing Java save can be opened safely.
-- **The alternate in-frame path has a known UI gap.** A Pattern Provider can fail to open its menu because its local session/routing path is incomplete. The default server-thread path has broader testing.
-- **Platform and multiplayer coverage are bounded.** The checkpoint's native-world testing was conducted on macOS with isolated profiles and selected local/peer scenarios. It does not certify every platform, dedicated server setup or multiplayer interaction.
+- **Full parity is unfinished.** Concrete remaining requirements and verification gaps are in the ledgers. Current work includes remaining processing transfer/queue details, source pattern compatibility, block-entity pickup and menu gesture/session gaps. A newly implemented path still needs its coordinated gate.
+- **No Java mod loader or modpack support is implied.** This native integration is not an upstream `.jar` or `.hmod`; ATM10 and other Java modpacks are unsupported.
+- **Java-world migration has not been established.** Horizon and the pinned AE2 reference target different Minecraft versions. Do not open an existing Java save as an experiment without a separate preserved copy.
+- **Extension and platform coverage is bounded.** Arbitrary NeoForge custom ingredients, third-party key/container capabilities, unsupported addon integrations, every multiplayer timing and every operating system are not certified by these macOS tests.
+- **The alternate local runtime remains partial.** Several nonterminal machine/part menus, hotkeys, client settings presentation and source UI details still need implementation or comparison. The default integrated-server path remains the tested play path.
+- **Planner safeguards and callback coverage remain explicit.** Native allocation limits and unusual lifecycle sequences remain explicit. The former recursive depth and fixed node/step guards were replaced and validated in the Wave 11 checkpoint. Source stubs do not replace a live Java reference world.
 
-Use a fresh world for experiments and preserve any existing saves. A passing targeted test demonstrates the named scenario only.
+All automated native clients use isolated saves, invisible/unfocused windows, virtual input and a shared rendering lease at 30 FPS. They do not occupy or capture the real desktop. Runtime binaries, logs, test worlds and generated resources remain local and ignored.
 
 ## Source and content
 

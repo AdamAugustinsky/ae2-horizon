@@ -36,12 +36,8 @@ fn inscriber_auto_export_work(m:&Machine)->bool {
 
 /// Private machine buffers are separate from network storage. Source AE2
 /// AEBasePoweredBlockEntity and the individual machine constructors.
-pub(super) fn ae2_private_power_capacity(kind: MachineKind) -> Option<f64> {
-    match kind {
-        MachineKind::Inscriber | MachineKind::Charger | MachineKind::GrowthAccelerator => Some(1600.0),
-        MachineKind::Chest => Some(500.0),
-        _ => None,
-    }
+pub(super) fn ae2_private_power_capacity(machine: &Machine) -> Option<f64> {
+    machine.private_power_capacity()
 }
 
 pub(super) fn ae2_private_power_face(
@@ -223,16 +219,62 @@ pub(super) fn json_ingredient(items: &Items, value: Option<&serde_json::Value>, 
 }
 /// Source dynamic name-press recipe: preserve the middle item's components,
 /// replace its custom name, and retain the physical presses.
+fn append_component(root: &mut Tag, sibling: Tag) {
+    if let Tag::Compound(map) = root {
+        let extra = map.entry("extra".into()).or_insert_with(|| Tag::List(Vec::new()));
+        if let Tag::List(parts) = extra {
+            parts.push(sibling);
+        }
+    }
+}
+
+fn component_root(component: &Tag) -> Tag {
+    match component {
+        Tag::Compound(_) => component.clone(),
+        // ComponentSerialization decodes a list as its first component with
+        // the remaining components appended as siblings. In particular, the
+        // first component's style is inherited by those siblings.
+        Tag::List(parts) => {
+            let Some((first, siblings)) = parts.split_first() else {
+                return Tag::compound([("text", Tag::String("".into()))]);
+            };
+            let mut root = component_root(first);
+            for sibling in siblings {
+                append_component(&mut root, sibling.clone());
+            }
+            root
+        }
+        literal => Tag::compound([("text", literal.clone())]),
+    }
+}
+
+fn append_press_name(first: &Tag, second: &Tag) -> Tag {
+    let mut root = component_root(first);
+    append_component(&mut root, Tag::String(" ".into()));
+    append_component(&mut root, second.clone());
+    root
+}
 fn name_press_recipe(machine:&Machine)->Option<ItemStack> {
     let [top,bottom,middle,_]=machine.slots.as_slice() else{return None};
     let is_press=|s:&Option<ItemStack>|s.as_ref().is_some_and(|v|v.item.as_ref()=="ae2:name_press");
     if !(is_press(top) && (bottom.is_none() || is_press(bottom)) || top.is_none() && is_press(bottom)){return None;}
     let mut output=middle.as_ref()?.clone();output.count=1;
-    let names:Vec<String>=[top,bottom].into_iter().filter_map(|slot|slot.as_ref())
-        .filter_map(|press|press.data().and_then(|d|d.other("minecraft:custom_data")))
-        .filter_map(|tag|tag.get("ae2:name_press_name"))
-        .filter_map(|tag|match tag {Tag::String(s)=>s.to_string().ok(),_=>None}).collect();
-    output.data_mut().custom_name=if names.is_empty(){None}else{Some(names.join(" "))};output.tidy();Some(output)
+    let names:Vec<Tag>=[top,bottom].into_iter().filter_map(|slot|slot.as_ref())
+        .filter_map(|press|press.data())
+        // Older native saves used a custom-data wrapper; keep them readable.
+        .filter_map(|data|data.other("ae2:name_press_name").or_else(||data.other("minecraft:custom_data").and_then(|tag|tag.get("ae2:name_press_name"))))
+        .filter(|tag|matches!(tag,Tag::String(_) | Tag::Compound(_) | Tag::List(_))).cloned().collect();
+    let name=match names.as_slice() {[]=>None,[only]=>Some(only.clone()),[first,second]=>Some(append_press_name(first,second)),_=>unreachable!()};
+    output.set_custom_name_component(name);Some(output)
+}
+/// InscriberRecipe.CODEC uses ItemStack.CODEC, including its component patch.
+fn inscriber_result(value: &serde_json::Value) -> Option<ItemStack> {
+    value.get("id")?.as_str()?;
+    let count = match value.get("count") { Some(count) => count.as_u64()?, None => 1 };
+    if count == 0 || count > u32::MAX as u64 || value.get("components").is_some_and(|v| !v.is_object()) {
+        return None;
+    }
+    Some(horizon_client::crafting::Template::parse(value)?.create())
 }
 fn live_inscriber_recipe(machine:&Machine, items:&Items, recipes:&horizon_client::crafting::Recipes) -> Option<(ItemStack,bool)> {
     if let Some(output)=name_press_recipe(machine){return Some((output,false));}
@@ -243,13 +285,7 @@ fn live_inscriber_recipe(machine:&Machine, items:&Items, recipes:&horizon_client
         let t=ingredients.get("top");let b=ingredients.get("bottom");
         if !(json_ingredient(items,t,top.as_ref()) && json_ingredient(items,b,bottom.as_ref()) || json_ingredient(items,t,bottom.as_ref()) && json_ingredient(items,b,top.as_ref())) { return None; }
         let mode=match v.get("mode")?.as_str()? { "press"=>true,"inscribe"=>false,_=>return None };
-        let result=v.get("result")?;
-        if result.get("components").is_some() { return None; }
-        let id=result.get("id")?.as_str()?;
-        let count=result.get("count").and_then(|x|x.as_u64()).unwrap_or(1);
-        if count==0 || count>u32::MAX as u64 { return None; }
-        let mut output=simple_stack(id);output.count=count as u32;
-        Some((output,mode))
+        Some((inscriber_result(v.get("result")?)?,mode))
     })
 }
 pub(super) fn live_charger_recipe(stack:&ItemStack,items:&Items,recipes:&horizon_client::crafting::Recipes)->Option<ItemStack> {
@@ -613,10 +649,11 @@ impl Game<'_> {
                         _ => 50,
                     };
                     let cost = f64::from(speed) * 10.0;
+                    let usage = horizon_client::ae2_common_config::gameplay().usage_multiplier;
                     let power = if smash != 0 || !valid {
                         false
-                    } else if m.energy > cost - 0.01 {
-                        m.energy = (m.energy - cost).max(0.0);
+                    } else if m.private_energy_extract(cost * usage, false) / usage > cost - 0.01 {
+                        m.private_energy_extract(cost * usage, true);
                         true
                     } else {
                         self.ae2_online(pos)
@@ -642,7 +679,7 @@ impl Game<'_> {
                                     "64k" => Some(2.0), "256k" => Some(2.5), _ => None,
                                 })
                             };
-                            if let Some(idle) = cell_idle { m.energy = (m.energy - 1.0 - idle).max(0.0); }
+                            if let Some(idle) = cell_idle { m.private_energy_extract((1.0 + idle) * horizon_client::ae2_common_config::gameplay().usage_multiplier, true); }
                         }
                     }
                     m.energy != old
@@ -675,8 +712,10 @@ impl Game<'_> {
                             if let (Ok((current, max)), Ok(rate)) = (energy, rate) {
                                 let wanted = (rate * elapsed as f64 * horizon_client::ae2_common_config::processing().charger_rate).min((max - current).max(0.0));
                                 if wanted > 0.0 {
-                                    let local = m.energy.min(wanted).max(0.0);
-                                    let grid = self.ae2_take_power(pos, wanted - local, false);
+                                    let usage = horizon_client::ae2_common_config::gameplay().usage_multiplier;
+                                    let mut local_buffer = ae2_machines_core::stored_energy::StoredEnergy::new(m.energy, 1600.0);
+                                    let local = local_buffer.extract(wanted * usage, false) / usage;
+                                    let grid = self.ae2_take_power_raw(pos, wanted - local, false);
                                     let offered = local + grid;
                                     let charge = if wireless {
                                         super::ae2_wireless::transfer_energy(
@@ -693,7 +732,8 @@ impl Game<'_> {
                                         Ok(accepted) if accepted >= 0.0 && accepted <= offered => {
                                             if accepted>0.0 {working=true;}
                                             let used_local = accepted.min(local);
-                                            m.energy -= used_local;
+                                            local_buffer.extract(used_local * usage, true);
+                                            m.energy = local_buffer.stored();
                                             let unused_grid =
                                                 (grid - (accepted - used_local)).max(0.0);
                                             if unused_grid > 0.0 {
@@ -711,14 +751,19 @@ impl Game<'_> {
                                 if let Some(out)=live_charger_recipe(stack,self.res.items(),self.res.recipes())
                                     && self.res.items().get(&out.item).is_some() {
                                     working=true;
-                                    if self.world.random.next_float() > 0.8 { *stack=out; m.energy=0.0; }
+                                    if self.world.random.next_float() > 0.8 {
+                                        *stack=out;
+                                        let mut local_buffer = ae2_machines_core::stored_energy::StoredEnergy::new(m.energy, 1600.0);
+                                        local_buffer.extract(1600.0*horizon_client::ae2_common_config::gameplay().usage_multiplier, true);
+                                        m.energy = local_buffer.stored();
+                                    }
                                 }
                             }
                         }
                         m.config.insert("charger_working".into(),Tag::Byte(i8::from(working)));
                         if m.energy < 1599.0 && self.ae2_online(pos) {
-                            m.energy +=
-                                self.ae2_take_power(pos, (1600.0 - m.energy).min(800.0), false);
+                            let received = self.ae2_take_power_raw(pos, (1600.0 - m.energy).min(800.0), false);
+                            m.private_energy_insert(received, true);
                         }
                     }
                     m != old
@@ -839,15 +884,90 @@ mod tests {
     }
     use super::*;
     #[test]
+    fn inscriber_output_keeps_recipe_components_in_the_physical_slot() {
+        let result = serde_json::json!({"id":"minecraft:diamond", "count":2,
+            "components":{"minecraft:custom_data":{"marker":7}}});
+        let output = inscriber_result(&result).unwrap();
+        assert_eq!(output.count, 2);
+        assert_eq!(output.data().unwrap().other("minecraft:custom_data").unwrap().get("marker"), Some(&Tag::Int(7)));
+        assert!(!output.same_item_same_components(&simple_stack("minecraft:diamond")));
+        let mut machine = Machine::new(MachineKind::Inscriber);
+        machine.slots[2] = Some(simple_stack("minecraft:gold_ingot"));
+        finish_inscriber(&mut machine, false, output);
+        assert!(machine.slots[2].is_none());
+        let stored = machine.slots[3].as_ref().unwrap();
+        assert_eq!(stored.count, 2);
+        assert_eq!(stored.data().unwrap().other("minecraft:custom_data").unwrap().get("marker"), Some(&Tag::Int(7)));
+        assert!(inscriber_result(&serde_json::json!({"id":"minecraft:diamond","count":-1})).is_none());
+    }
+    #[test]
     fn name_press_combines_names_preserves_input_and_retains_plates() {
-        let press=|name:&str| {let mut s=simple_stack("ae2:name_press");s.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2:name_press_name",Tag::String(name.into()))])));s};
+        let press=|name:&str| {let mut s=simple_stack("ae2:name_press");s.data_mut().set_other("ae2:name_press_name",Some(Tag::String(name.into())));s};
         let mut m=Machine::new(MachineKind::Inscriber);
         m.slots[0]=Some(press("Alpha"));m.slots[1]=Some(press("Beta"));
         let mut input=simple_stack("minecraft:diamond");input.count=2;input.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("marker",Tag::Int(7))])));m.slots[2]=Some(input);
         let output=name_press_recipe(&m).unwrap();assert_eq!(output.count,1);assert_eq!(output.custom_name(),Some("Alpha Beta"));
         assert_eq!(output.data().unwrap().other("minecraft:custom_data").unwrap().get("marker"),Some(&Tag::Int(7)));
+        m.slots[1].as_mut().unwrap().data_mut().set_other("ae2:name_press_name",None);
+        m.slots[1].as_mut().unwrap().data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2:name_press_name",Tag::String("Legacy".into()))])));
+        assert_eq!(name_press_recipe(&m).unwrap().custom_name(),Some("Alpha Legacy"));
         finish_inscriber(&mut m,false,output);assert!(m.slots[0].is_some()&&m.slots[1].is_some());assert_eq!(m.slots[2].as_ref().unwrap().count,1);
         m.slots[1]=Some(simple_stack("ae2:logic_processor_press"));assert!(name_press_recipe(&m).is_none());
+    }
+    #[test]
+    fn name_press_preserves_structured_component_trees_in_physical_output() {
+        let first=Tag::compound([("text",Tag::String("Red".into())),("color",Tag::String("red".into()))]);
+        let second=Tag::compound([("translate",Tag::String("item.minecraft.diamond".into())),("bold",Tag::Byte(1))]);
+        let mut top=simple_stack("ae2:name_press");top.data_mut().set_other("ae2:name_press_name",Some(first.clone()));
+        let mut bottom=simple_stack("ae2:name_press");bottom.data_mut().set_other("ae2:name_press_name",Some(second.clone()));
+        let mut machine=Machine::new(MachineKind::Inscriber);
+        machine.slots[0]=Some(top);machine.slots[1]=Some(bottom);machine.slots[2]=Some(simple_stack("minecraft:diamond"));
+        let output=name_press_recipe(&machine).unwrap();
+        let expected=append_press_name(&first,&second);
+        assert_eq!(horizon_client::item_data::encode_components(&output).unwrap().get("minecraft:custom_name"),Some(&expected));
+        let saved=horizon_client::save::item_to_nbt(&output);
+        let restored=horizon_client::save::item_from_nbt(&saved).unwrap();
+        assert_eq!(horizon_client::item_data::encode_components(&restored).unwrap().get("minecraft:custom_name"),Some(&expected));
+        assert!(output.same_item_same_components(&restored));
+        machine.slots[1]=None;
+        let single=name_press_recipe(&machine).unwrap();
+        assert_eq!(horizon_client::item_data::encode_components(&single).unwrap().get("minecraft:custom_name"),Some(&first));
+    }
+    #[test]
+    fn name_press_list_inherits_first_component_style_through_nbt() {
+        let second = Tag::compound([("text", Tag::String("End".into())), ("color", Tag::String("blue".into()))]);
+        let first = Tag::List(vec![
+            Tag::compound([
+                ("text", Tag::String("Red".into())),
+                ("color", Tag::String("red".into())),
+                ("extra", Tag::List(vec![Tag::String("!".into())])),
+            ]),
+            Tag::String("tail".into()),
+        ]);
+        let mut machine = Machine::new(MachineKind::Inscriber);
+        let mut top = simple_stack("ae2:name_press");
+        top.data_mut().set_other("ae2:name_press_name", Some(first));
+        let mut bottom = simple_stack("ae2:name_press");
+        bottom.data_mut().set_other("ae2:name_press_name", Some(second.clone()));
+        machine.slots[0] = Some(top);
+        machine.slots[1] = Some(bottom);
+        machine.slots[2] = Some(simple_stack("minecraft:diamond"));
+        let output = name_press_recipe(&machine).unwrap();
+        let encoded = horizon_client::save::item_to_nbt(&output);
+        let bytes = horizon_world::nbt::write_network(&encoded, Default::default()).unwrap();
+        let (decoded, _) = horizon_world::nbt::read_network(&bytes, Default::default()).unwrap();
+        let restored = horizon_client::save::item_from_nbt(&decoded).unwrap();
+        let name = restored.custom_name_component().unwrap();
+        assert_eq!(name.get("color"), Some(&Tag::String("red".into())));
+        assert_eq!(name.get("extra"), Some(&Tag::List(vec![
+            Tag::String("!".into()), Tag::String("tail".into()), Tag::String(" ".into()), second,
+        ])));
+        let rendered = horizon_client::entity_nbt::name_text(name);
+        assert_eq!(rendered.plain(), "Red!tail End");
+        let colors: Vec<_> = rendered.chars().map(|(_, style)| style.color).collect();
+        assert!(colors[0].is_some());
+        assert!(colors[..9].iter().all(|color| *color == colors[0]), "the first root's red style must carry through the separator");
+        assert_ne!(colors[9], colors[0], "the second component's explicit blue style wins");
     }
     #[test]
     fn ae2_private_power_capacities_and_oriented_faces() {
@@ -856,9 +976,11 @@ mod tests {
             name: "ae2:inscriber".to_owned(),
             properties: [("facing".to_owned(), "north".to_owned())].into_iter().collect(),
         };
-        assert_eq!(ae2_private_power_capacity(MachineKind::Inscriber), Some(1600.0));
-        assert_eq!(ae2_private_power_capacity(MachineKind::Chest), Some(500.0));
-        assert_eq!(ae2_private_power_capacity(MachineKind::EnergyAcceptor), None);
+        assert_eq!(ae2_private_power_capacity(&Machine::new(MachineKind::Inscriber)), Some(1600.0));
+        let mut chest=Machine::new(MachineKind::Chest);
+        chest.chest_power_capacity=Some(1234.0);
+        assert_eq!(ae2_private_power_capacity(&chest), Some(1234.0));
+        assert_eq!(ae2_private_power_capacity(&Machine::new(MachineKind::EnergyAcceptor)), None);
         assert!(!ae2_private_power_face(MachineKind::Inscriber, &state, North));
         assert!(ae2_private_power_face(MachineKind::Inscriber, &state, South));
         assert!(ae2_private_power_face(MachineKind::GrowthAccelerator, &state, North));
@@ -946,6 +1068,28 @@ pub(super) fn ae2_encode_pattern_options(
     );
     Ok(p)
 }
+/// Persist the actual selected recipe using the source pattern component.
+pub(super) fn ae2_encode_pattern_source(
+    grid: &[Option<ItemStack>], output: &ItemStack, recipe: &str,
+    substitutes: bool, fluid_substitutes: bool,
+) -> Result<ItemStack, String> {
+    let source = super::ae2_source_patterns::encode_crafting(grid, output, recipe, substitutes, fluid_substitutes)?;
+    let mut pattern = ae2_encode_pattern_options(grid, output, substitutes, fluid_substitutes)?;
+    pattern.data_mut().set_other("ae2:encoded_crafting_pattern", Some(source));
+    Ok(pattern)
+}
+
+/// Source data is authoritative when present; malformed source data never
+/// revives stale legacy options.
+pub(super) fn ae2_crafting_pattern_options(pattern: &ItemStack) -> Option<(bool, bool)> {
+    if let Some(source) = super::ae2_source_patterns::crafting(pattern) {
+        let source = source.ok()?;
+        return Some((source.substitutes, source.fluid_substitutes));
+    }
+    let data = pattern.data()?.other("minecraft:custom_data")?.get("ae2_lab_pattern")?;
+    Some((matches!(data.get("substitutes"), Some(Tag::Byte(1))),
+          matches!(data.get("fluid_substitutes"), Some(Tag::Byte(1)))))
+}
 /// Upstream special patterns use the middle row of the Molecular Assembler,
 /// while the encoding UI stores its compact logical input slots first.
 pub(super) fn special_assembler_grid(kind:&str,logical:&[Option<ItemStack>])->Option<Vec<Option<ItemStack>>> {
@@ -979,11 +1123,20 @@ pub(super) fn ae2_encode_special_pattern(kind:&str,recipe:&str,grid:&[Option<Ite
     let Some(Tag::Compound(mut custom))=p.data().and_then(|d|d.other("minecraft:custom_data")).cloned() else{return Err("missing pattern data".into())};
     let Some(Tag::Compound(data))=custom.get_mut(&"ae2_lab_pattern".into()) else{return Err("missing pattern data".into())};
     data.insert("special_kind".into(),Tag::String(kind.into()));data.insert("recipe".into(),Tag::String(recipe.into()));
-    p.data_mut().set_other("minecraft:custom_data",Some(Tag::Compound(custom)));Ok(p)
+    p.data_mut().set_other("minecraft:custom_data",Some(Tag::Compound(custom)));
+    let source=super::ae2_source_patterns::encode_special(kind,grid,output,recipe,substitutes)?;
+    let component=if kind=="smithing" {"ae2:encoded_smithing_table_pattern"} else {"ae2:encoded_stonecutting_pattern"};
+    p.data_mut().set_other(component,Some(source));
+    Ok(p)
 }
 pub(super) fn ae2_decode_special_pattern(p:&ItemStack)->Option<SpecialPattern> {
     let kind=match p.item.as_ref() {"ae2:smithing_table_pattern"=>"smithing","ae2:stonecutting_pattern"=>"stonecutting",_=>return None};
-    if p.count!=1{return None;}let data=p.data()?.other("minecraft:custom_data")?.get("ae2_lab_pattern")?;
+    if p.count!=1{return None;}
+    if let Some(source)=super::ae2_source_patterns::special(p) {
+        let source=source.ok()?;
+        return Some(SpecialPattern{kind:kind.into(),recipe:source.recipe,grid:source.grid,output:source.output,substitutes:source.substitutes});
+    }
+    let data=p.data()?.other("minecraft:custom_data")?.get("ae2_lab_pattern")?;
     let Tag::String(saved_kind)=data.get("special_kind")? else{return None};if saved_kind.to_string().ok()?.as_str()!=kind{return None;}
     let Tag::String(recipe)=data.get("recipe")? else{return None};let recipe=recipe.to_string().ok()?;if recipe.is_empty(){return None;}
     let grid=strict_pattern_slots(data.get("grid")?,9)?;let output=horizon_client::save::item_from_nbt(data.get("output")?)?;
@@ -995,6 +1148,10 @@ pub(super) fn decode_pattern(p: &ItemStack) -> Option<(Vec<Option<ItemStack>>, I
     if p.item.as_ref() != "ae2:crafting_pattern" || p.count != 1 {
         return None;
     }
+    if let Some(source) = super::ae2_source_patterns::crafting(p) {
+        let source = source.ok()?;
+        return Some((source.grid, source.output));
+    }
     let data = p
         .data()?
         .other("minecraft:custom_data")?
@@ -1005,6 +1162,29 @@ pub(super) fn decode_pattern(p: &ItemStack) -> Option<(Vec<Option<ItemStack>>, I
     }
     let output = horizon_client::save::item_from_nbt(data.get("output")?)?;
     Some((grid, output))
+}
+/// Build the assembler's persistent recipe snapshot from either source or
+/// legacy pattern data. The pattern itself remains physically owned by the
+/// provider or assembler; this record only captures the recipe being run.
+pub(super) fn assembler_pattern_data(pattern: &ItemStack) -> Option<Tag> {
+    let (grid, output, special, recipe) = if let Some(special) = ae2_decode_special_pattern(pattern) {
+        let grid = special_assembler_grid(&special.kind, &special.grid)?;
+        (grid, special.output, Some((special.kind, special.recipe)), None)
+    } else {
+        let (grid, output) = decode_pattern(pattern)?;
+        let recipe = super::ae2_source_patterns::crafting(pattern).and_then(Result::ok).map(|source| source.recipe);
+        (grid, output, None, recipe)
+    };
+    let mut data = match Tag::compound([
+        ("grid", horizon_client::save::encode_items(&grid)),
+        ("output", horizon_client::save::item_to_nbt(&output)),
+    ]) { Tag::Compound(values) => values, _ => unreachable!() };
+    if let Some((kind, recipe)) = special {
+        data.insert("special_kind".into(), Tag::String(kind.as_str().into()));
+        data.insert("recipe".into(), Tag::String(recipe.as_str().into()));
+    }
+    if let Some(recipe) = recipe { data.insert("crafting_recipe".into(), Tag::String(recipe.as_str().into())); }
+    Some(Tag::Compound(data))
 }
 fn adjacent(a: (i32, i32, i32), b: (i32, i32, i32)) -> bool {
     (i64::from(a.0) - i64::from(b.0)).abs()
@@ -1050,12 +1230,12 @@ impl Game<'_> {
             .and_then(Option::as_ref)
             .ok_or("empty pattern slot")?;
         let (grid, expected) = decode_pattern(pattern).ok_or("invalid laboratory pattern")?;
-        let (_, result) = self
-            .res
-            .recipes()
-            .find(&grid, 3)
-            .ok_or("recipe unavailable")?;
-        if result != expected {
+        let source_recipe = super::ae2_source_patterns::crafting(pattern).and_then(Result::ok).map(|source| source.recipe);
+        let result = match source_recipe.as_deref() {
+            Some(recipe) => self.res.recipes().assemble_named(recipe, &grid, 3),
+            None => self.res.recipes().find(&grid, 3).map(|(_, result)| result),
+        }.ok_or("recipe unavailable")?;
+        if source_recipe.is_none() && result != expected {
             return Err("pattern result does not match recipe".into());
         }
         let Some(BlockEntity::Ae2(a)) = self.world.block_entities.get(&assembler) else {
@@ -1089,12 +1269,7 @@ impl Game<'_> {
                 consume(slot);
             }
         }
-        let pattern_data = pattern
-            .data()
-            .and_then(|d| d.other("minecraft:custom_data"))
-            .and_then(|t| t.get("ae2_lab_pattern"))
-            .cloned()
-            .ok_or("invalid pattern")?;
+        let pattern_data = assembler_pattern_data(pattern).ok_or("invalid pattern")?;
         if let Some(BlockEntity::Chest(chest)) = self.world.block_entities.get_mut(&source) {
             *chest = source_next;
         } else {
@@ -1135,17 +1310,7 @@ impl Game<'_> {
             .config
             .get(&"ae2_assembler_pattern".into())
             .cloned()
-            .or_else(|| {
-                m.slots[10].as_ref().and_then(|p| {
-                    let mut data=p.data()?.other("minecraft:custom_data")?.get("ae2_lab_pattern")?.clone();
-                    if let Some(special)=ae2_decode_special_pattern(p) {
-                        let grid=special_assembler_grid(&special.kind,&special.grid)?;
-                        let Tag::Compound(values)=&mut data else{return None};
-                        values.insert("grid".into(),horizon_client::save::encode_items(&grid));
-                    }
-                    Some(data)
-                })
-            });
+            .or_else(|| m.slots[10].as_ref().and_then(assembler_pattern_data));
         let Some(data) = pattern_data else {
             return false;
         };
@@ -1166,10 +1331,17 @@ impl Game<'_> {
         };
         let (recipe,result)=if let Some((kind,id))=&special {
             let logical=special_logical_grid(kind,&recipe_grid).unwrap_or_else(||recipe_grid.clone());let Some(result)=special_recipe_result(self.res.stations(),kind,id,&logical) else{return false};(None,result)
+        } else if let Some(Tag::String(recipe))=data.get("crafting_recipe") {
+            let Ok(recipe)=recipe.to_string() else{return false;};
+            let Some(result)=self.res.recipes().assemble_named(&recipe,&recipe_grid,3) else{return false;};
+            (Some(recipe.strip_prefix("minecraft:").unwrap_or(&recipe).to_owned()),result)
         } else {
             let Some((id,result))=self.res.recipes().find(&recipe_grid,3) else{return false};(Some(id.to_owned()),result)
         };
-        if result != expected || self.res.items().get(&result.item).is_none() {return false;}
+        // Source patterns deliberately use the live named recipe result;
+        // the stored result is display/recovery data and may be stale.
+        let source_recipe=data.get("crafting_recipe").is_some() || special.is_some();
+        if (!source_recipe && result != expected) || self.res.items().get(&result.item).is_none() {return false;}
         if !self.ae2_online(pos) {
             return false;
         }
@@ -1228,6 +1400,28 @@ mod pattern_tests {
         assert!(!same_grid(&grid, &decoded));
     }
     #[test]
+    fn source_crafting_and_special_patterns_work_without_legacy_data() {
+        let mut grid=vec![None;9]; grid[0]=Some(simple_stack("minecraft:oak_planks"));
+        let output=ItemStack::new("minecraft:oak_button",1);
+        let mut pattern=ae2_encode_pattern_source(&grid,&output,"oak_button",true,true).unwrap();
+        let source=super::super::ae2_source_patterns::crafting(&pattern).unwrap().unwrap();
+        assert_eq!(source.recipe,"minecraft:oak_button");
+        let mut bad=pattern.clone();
+        bad.data_mut().set_other("ae2:encoded_crafting_pattern",Some(Tag::compound([("recipeId",Tag::String("minecraft:bad".into()))])));
+        assert!(decode_pattern(&bad).is_none(),"malformed source must not revive stale legacy data");
+        pattern.data_mut().set_other("minecraft:custom_data",None);
+        assert_eq!(decode_pattern(&pattern),Some((grid.clone(),output.clone())));
+        assert_eq!(ae2_crafting_pattern_options(&pattern),Some((true,true)));
+        let snapshot=assembler_pattern_data(&pattern).unwrap();
+        assert_eq!(snapshot.get("crafting_recipe"),Some(&Tag::String("minecraft:oak_button".into())));
+        let mut special=ae2_encode_special_pattern("stonecutting","minecraft:stone_slab",&grid,&output,false).unwrap();
+        special.data_mut().set_other("minecraft:custom_data",None);
+        let snapshot=assembler_pattern_data(&special).unwrap();
+        assert_eq!(snapshot.get("special_kind"),Some(&Tag::String("stonecutting".into())));
+        let actual=horizon_client::save::decode_items(snapshot.get("grid"),9);
+        assert_eq!(actual[4],grid[0]);
+    }
+    #[test]
     fn special_pattern_roundtrips_recipe_identity_and_rejects_malformed_grid() {
         let mut grid=vec![None;9];grid[0]=Some(simple_stack("minecraft:stone"));let output=ItemStack::new("minecraft:stone_slab",2);
         let pattern=ae2_encode_special_pattern("stonecutting","minecraft:stone_slab",&grid,&output,true).unwrap();
@@ -1280,6 +1474,77 @@ mod pattern_tests {
     }
 }
 
+// Translate source GenericStack positions without losing their physical order.
+// The host item representation is u32; out-of-range source quantities are
+// rejected rather than truncated. Missing Content invalidates processing as in
+// AEProcessingPattern while its original component remains on the stack.
+struct SourceProcessingView {
+    inputs: Vec<Option<ItemStack>>,
+    outputs: Vec<Option<ItemStack>>,
+    fluid_inputs: Vec<Option<PatternFluid>>,
+    fluid_outputs: Vec<Option<PatternFluid>>,
+}
+fn source_processing_view(pattern: &ItemStack) -> Option<Result<SourceProcessingView, String>> {
+    let source = super::ae2_source_patterns::processing(pattern)?;
+    Some((|| {
+        fn slots(values: Vec<Option<horizon_client::ae2_generic_stack::GenericStack>>, size: usize)
+            -> Result<(Vec<Option<ItemStack>>, Vec<Option<PatternFluid>>), String> {
+            let mut items = vec![None; size];
+            let mut fluids = vec![None; size];
+            for (index, value) in values.into_iter().enumerate() {
+                let Some(value) = value else { continue; };
+                if value.amount <= 0 || value.key.item_id == "ae2:missing_content" {
+                    return Err("invalid processing ingredient".into());
+                }
+                if value.fluid {
+                    fluids[index] = Some(PatternFluid { key: value.key, amount: value.amount as u64 });
+                } else {
+                    let mut stack = horizon_client::ae2_cell_codec::prototype(&value.key)?;
+                    stack.count = u32::try_from(value.amount).map_err(|_| "processing item amount exceeds host limit")?;
+                    items[index] = Some(stack);
+                }
+            }
+            Ok((items, fluids))
+        }
+        let (input, output) = source?;
+        let (inputs, fluid_inputs) = slots(input, 81)?;
+        let (outputs, fluid_outputs) = slots(output, 27)?;
+        Ok(SourceProcessingView { inputs, outputs, fluid_inputs, fluid_outputs })
+    })())
+}
+fn source_processing_slots(items: &[Option<ItemStack>], fluids: &[Option<PatternFluid>])
+    -> Result<Vec<Option<horizon_client::ae2_generic_stack::GenericStack>>, String> {
+    use horizon_client::ae2_generic_stack::GenericStack;
+    if items.len() != fluids.len() { return Err("processing slot count mismatch".into()); }
+    items.iter().zip(fluids).map(|(item, fluid)| match (item, fluid) {
+        (None, None) => Ok(None),
+        (Some(item), None) if item.count > 0 => Ok(Some(GenericStack {
+            key: horizon_client::ae2_cell_codec::key(item)?, fluid: false, amount: i64::from(item.count),
+        })),
+        (None, Some(fluid)) if fluid.amount > 0 => Ok(Some(GenericStack {
+            key: fluid.key.clone(), fluid: true,
+            amount: i64::try_from(fluid.amount).map_err(|_| "processing fluid amount exceeds source limit")?,
+        })),
+        _ => Err("invalid processing slot".into()),
+    }).collect()
+}
+fn write_source_processing(pattern: &mut ItemStack, items_in: &[Option<ItemStack>], items_out: &[Option<ItemStack>],
+    fluids_in: &[Option<PatternFluid>], fluids_out: &[Option<PatternFluid>]) -> Result<(), String> {
+    let input = source_processing_slots(items_in, fluids_in)?;
+    let output = source_processing_slots(items_out, fluids_out)?;
+    let source = super::ae2_source_patterns::encode_processing(&input, &output)?;
+    pattern.data_mut().set_other("ae2:encoded_processing_pattern", Some(source));
+    Ok(())
+}
+fn has_unrepresentable_fluid(values: &[Option<PatternFluid>]) -> bool {
+    values.iter().flatten().any(|fluid| {
+        let generic = horizon_client::ae2_generic_stack::GenericStack {
+            key: fluid.key.clone(), fluid: true, amount: i64::try_from(fluid.amount).unwrap_or(i64::MAX),
+        };
+        !fluid.key.components.is_empty() && horizon_client::ae2_generic_stack::encode(&generic).is_err()
+    })
+}
+
 /// Experimental item-only processing pattern. Fluid ingredients are not yet
 /// accepted because CPU fluid ownership is not break-safe.
 pub(super) fn ae2_encode_processing_pattern(
@@ -1305,6 +1570,7 @@ pub(super) fn ae2_encode_processing_pattern(
             ]),
         )])),
     );
+    write_source_processing(&mut pattern, inputs, outputs, &vec![None; inputs.len()], &vec![None; outputs.len()])?;
     Ok(pattern)
 }
 fn strict_pattern_slots(tag: &Tag, size: usize) -> Option<Vec<Option<ItemStack>>> {
@@ -1330,6 +1596,10 @@ pub(super) fn ae2_decode_processing_pattern(
 ) -> Option<(Vec<Option<ItemStack>>, Vec<Option<ItemStack>>)> {
     if pattern.item.as_ref() != "ae2:processing_pattern" || pattern.count != 1 {
         return None;
+    }
+    if let Some(source) = source_processing_view(pattern) {
+        let source = source.ok()?;
+        return Some((source.inputs, source.outputs));
     }
     let data = pattern
         .data()?
@@ -1369,6 +1639,25 @@ mod processing_pattern_tests {
             "minecraft:gold_nugget"
         );
         assert!(ae2_encode_processing_pattern(&[], &outputs).is_err());
+    }
+
+    #[test]
+    fn source_processing_preserves_sparse_items_fluids_and_rejects_bad_source() {
+        let mut items_in = vec![None; 81]; items_in[80] = Some(simple_stack("minecraft:iron_ore"));
+        let mut items_out = vec![None; 27]; items_out[4] = Some(simple_stack("minecraft:iron_ingot"));
+        let mut fluids_in = vec![None; 81]; fluids_in[3] = Some(PatternFluid {
+            key: ae2_cell_core::ItemKey { item_id: "minecraft:water".into(), components: vec![] }, amount: 1000,
+        });
+        let mut fluids_out = vec![None; 27]; fluids_out[0] = Some(PatternFluid {
+            key: ae2_cell_core::ItemKey { item_id: "minecraft:lava".into(), components: vec![] }, amount: 250,
+        });
+        let mut pattern = ae2_encode_processing_positioned(&items_in, &items_out, &fluids_in, &fluids_out).unwrap();
+        assert!(pattern.data().unwrap().other("ae2:encoded_processing_pattern").is_some());
+        pattern.data_mut().set_other("minecraft:custom_data", None);
+        assert_eq!(ae2_decode_processing_pattern(&pattern), Some((items_in, items_out)));
+        assert_eq!(ae2_decode_processing_positions(&pattern).unwrap(), Some((fluids_in, fluids_out)));
+        pattern.data_mut().set_other("ae2:encoded_processing_pattern", Some(Tag::compound([("sparseInputs", Tag::List(vec![]))])));
+        assert!(ae2_decode_processing_pattern(&pattern).is_none());
     }
 
     #[test]
@@ -1477,6 +1766,11 @@ pub(super) fn ae2_encode_processing_with_fluids(
 pub(super) fn ae2_decode_processing_fluids(
     pattern: &ItemStack,
 ) -> Option<(Vec<PatternFluid>, Vec<PatternFluid>)> {
+    if pattern.item.as_ref() != "ae2:processing_pattern" || pattern.count != 1 { return None; }
+    if let Some(source) = source_processing_view(pattern) {
+        let source = source.ok()?;
+        return Some((source.fluid_inputs.into_iter().flatten().collect(), source.fluid_outputs.into_iter().flatten().collect()));
+    }
     let data = pattern
         .data()?
         .other("minecraft:custom_data")?
@@ -1550,12 +1844,24 @@ pub(super) fn ae2_encode_processing_positioned(
     data.insert("fluid_output_slots".into(), positions(fluid_outputs));
     pattern.data_mut().set_other("minecraft:custom_data", Some(Tag::Compound(custom)));
     ae2_decode_processing_positions(&pattern)?.ok_or("missing processing positions")?;
+    if let Err(error) = write_source_processing(&mut pattern, inputs, outputs, fluid_inputs, fluid_outputs) {
+        // Older native saves can contain opaque fluid-key bytes that do not
+        // represent an NBT DataComponentPatch. Preserve those legacy records.
+        if !has_unrepresentable_fluid(fluid_inputs) && !has_unrepresentable_fluid(fluid_outputs) {
+            return Err(error);
+        }
+    }
     Ok(pattern)
 }
 
 pub(super) fn ae2_decode_processing_positions(
     pattern: &ItemStack,
 ) -> Result<Option<(Vec<Option<PatternFluid>>, Vec<Option<PatternFluid>>)>, String> {
+    if pattern.item.as_ref() != "ae2:processing_pattern" || pattern.count != 1 { return Err("invalid processing pattern".into()); }
+    if let Some(source) = source_processing_view(pattern) {
+        let source = source?;
+        return Ok(Some((source.fluid_inputs, source.fluid_outputs)));
+    }
     let data = pattern.data().and_then(|data| data.other("minecraft:custom_data"))
         .and_then(|tag| tag.get("ae2_lab_processing")).ok_or("invalid processing pattern")?;
     let (items_in, items_out) = ae2_decode_processing_pattern(pattern).ok_or("invalid processing pattern")?;

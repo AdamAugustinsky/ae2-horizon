@@ -62,6 +62,7 @@ pub(super) fn mark_card_removed(machine: &mut Machine) {
     if machine.kind != MachineKind::Interface {
         return;
     }
+    super::ae2_autocrafting::advance_crafting_card_generation(&mut machine.config);
     let mask = craft_links(machine)
         .map(|links| {
             links.iter().enumerate().fold(0i32, |mask, (slot, link)| {
@@ -216,6 +217,9 @@ pub(super) fn interface_config(machine: &Machine) -> Result<Vec<Option<ItemStack
     }
     Ok(save::decode_items(Some(tag), 9))
 }
+// InterfaceLogic calls useRegisteredCapacities for both rows; AE2 registers
+// four buckets for fluids in GenericSlotCapacities.
+pub(super) const INTERFACE_FLUID_CAPACITY: u64 = 4000;
 const FLUID_CONFIG: &str = "ae2_interface_fluid_config";
 const FLUID_STOCK: &str = "ae2_interface_fluids";
 // InterfaceLogic.isAllowedInStorageSlot uses AEKey.fuzzyEquals; fluid keys
@@ -263,7 +267,7 @@ fn fluid_slots(machine: &Machine, name: &str) -> Result<Vec<Option<(ItemKey, u64
         if i >= 9
             || slots[i].is_some()
             || *amount <= 0
-            || *amount > 4000
+            || *amount > INTERFACE_FLUID_CAPACITY as i64
             || !super::ae2_fluids::valid_fluid_id(&id)
         {
             return Err("invalid interface fluid slot".into());
@@ -310,13 +314,19 @@ pub(super) fn set_interface_fluid_config(
     index: usize,
     key: Option<&ItemKey>,
 ) -> Result<(), String> {
+    set_interface_fluid_config_amount(machine,index,key.map(|key|(key,1000)))
+}
+pub(super) fn set_interface_fluid_config_amount(
+    machine:&mut Machine,index:usize,value:Option<(&ItemKey,u64)>,
+)->Result<(),String> {
     if machine.kind != MachineKind::Interface || index >= 9 {
         return Err("invalid interface fluid config".into());
     }
+    if value.is_some_and(|(_,amount)|amount==0) {return Err("invalid interface fluid amount".into());}
     let mut fluid = interface_fluid_config(machine)?;
     let mut item = interface_config(machine)?;
-    fluid[index] = key.map(|k| (k.clone(), 1000));
-    if key.is_some() {
+    fluid[index] = value.map(|(key,amount)| (key.clone(), amount.min(INTERFACE_FLUID_CAPACITY)));
+    if value.is_some() {
         item[index] = None;
     }
     store_fluids(machine, FLUID_CONFIG, &fluid);
@@ -358,7 +368,7 @@ pub(super) fn interface_bucket_exchange(
             Some(_) => return Ok(None),
             None => 0,
         };
-        if n > 3000 {
+        if n > INTERFACE_FLUID_CAPACITY - 1000 {
             return Ok(None);
         }
         stock[index] = Some((key, n + 1000));
@@ -405,6 +415,21 @@ pub(super) fn set_interface_config(
     Ok(())
 }
 impl Game<'_> {
+    /// A calculation is valid only for the current card and ghost request.
+    pub(super) fn ae2_interface_pending_craft_generation(
+        &self, owner: InterfaceCraftOwner, slot: usize, key: &ItemKey, fluid: bool,
+    ) -> Option<i64> {
+        if slot >= 9 { return None; }
+        let machine = self.interface_get(owner.owner()?)?;
+        if !has_crafting_card(&machine) || craft_links(&machine).ok()?[slot].is_some() { return None; }
+        let matches = if fluid {
+            interface_fluid_config(&machine).ok()?.get(slot)?.as_ref().is_some_and(|(wanted, _)| wanted == key)
+        } else {
+            interface_config(&machine).ok()?.get(slot)?.as_ref()
+                .and_then(|stack| ae2_lab::key(stack).ok()).is_some_and(|wanted| wanted == *key)
+        };
+        matches.then(|| super::ae2_autocrafting::crafting_card_generation(&machine.config)).flatten()
+    }
     pub(super) fn ae2_interface_craft_link_valid(
         &self,
         owner: InterfaceCraftOwner,
@@ -554,7 +579,7 @@ impl Game<'_> {
             return Ok(0);
         }
         let old = stock[slot].as_ref().map_or(0, |(_, n)| *n);
-        let moved = amount.min(4000u64.saturating_sub(old));
+        let moved = amount.min(INTERFACE_FLUID_CAPACITY.saturating_sub(old));
         if moved > 0 && !simulate {
             stock[slot] = Some((key.clone(), old + moved));
             store_fluids(&mut machine, FLUID_STOCK, &stock);
@@ -933,9 +958,11 @@ mod tests {
         assert_eq!(craft_links(&machine).unwrap(), links);
         machine.upgrades = vec![Some(ItemStack::new("ae2:crafting_card", 1))];
         assert!(active_craft_link(&machine, 4, cpu));
+        let original_generation = super::super::ae2_autocrafting::crafting_card_generation(&machine.config);
         machine.upgrades[0] = None;
         mark_card_removed(&mut machine);
         machine.upgrades[0] = Some(ItemStack::new("ae2:crafting_card", 1));
+        assert_ne!(super::super::ae2_autocrafting::crafting_card_generation(&machine.config), original_generation);
         assert!(!active_craft_link(&machine, 4, cpu));
         assert!(craft_link_cancelled(&machine, 4));
         assert!(!craft_link_cancelled(&machine, 3));
@@ -944,6 +971,15 @@ mod tests {
         };
         entries.push(entries[0].clone());
         assert!(craft_links(&machine).is_err());
+    }
+    #[test]
+    fn wrapped_fluid_config_keeps_identity_and_clamps_registered_capacity() {
+        let mut machine=Machine::new(MachineKind::Interface);
+        let key=ItemKey{item_id:"minecraft:water".into(),components:vec![1,2]};
+        set_interface_fluid_config_amount(&mut machine,2,Some((&key,1250))).unwrap();
+        assert_eq!(interface_fluid_config(&machine).unwrap()[2],Some((key.clone(),1250)));
+        set_interface_fluid_config_amount(&mut machine,2,Some((&key,10_000))).unwrap();
+        assert_eq!(interface_fluid_config(&machine).unwrap()[2],Some((key,4000)));
     }
     #[test]
     fn ghost_configuration_preserves_count_and_components_and_rejects_duplicate_slots() {
@@ -1373,12 +1409,12 @@ impl Game<'_> {
                 }
                 match &mut stock[i] {
                     Some((stored, n)) if stored == key => {
-                        let moved = left.min(4000 - *n);
+                        let moved = left.min(INTERFACE_FLUID_CAPACITY.saturating_sub(*n));
                         *n += moved;
                         left -= moved
                     }
                     None => {
-                        let moved = left.min(4000);
+                        let moved = left.min(INTERFACE_FLUID_CAPACITY);
                         stock[i] = Some((key.clone(), moved));
                         left -= moved
                     }

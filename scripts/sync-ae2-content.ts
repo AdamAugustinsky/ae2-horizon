@@ -70,6 +70,15 @@ for(const path of commonTags){
  const values=[...new Map([...(dependency.values??[]),...(own.values??[])].map((v:unknown)=>[JSON.stringify(v),v])).values()];
  put(dst,{...dependency,...own,replace:false,values});
 }
+// Block tags are equally important: AE2's growth_acceleratable tag includes
+// #c:budding_blocks, to which NeoForge adds vanilla budding amethyst.
+const commonBlockTags=execFileSync('unzip',['-Z1',neoForgeJar],{encoding:'utf8'}).split('\n').filter(p=>/^data\/c\/tags\/block\/.+\.json$/.test(p));
+for(const path of commonBlockTags){
+ const dependency=JSON.parse(execFileSync('unzip',['-p',neoForgeJar,path],{encoding:'utf8'}));
+ const dst=join(content,path);const own=existsSync(dst)?JSON.parse(readFileSync(dst,'utf8')):{values:[]};
+ const values=[...new Map([...(dependency.values??[]),...(own.values??[])].map((v:unknown)=>[JSON.stringify(v),v])).values()];
+ put(dst,{...dependency,...own,replace:false,values});
+}
 // Biome tag definitions are required for AE2 meteorite ocean, sand and cold rules.
 const commonBiomeTags=execFileSync('unzip',['-Z1',neoForgeJar],{encoding:'utf8'}).split('\n').filter(p=>/^data\/c\/tags\/worldgen\/biome\/.+\.json$/.test(p));
 for(const path of commonBiomeTags){
@@ -78,7 +87,7 @@ for(const path of commonBiomeTags){
  const values=[...new Map([...(dependency.values??[]),...(own.values??[])].map((v:unknown)=>[JSON.stringify(v),v])).values()];
  put(dst,{...dependency,...own,replace:false,values});
 }
-report.gameplay_data={ae2_recipe_files:recipeFiles,ae2_tag_files:tagFiles,ae2_loot_files:lootFiles,common_item_tags:commonTags.length,common_biome_tags:commonBiomeTags.length,omitted_optional_dependency_namespaces:[...omittedNamespaces],common_tag_source:'Pinned NeoForged NeoForge 21.1.259 universal JAR from official Maven; https://github.com/neoforged/NeoForge',note:'Copied definitions do not imply custom recipe handlers or world mechanics are implemented.'};
+report.gameplay_data={ae2_recipe_files:recipeFiles,ae2_tag_files:tagFiles,ae2_loot_files:lootFiles,common_item_tags:commonTags.length,common_block_tags:commonBlockTags.length,common_biome_tags:commonBiomeTags.length,omitted_optional_dependency_namespaces:[...omittedNamespaces],common_tag_source:'Pinned NeoForged NeoForge 21.1.259 universal JAR from official Maven; https://github.com/neoforged/NeoForge',note:'Copied definitions do not imply custom recipe handlers or world mechanics are implemented.'};
 function modelStatus(name: string, seen = new Set<string>(), inheritedGeometry = false): string | null {
   const key = name.includes(':') ? name : 'minecraft:' + name;
   if (!key.startsWith('ae2:')) return key.startsWith('minecraft:') ? null : `external parent ${key}`;
@@ -353,12 +362,33 @@ copyFileSync(join(reference,'src/generated/resources/assets/ae2/blockstates/debu
 for (const [id, entry] of items) {
   if (blockItems.has(id)) {report.excluded.push({id:'ae2:'+id,kind:entry.kind,reason:'already registered as block item'});continue;}
   const model = 'ae2:item/'+id; const issue = modelStatus(model);
-  if (issue) {
+  let chosen = issue ? `ae2:item/horizon_static/${id}` : model;
+  if (id === 'facade') {
+    // FacadeItemModel bakes this source anchor before adding the sliced
+    // texture item in the native renderer. An empty facade uses the anchor.
+    const base = 'ae2:item/facade_base', problem = modelStatus(base);
+    if (problem || !existsSync(join(assets,'textures/part/cable_anchor.png'))) {
+      throw new Error(`facade source assets unavailable: ${problem ?? 'missing anchor texture'}`);
+    }
+    chosen = base;
+  } else if (id === 'memory_card') {
+    // The custom loader delegates its card body to this ordinary source model;
+    // the native renderer adds the eight tinted cubes from MemoryCardBakedModel.
+    const base = 'ae2:item/memory_card_base', problem = modelStatus(base);
+    if (problem || !['memory_card_base','memory_card_led','memory_card_hash'].every(name=>existsSync(join(assets,'textures/item',name+'.png')))) {
+      throw new Error(`memory card source assets unavailable: ${problem ?? 'missing texture'}`);
+    }
+    chosen = base;
+  } else if (id === 'wrapped_generic_stack') {
+    // Source registers an empty item model; AEBaseScreen uses the contained
+    // GenericStack key to draw GUI slots. Never replace it with an iron ingot.
+    put(join(assets,'models/item/horizon_static',id+'.json'), {parent:'minecraft:block/block',gui_light:'front',elements:[]});
+    chosen = `ae2:item/horizon_static/${id}`;
+  } else if (issue) {
     const texture = existsSync(join(assets,'textures/item',id+'.png')) ? 'ae2:item/'+id : 'minecraft:item/iron_ingot';
     put(join(assets,'models/item/horizon_static',id+'.json'), {parent:'minecraft:item/generated', textures:{layer0:texture}});
     if (texture.startsWith('minecraft:')) report.errors.push({id:'ae2:'+id,reason:`${issue}; generic item fallback`});
   }
-  const chosen = issue ? `ae2:item/horizon_static/${id}` : model;
   put(join(assets,'items',id+'.json'), {model:{type:'minecraft:model',model:chosen}});
   // QuartzToolType uses iron's tier. Fluix inherits iron's mining tags;
   // native item projection supplies source Fluix durability, speed and attack,
@@ -369,7 +399,9 @@ for (const [id, entry] of items) {
   if (singletonIds.has(id)) obj.max_stack_size=1;
   if (id === 'item_storage_cell_1k') obj.rarity='uncommon';
   put(join(content,'data/ae2/horizon/item',id+'.json'), obj);
-  report.items.push({id:'ae2:'+id,kind:entry.kind,template,model:chosen,max_stack_size:obj.max_stack_size ?? 64,visual:issue?'static_texture_fallback':'source_model',reason:issue,behavior:'unimplemented_unless_native_host_explicitly_implements_it'});
+  const visual=id==='facade'?'source_anchor_native_dynamic_facade':id==='memory_card'?'source_card_base_native_dynamic_leds':id==='wrapped_generic_stack'?'source_empty_model_native_gui_key':issue?'static_texture_fallback':'source_model';
+  const reason=id==='facade'?'textured facade requires the native item renderer':id==='memory_card'?'LED cubes require the native item renderer':id==='wrapped_generic_stack'?'GUI key drawing requires the native item renderer':issue;
+  report.items.push({id:'ae2:'+id,kind:entry.kind,template,model:chosen,max_stack_size:obj.max_stack_size ?? 64,visual,reason,behavior:'unimplemented_unless_native_host_explicitly_implements_it'});
 }
 // Source ColorApplicatorModel chooses its colored variant only with an active
 // stored color. The native renderer supplies a render-only custom-model flag.
@@ -407,4 +439,4 @@ writeFileSync(join(content,'ATTRIBUTION.md'),`# Attribution\n\nAssets generated 
 put(join(content,'content-inventory.json'),report);
 appendAttribution();
 console.log(JSON.stringify(report.counts,null,2));
-function appendAttribution(){const p=join(content,'ATTRIBUTION.md');writeFileSync(p,readFileSync(p,'utf8')+'\nConventional item and biome tag JSONs merge NeoForge 21.1.259 data from its pinned official Maven JAR. Source: https://github.com/neoforged/NeoForge/tree/1.21.1/src/generated/resources/data/c/tags . NeoForge is LGPL-2.1-only: https://github.com/neoforged/NeoForge/blob/1.21.1/LICENSE.txt . No Java classes or Mojang prepared resources are redistributed in this content folder.\n');}
+function appendAttribution(){const p=join(content,'ATTRIBUTION.md');writeFileSync(p,readFileSync(p,'utf8')+'\nConventional item, block and biome tag JSONs merge NeoForge 21.1.259 data from its pinned official Maven JAR. Source: https://github.com/neoforged/NeoForge/tree/1.21.1/src/generated/resources/data/c/tags . NeoForge is LGPL-2.1-only: https://github.com/neoforged/NeoForge/blob/1.21.1/LICENSE.txt . No Java classes or Mojang prepared resources are redistributed in this content folder.\n');}

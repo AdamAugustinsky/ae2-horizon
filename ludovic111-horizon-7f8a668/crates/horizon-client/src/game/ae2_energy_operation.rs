@@ -69,11 +69,6 @@ impl Game<'_> {
     pub(super) fn ae2_energy_transaction(&mut self, anchor: GridAddress, face: Option<u8>, amount: f64, simulate: bool, inject: bool) -> Result<f64, String> {
         self.ae2_energy_transaction_with(anchor,face,amount,simulate,inject,false)
     }
-    /// FE sources transfer whole units. Reject a short result before any write
-    /// so a rejected fractional transfer cannot create or destroy energy.
-    pub(super) fn ae2_energy_inject_exact(&mut self,anchor:GridAddress,face:Option<u8>,amount:f64)->Result<f64,String>{
-        self.ae2_energy_transaction_with(anchor,face,amount,false,true,true)
-    }
     fn ae2_energy_transaction_with(&mut self, anchor: GridAddress, face: Option<u8>, amount: f64, simulate: bool, inject: bool, exact:bool) -> Result<f64, String> {
         if !amount.is_finite() || amount < 0.0 { return Err("invalid energy transaction".into()); }
         if !self.ae2_sync_events() { return Err("energy lifecycle unavailable".into()); }
@@ -169,8 +164,10 @@ impl Game<'_> {
             let amount=if base>0.0001{component.idle_per_tick}else{0.1};
             plans.push((power,service,pos,base,amount));
         }
+        let multiplier=horizon_client::ae2_common_config::gameplay().usage_multiplier;
         for (power,_,pos,_,amount) in &plans {
-            if !bad.contains(power)&&self.ae2_energy_transaction_snapshot(&network,&analysis,*pos,*amount,true,false,false).is_err(){bad.insert(*power);}
+            let charged=(*amount*multiplier).min(f64::MAX);
+            if !bad.contains(power)&&self.ae2_energy_transaction_snapshot(&network,&analysis,*pos,charged,true,false,false).is_err(){bad.insert(*power);}
         }
         // Source onServerStartTick selects one incumbent passive generator per
         // real energy overlay, including across quartz fiber. A group without
@@ -205,7 +202,7 @@ impl Game<'_> {
             for power in &bad {
                 let Some(group)=analysis.power_components.get(*power) else{continue};
                 if group.positions.iter().any(|pos|legacy.nodes[pos].kind==ae2_network_core::DeviceKind::CreativeEnergyCell){continue}
-                let mut remaining=group.idle_per_tick;
+                let mut remaining=(group.idle_per_tick*multiplier).min(f64::MAX);
                 for pos in &group.positions {
                     if let Some(device)=legacy.nodes.get_mut(pos){let used=remaining.min(device.energy);device.energy-=used;remaining-=used;if remaining<=0.0{break}}
                 }
@@ -224,7 +221,8 @@ impl Game<'_> {
                 if let Err(error)=self.ae2_energy_transaction_snapshot(&network,&analysis,pos,rate,false,true,false){log::warn!("AE2 passive generation stopped: {error}");return true}
             }
             if let Err(error)=self.ae2_live_events.borrow_mut().energy.watcher_tick(service){log::warn!("AE2 energy watcher tick stopped: {error}");return true}
-            let extracted=match self.ae2_energy_transaction_snapshot(&network,&analysis,pos,amount,base<=0.0001,false,false){Ok(value)=>value,Err(error)=>{log::warn!("AE2 energy idle tick stopped: {error}");return true}};
+            let charged=(amount*multiplier).min(f64::MAX);
+            let extracted=match self.ae2_energy_transaction_snapshot(&network,&analysis,pos,charged,base<=0.0001,false,false){Ok(value)=>value/multiplier,Err(error)=>{log::warn!("AE2 energy idle tick stopped: {error}");return true}};
             let powered=if base>0.0001{extracted>=base-0.001}else{extracted>0.0};
             if let Err(error)=self.ae2_live_events.borrow_mut().energy.finish_service_tick(service,powered){log::warn!("AE2 energy power tick stopped: {error}");return true}
         }

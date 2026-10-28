@@ -113,6 +113,89 @@ pub fn world_generation() -> crate::ae2_meteorite::Options {
     WORLD_GEN.with(|c| cached(c, parse_world_generation))
 }
 
+/// TickHandler's per-server-tick crafting calculation budget, in milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CraftingCalculationBudget(i32);
+impl Default for CraftingCalculationBudget {
+    fn default() -> Self { Self(5) }
+}
+fn parse_crafting_calculation_budget(text: &str) -> Result<CraftingCalculationBudget, String> {
+    let config: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    let Some(section) = config.get("craftingCPU") else { return Ok(CraftingCalculationBudget::default()); };
+    if !section.is_table() { return Err("craftingCPU must be a TOML table".into()); }
+    let Some(value) = section.get("craftingCalculationTimePerTick") else { return Ok(CraftingCalculationBudget::default()); };
+    let value = value.as_integer().and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| "craftingCPU.craftingCalculationTimePerTick must be a signed 32-bit integer".to_string())?;
+    Ok(CraftingCalculationBudget(value))
+}
+thread_local! { static CRAFTING_CALCULATION_BUDGET: RefCell<Option<Cache<CraftingCalculationBudget>>> = const { RefCell::new(None) }; }
+pub fn crafting_calculation_time_per_tick() -> i32 {
+    CRAFTING_CALCULATION_BUDGET.with(|c| cached(c, parse_crafting_calculation_budget)).0
+}
+
+/// Source CommonConfig settings shared by grid energy, automation and chunk
+/// loading. Values are read independently of unrelated TOML sections.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gameplay {
+    pub spatial_anchor_random_ticks: bool,
+    pub annihilation_sky_dust: bool,
+    pub forge_energy: f64,
+    pub usage_multiplier: f64,
+    pub grid_energy_per_node: f64,
+    pub p2p_energy_tax: f64,
+    pub p2p_transport_tax: f64,
+}
+impl Default for Gameplay {
+    fn default() -> Self {
+        Self {
+            spatial_anchor_random_ticks: true,
+            annihilation_sky_dust: true,
+            forge_energy: 0.5,
+            usage_multiplier: 1.0,
+            grid_energy_per_node: 25.0,
+            p2p_energy_tax: 0.025,
+            p2p_transport_tax: 0.025,
+        }
+    }
+}
+fn parse_gameplay(text: &str) -> Result<Gameplay, String> {
+    let config: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
+    let mut result = Gameplay::default();
+    for (section, name, target) in [
+        ("general", "spatialAnchorEnableRandomTicks", &mut result.spatial_anchor_random_ticks),
+        ("crafting", "annihilationPlaneSkyDustGeneration", &mut result.annihilation_sky_dust),
+    ] {
+        if let Some(table) = config.get(section) {
+            if !table.is_table() { return Err(format!("{section} must be a TOML table")); }
+            if let Some(value) = table.get(name) {
+                *target = value.as_bool().ok_or_else(|| format!("{section}.{name} must be boolean"))?;
+            }
+        }
+    }
+    if let Some(table) = config.get("powerRatios") {
+        if !table.is_table() { return Err("powerRatios must be a TOML table".into()); }
+        for (name, target, min, max) in [
+            ("forgeEnergy", &mut result.forge_energy, f64::from_bits(1), f64::MAX),
+            ("usageMultiplier", &mut result.usage_multiplier, 0.01, f64::MAX),
+            ("gridEnergyStoragePerNode", &mut result.grid_energy_per_node, 1.0, 1_000_000.0),
+            ("p2pTunnelEnergyTax", &mut result.p2p_energy_tax, 0.0, 1.0),
+            ("p2pTunnelTransportTax", &mut result.p2p_transport_tax, 0.0, 1.0),
+        ] {
+            if let Some(value) = table.get(name) {
+                let n = value.as_float().or_else(|| value.as_integer().map(|n| n as f64))
+                    .ok_or_else(|| format!("powerRatios.{name} must be numeric"))?;
+                if !n.is_finite() || !(min..=max).contains(&n) {
+                    return Err(format!("powerRatios.{name} is outside source bounds"));
+                }
+                *target = n;
+            }
+        }
+    }
+    Ok(result)
+}
+thread_local! { static GAMEPLAY: RefCell<Option<Cache<Gameplay>>> = const { RefCell::new(None) }; }
+pub fn gameplay() -> Gameplay { GAMEPLAY.with(|c| cached(c, parse_gameplay)) }
+
 /// AE2's automation limit is a signed source integer, including zero and
 /// negative values (which prevent Formation Plane entity placement).
 #[derive(Clone, Copy)]
@@ -344,6 +427,31 @@ pub fn unsupported_developer_tools() -> bool {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crafting_calculation_budget_matches_source_integer_bounds() {
+        use super::parse_crafting_calculation_budget as parse;
+        assert_eq!(parse("").unwrap().0, 5);
+        assert_eq!(parse("[craftingCPU]\ncraftingCalculationTimePerTick=-2147483648").unwrap().0, i32::MIN);
+        assert_eq!(parse("[craftingCPU]\ncraftingCalculationTimePerTick=2147483647").unwrap().0, i32::MAX);
+        assert!(parse("[craftingCPU]\ncraftingCalculationTimePerTick=2147483648").is_err());
+        assert!(parse("[craftingCPU]\ncraftingCalculationTimePerTick=1.5").is_err());
+    }
+    #[test]
+    fn gameplay_config_uses_source_defaults_bounds_and_independent_sections() {
+        use super::*;
+        assert_eq!(parse_gameplay("").unwrap(), Gameplay::default());
+        let parsed = parse_gameplay("[general]\nspatialAnchorEnableRandomTicks=false\n[crafting]\nannihilationPlaneSkyDustGeneration=false\n[powerRatios]\nforgeEnergy=1.5\nusageMultiplier=0.01\ngridEnergyStoragePerNode=1000000\np2pTunnelEnergyTax=0\np2pTunnelTransportTax=1\n[wireless]\nwirelessBaseRange=42").unwrap();
+        assert_eq!(parsed, Gameplay { spatial_anchor_random_ticks: false, annihilation_sky_dust: false,
+            forge_energy: 1.5, usage_multiplier: 0.01, grid_energy_per_node: 1_000_000.0,
+            p2p_energy_tax: 0.0, p2p_transport_tax: 1.0 });
+        assert!(parse_gameplay("[powerRatios]\nforgeEnergy=4.9406564584124654e-324").is_ok());
+        for bad in ["[general]\nspatialAnchorEnableRandomTicks=0", "[crafting]\nannihilationPlaneSkyDustGeneration='false'",
+            "[powerRatios]\nforgeEnergy=0", "[powerRatios]\nusageMultiplier=0.009",
+            "[powerRatios]\ngridEnergyStoragePerNode=0.99", "[powerRatios]\ngridEnergyStoragePerNode=1000001",
+            "[powerRatios]\np2pTunnelEnergyTax=-0.01", "[powerRatios]\np2pTunnelTransportTax=1.01"] {
+            assert!(parse_gameplay(bad).is_err(), "{bad}");
+        }
+    }
     #[test]
     fn formation_limit_uses_source_integer_default_and_bounds() {
         assert_eq!(super::parse_formation_entity_limit("").unwrap().0, 128);

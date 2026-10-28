@@ -406,6 +406,7 @@ impl Game<'_> {
         if let Some(ordered) = self.ae2_event_overlay(&n) {
             n.committed_channels = Some(ordered);
         }
+        self.ae2_event_connection_order(&mut n);
         self.ae2_project_energy_buffers(&mut n);
         n
     }
@@ -631,6 +632,24 @@ impl Game<'_> {
         amount: f64,
         simulate: bool,
     ) -> f64 {
+        // PowerMultiplier.CONFIG charges real storage in scaled AE, while the
+        // source API returns the corresponding unscaled requested amount.
+        if !amount.is_finite() || amount <= 0.0 { return 0.0; }
+        let multiplier = horizon_client::ae2_common_config::gameplay().usage_multiplier;
+        self.ae2_take_power_encoded_raw(address, (amount * multiplier).min(f64::MAX), simulate) / multiplier
+    }
+    /// Source operations using PowerMultiplier.ONE, such as charger grid
+    /// refill, deliberately bypass the configured consumption multiplier.
+    pub(super) fn ae2_take_power_raw(&mut self, pos: WorldPos, amount: f64, simulate: bool) -> f64 {
+        let Some(address) = self.ae2_local_address(pos) else { return 0.0; };
+        self.ae2_take_power_encoded_raw(address, amount, simulate)
+    }
+    pub(super) fn ae2_take_power_encoded_raw(
+        &mut self,
+        address: super::ae2_global::GridAddress,
+        amount: f64,
+        simulate: bool,
+    ) -> f64 {
         if !amount.is_finite() || amount <= 0.0 {
             return 0.0;
         }
@@ -707,7 +726,7 @@ impl Game<'_> {
         for p in self.ae2_drives_encoded(pos)? {
             if let Some(BlockEntity::Ae2(m)) = self.ae2_block_entity(p) {
                 for stack in m.slots.iter().flatten() {
-                    if let Ok(keys) = super::ae2_storage_devices::creative_cell_keys(stack) {
+                    if let Ok(keys) = self.ae2_creative_cell_keys(stack) {
                         for key in keys {
                             if let super::ae2_storage_devices::CreativeCellKey::Item(k) = key {
                                 let n = total.entry(k).or_default();
@@ -717,7 +736,7 @@ impl Game<'_> {
                             }
                         }
                     }
-                    if let Ok(c) = ae2_lab::read_cell(stack) {
+                    if let Ok(c) = self.ae2_read_item_cell(stack) {
                         for (k, v) in c.entries() {
                             let n = total.entry(k.clone()).or_default();
                             *n = n.checked_add(*v).ok_or("network item count overflow")?;
@@ -1376,6 +1395,9 @@ impl Game<'_> {
                     };
                 }
                 self.world.modified.insert((p.0 >> 4, p.2 >> 4));
+                if self.ae2_has_anchor_owners() {
+                    if let Err(error)=self.ae2_apply_anchor_callbacks(){log::debug!("AE2 anchor callbacks deferred: {error}");}
+                }
                 Ok(json!({"attached":true,"face":face}))
             }
             "simulate" => {

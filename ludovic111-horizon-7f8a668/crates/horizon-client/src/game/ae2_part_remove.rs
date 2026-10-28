@@ -59,6 +59,9 @@ impl Game<'_> {
         self.world.modified.insert((pos.0>>4,pos.2>>4));
         if remove_host { let _=self.set_state_named(hit,"minecraft:air",&[]); }
         for stack in overflow {self.pop_resource(hit,stack);}
+        if self.ae2_has_anchor_owners() {
+            if let Err(error)=self.ae2_apply_anchor_callbacks(){log::debug!("AE2 anchor callbacks deferred: {error}");}
+        }
         true
     }
 }

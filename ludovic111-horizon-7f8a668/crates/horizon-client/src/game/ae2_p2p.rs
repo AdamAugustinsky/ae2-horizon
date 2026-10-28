@@ -59,6 +59,33 @@ fn frequency(tag: &Tag) -> i16 {
         _ => 0,
     }
 }
+/// P2PTunnelPart consumes registered components; old Horizon saves used an
+/// envelope in custom data. A present source component always takes precedence.
+fn card_target(card:&horizon_client::items::ItemStack)->Option<(String,Option<i16>)> {
+    let components=card.data()?;
+    let ty=components.other("ae2:exported_p2p_type");
+    let freq=components.other("ae2:exported_p2p_frequency");
+    if ty.is_some() || freq.is_some() {
+        let Some(Tag::String(id))=ty else{return None;};
+        let id=id.to_string().ok().filter(|id|is_tunnel(id))?;
+        let frequency=match freq {None=>None,Some(Tag::Short(value))=>Some(*value),_=>return None};
+        return Some((id,frequency));
+    }
+    let saved=components.other("minecraft:custom_data")?.get("ae2_p2p_card")?;
+    let id=text(saved,"id").filter(|id|is_tunnel(id))?;
+    let Some(Tag::Short(frequency))=saved.get("frequency") else{return None;};
+    (*frequency!=0).then_some((id,Some(*frequency)))
+}
+fn card_colors(frequency:i16)->Tag {
+    const COLORS:[&str;16]=["white","light_gray","gray","black","lime","yellow","orange","brown","red","pink","magenta","purple","blue","light_blue","cyan","green"];
+    let value=frequency as u16;
+    let mut result=Vec::with_capacity(8);
+    for shift in [12,8,4,0] {
+        let color=COLORS[((value>>shift)&15) as usize];
+        result.push(Tag::String(color.into()));result.push(Tag::String(color.into()));
+    }
+    Tag::List(result)
+}
 fn face(face: &str) -> Option<(u8, [i32; 3])> {
     Some(match face {
         "east" => (0, [1, 0, 0]),
@@ -273,44 +300,40 @@ impl Game<'_> {
             };
             fields.insert("p2p_frequency".into(), Tag::Short(new));
             fields.insert("p2p_output".into(), Tag::Byte(0));
+            if super::ae2_memory::clear(&mut card).is_err() {return true;}
             data.remove(&"ae2_memory_settings".into());
+            let id=text(&part,"id").unwrap();
             data.insert(
                 "ae2_p2p_card".into(),
                 Tag::compound([
-                    (
-                        "id",
-                        Tag::String(text(&part, "id").unwrap().as_str().into()),
-                    ),
+                    ("id",Tag::String(id.as_str().into())),
                     ("frequency", Tag::Short(new)),
                 ]),
             );
             card.data_mut()
                 .set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+            card.data_mut().set_other("ae2:exported_p2p_type",Some(Tag::String(id.as_str().into())));
+            card.data_mut().set_other("ae2:exported_p2p_frequency",Some(Tag::Short(new)));
+            card.data_mut().set_other("ae2:memory_card_colors",Some(card_colors(new)));
+            let translation=format!("item.ae2.{}",id.strip_prefix("ae2:").unwrap_or(&id));
+            card.data_mut().set_other("ae2:exported_settings_source",Some(Tag::compound([("translate",Tag::String(translation.as_str().into()))])));
             *self.held_mut() = Some(card);
         } else {
-            let Some(saved) = data.get(&"ae2_p2p_card".into()) else {
-                return true;
-            };
-            let Some(id) = text(saved, "id").filter(|id| is_tunnel(id)) else {
-                return true;
-            };
-            let Some(Tag::Short(new)) = saved
-                .get("frequency")
-                .filter(|n| matches!(n,Tag::Short(n)if *n!=0))
-            else {
-                return true;
-            };
+            let Some((id,new))=card_target(&card) else{return true;};
             if text(&part, "id").as_deref() != Some(id.as_str()) {
                 let Some(replacement) = replace_tunnel_type(&part, &id) else { return true };
                 updated = replacement;
                 replaced = true;
             }
+            let previous_frequency=frequency(&updated);
             let Tag::Compound(ref mut fields) = updated else {
                 return true;
             };
-            if replaced || frequency(&part) != *new {
-                fields.insert("p2p_frequency".into(), Tag::Short(*new));
-                fields.insert("p2p_output".into(), Tag::Byte(1));
+            if let Some(new)=new {
+                if previous_frequency != new {
+                    fields.insert("p2p_frequency".into(), Tag::Short(new));
+                    fields.insert("p2p_output".into(), Tag::Byte(1));
+                }
             }
         }
         let mut changed = false;
@@ -328,6 +351,9 @@ impl Game<'_> {
             } else {
                 self.world.block_entities.record_ae2_part_change(pos, part, updated);
             }
+            if self.ae2_has_anchor_owners() {
+                if let Err(error)=self.ae2_apply_anchor_callbacks(){log::debug!("AE2 anchor callbacks deferred: {error}");}
+            }
         }
         true
     }
@@ -337,6 +363,22 @@ impl Game<'_> {
 mod replacement_tests {
     use super::*;
     use horizon_client::items::ItemStack;
+    #[test]
+    fn memory_card_reads_registered_p2p_components_before_legacy_data() {
+        let mut card=ItemStack::new("ae2:memory_card",1);
+        card.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2_p2p_card",Tag::compound([
+            ("id",Tag::String("ae2:me_p2p_tunnel".into())),("frequency",Tag::Short(11))
+        ]))])));
+        assert_eq!(card_target(&card),Some(("ae2:me_p2p_tunnel".into(),Some(11))));
+        card.data_mut().set_other("ae2:exported_p2p_type",Some(Tag::String("ae2:item_p2p_tunnel".into())));
+        card.data_mut().set_other("ae2:exported_p2p_frequency",Some(Tag::Short(-1234)));
+        assert_eq!(card_target(&card),Some(("ae2:item_p2p_tunnel".into(),Some(-1234))));
+        card.data_mut().set_other("ae2:exported_p2p_frequency",None);
+        assert_eq!(card_target(&card),Some(("ae2:item_p2p_tunnel".into(),None)));
+        card.data_mut().set_other("ae2:exported_p2p_frequency",Some(Tag::Int(7)));
+        assert_eq!(card_target(&card),None);
+        assert_eq!(card_colors(0x1234),Tag::List(["light_gray","light_gray","gray","gray","black","black","lime","lime"].into_iter().map(|s|Tag::String(s.into())).collect()));
+    }
     #[test]
     fn type_change_replaces_physical_part_and_clears_old_nodes() {
         let stack=ItemStack::new("ae2:me_p2p_tunnel",1);

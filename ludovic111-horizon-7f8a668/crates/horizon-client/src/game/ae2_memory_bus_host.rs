@@ -7,6 +7,7 @@ struct BusMemorySnapshot {
     part:horizon_world::nbt::Compound,
     incarnation:u64,
     name:Option<String>,
+    name_component:Option<Tag>,
 }
 impl Game<'_> {
     fn bus_memory_snapshot(&self,pos:[i32;3],face:&str)->Result<Option<BusMemorySnapshot>,String>{
@@ -23,12 +24,12 @@ impl Game<'_> {
         let stack=part.get("stack").and_then(save::item_from_nbt).filter(|s|s.item.as_ref()==id&&s.count==1).ok_or("invalid bus stack")?;
         let Tag::Compound(part)=part else{return Err("invalid bus part".into())};
         super::ae2_buses::bus_state(part)?;
-        Ok(Some(BusMemorySnapshot{index,face:face.to_owned(),id,host:(**host).clone(),part:part.clone(),incarnation:self.world.block_entities.incarnation(&key).ok_or("missing bus identity")?,name:stack.custom_name().map(str::to_owned)}))
+        Ok(Some(BusMemorySnapshot{index,face:face.to_owned(),id,host:(**host).clone(),part:part.clone(),incarnation:self.world.block_entities.incarnation(&key).ok_or("missing bus identity")?,name:stack.custom_name().map(str::to_owned),name_component:stack_name_component(&stack)}))
     }
-    fn bus_memory_commit(&mut self,pos:[i32;3],snapshot:&BusMemorySnapshot,mut part:horizon_world::nbt::Compound,name:Option<Option<String>>)->Result<(),String>{
+    fn bus_memory_commit(&mut self,pos:[i32;3],snapshot:&BusMemorySnapshot,mut part:horizon_world::nbt::Compound,name:Option<Option<Tag>>)->Result<(),String>{
         let key=(pos[0],pos[1],pos[2]);if self.world.block_entities.incarnation(&key)!=Some(snapshot.incarnation){return Err("bus host identity changed".into())}
         if part.get(&"face".into())!=Some(&Tag::String(snapshot.face.as_str().into()))||part.get(&"id".into())!=Some(&Tag::String(snapshot.id.as_str().into())){return Err("bus face changed".into())}
-        if let Some(name)=name {let mut stack=part.get(&"stack".into()).and_then(save::item_from_nbt).ok_or("invalid bus stack")?;stack.data_mut().custom_name=name;part.insert("stack".into(),save::item_to_nbt(&stack));}
+        if let Some(name)=name {let mut stack=part.get(&"stack".into()).and_then(save::item_from_nbt).ok_or("invalid bus stack")?;stack.set_custom_name_component(name);part.insert("stack".into(),save::item_to_nbt(&stack));}
         let mut next=snapshot.host.clone();let Some(Tag::List(parts))=next.config.get_mut(&"parts".into())else{return Err("missing bus parts".into())};
         let slot=parts.get_mut(snapshot.index).ok_or("missing bus face")?;
         if *slot!=Tag::Compound(snapshot.part.clone()){return Err("bus face changed".into())}
@@ -41,9 +42,11 @@ impl Game<'_> {
         let Some(mut card)=self.held().filter(|s|s.item.as_ref()=="ae2:memory_card"&&s.count==1).cloned()else{return false};
         let snapshot=match self.bus_memory_snapshot(pos,face){Ok(None)=>return false,Ok(Some(s))=>s,Err(_)=>return true};
         if self.keys.contains(&super::KeyCode::ShiftLeft){
-            if super::ae2_memory::save_bus(&mut card,&snapshot.part,snapshot.name.as_deref()).is_ok(){horizon_client::ae2_stack_identity::synchronize_tracked(&card);*self.held_mut()=Some(card);self.system_message(horizon_client::text::Text::literal("Settings saved"));}
+            if super::ae2_memory::clear(&mut card).is_err(){return true}
+            if super::ae2_memory::save_bus(&mut card,&snapshot.part,snapshot.name.as_deref()).is_ok(){publish_memory_name(&mut card,snapshot.name_component.clone());horizon_client::ae2_stack_identity::synchronize_tracked(&card);*self.held_mut()=Some(card);self.system_message(horizon_client::text::Text::literal("Settings saved"));}
             return true
         }
+        let original_card=card.clone();let card=memory_card_with_plain_name(&card);
         let saved=match super::ae2_memory::read_bus(&card,&snapshot.id){Ok(Some(v))=>v,_=>{self.system_message(horizon_client::text::Text::literal("Invalid machine"));return true}};
         if !saved.matching&&!super::ae2_memory::bus_has_components(&saved){self.system_message(horizon_client::text::Text::literal("Invalid machine"));return true}
         let found=match self.memory_tool(){Ok(v)=>v,Err(_)=>return true};let location=found.as_ref().map(|(loc,_)|*loc);let mut pocket=found.map(|(_,inv)|inv);
@@ -54,7 +57,7 @@ impl Game<'_> {
             let target=match location{ToolLocation::Inventory(i)=>inventory.get_mut(i).and_then(Option::as_mut),ToolLocation::Armor(i)=>armor.get_mut(i).and_then(Option::as_mut),ToolLocation::Offhand=>offhand.as_mut()};
             let Some(tool)=target else{return true};if pocket.store(tool).is_err(){return true}changes.changed_tracked.push(tool.clone());
         }
-        let name=if saved.matching{Some(saved.name.clone())}else{None};
+        let name=if saved.matching{Some(memory_card_name_component(&original_card,saved.name.as_deref()))}else{None};
         if self.bus_memory_commit(pos,&snapshot,part,name).is_err(){return true}
         self.inventory=inventory;self.armor=armor;self.offhand=offhand;
         for stack in changes.replaced_tracked{horizon_client::ae2_stack_identity::mark_detached_by_replacement(&stack,None);}

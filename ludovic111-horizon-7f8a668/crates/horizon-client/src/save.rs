@@ -788,7 +788,15 @@ pub fn decode_block_entity(tag: &Tag) -> Option<((i32, i32, i32), crate::contain
                     Some(t) => float(Some(t)).filter(|v| v.is_finite() && *v >= 0.0),
                 }
             };
-            m.energy = state("ae2_lab_energy", 0.0)?;
+            let energy = if m.source_energy_capacity().is_some() {
+                match tag.get("ae2_lab_energy") {
+                    None => 0.0,
+                    Some(t) => float(Some(t)).filter(|v| v.is_finite())?,
+                }
+            } else {
+                state("ae2_lab_energy", 0.0)?
+            };
+            m.set_saved_energy(energy);
             m.burn_remaining = state("ae2_lab_burn_remaining", 0.0)?;
             m.burn_rate = state("ae2_lab_burn_rate", 1.0)?;
             m.progress = state("ae2_lab_progress", 0.0)?;

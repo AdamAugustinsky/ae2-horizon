@@ -10,6 +10,7 @@ pub(super) struct EnergyPhysical {pub address:GridAddress,pub face:Option<u8>,pu
 #[derive(Clone,Debug,Default)]
 pub(super) struct EnergyObserver {
     pub lifecycle:EnergyLifecycle,
+    pub per_node_capacity:Option<f64>,
     pub physical:BTreeMap<NodeIdentity,EnergyPhysical>,
     pub passive_selector:PassiveSelector,
     pub passive_suppressed:BTreeMap<NodeIdentity,bool>,
@@ -82,7 +83,7 @@ impl EnergyObserver {
         if self.failure.is_some(){return}
         let result=change.and_then(|change|{
             let state=self.physical.get(&change.node).and_then(|p|p.emitter.clone());let mut report=None;
-            self.lifecycle.membership(change,|service,node|{
+            self.lifecycle.membership_with_capacity(change,self.per_node_capacity.unwrap_or(25.0),|service,node|{
                 if let Some(state)=state.as_ref(){service.watch(node,state.threshold as f64,node.host)?;report=Some(service.stored() as i64);}Ok(())
             }).map_err(str::to_owned)?;
             if let Some(value)=report {if let Some(physical)=self.physical.get_mut(&change.node){physical.reported=value;}}

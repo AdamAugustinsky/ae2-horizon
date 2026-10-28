@@ -56,7 +56,7 @@ impl Game<'_> {
             let Some(state)=self.ae2_cranks.get_mut(&(self.dim,pos)) else{continue};
             state.rotation-=1;state.charge+=1;state.angle=(state.angle-20).rem_euclid(360);
             let completed=state.charge>=18;if completed {state.charge-=18;}
-            if completed {if let Some(target)=target {if let Some(BlockEntity::Ae2(m))=self.world.block_entities.get_mut(&target) {if m.energy.is_finite(){m.energy=(m.energy+160.0).min(1600.0);self.world.modified.insert((target.0>>4,target.2>>4));}}}}
+            if completed {if let Some(target)=target {if let Some(BlockEntity::Ae2(m))=self.world.block_entities.get_mut(&target) {if m.energy.is_finite(){m.private_energy_insert(160.0,true);self.world.modified.insert((target.0>>4,target.2>>4));}}}}
         }
     }
 }

@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 pub mod advancements;
 #[cfg(feature = "ae2-lab")]
+pub mod ae2_components;
+#[cfg(feature = "ae2-lab")]
 pub mod ae2_powered_items;
 #[cfg(feature = "ae2-lab")]
 pub mod ae2_item_capabilities;
@@ -18,6 +20,8 @@ pub mod ae2_network_tool;
 pub mod ae2_world;
 #[cfg(feature = "ae2-lab")]
 pub mod ae2_stack_identity;
+#[cfg(feature = "ae2-lab")]
+pub mod ae2_job_status;
 pub mod ambience;
 pub mod animate_tick;
 pub mod arrows;
@@ -227,6 +231,9 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[cfg(feature = "ae2-lab")]
 pub mod ae2_cell_codec;
+
+#[cfg(feature = "ae2-lab")]
+pub mod ae2_generic_stack;
 
 #[cfg(feature = "ae2-lab")]
 pub mod ae2_meteorite;

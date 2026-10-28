@@ -409,16 +409,33 @@ impl Game<'_> {
                         model(&format!("ae2:part/{name}"),pose,None);
                     }
                 }
-                // Bake the facade's block geometry directly: item display
-                // transforms shrink cubes and do not describe facade surfaces.
+                drop(model);
+                // Resolve the actual facade block state so directional and
+                // other blockstate variants use the same model as the world.
                 for facade in &v.facades {
-                    let Some((namespace,path))=facade.block.split_once(':') else {continue};
+                    // The block-state name and item registry ID need not be
+                    // equal. Check the public material against the state
+                    // before rendering a server-provided projection.
+                    if !facade.material.is_empty() {
+                        let Some(material)=self.res.items().get(&facade.material) else {continue};
+                        let Some(block)=material.block
+                            .filter(|id| !self.res.facts().is_air(*id))
+                            .or_else(|| self.pack.assets.registry.default_state("minecraft:glass"))
+                        else {continue};
+                        let Some(expected)=self.pack.assets.registry.state(block) else {continue};
+                        if expected.name!=facade.block {continue;}
+                    }
+                    let state = horizon_world::chunk::BlockState {
+                        name: facade.block.clone(), properties: facade.properties.clone(),
+                    };
+                    let Ok(state) = self.pack.assets.registry.resolve(&state) else {continue};
                     let pose=base*glam::Mat4::from_quat(rotate(&facade.face))
                         *glam::Mat4::from_translation(glam::Vec3::new(0.,0.,-15.0/32.0))
-                        *glam::Mat4::from_scale(glam::Vec3::new(1.,1.,1./16.));
-                    model(&format!("{namespace}:block/{path}"),pose,None);
+                        *glam::Mat4::from_scale(glam::Vec3::new(1.,1.,1./16.))
+                        *glam::Mat4::from_translation(glam::Vec3::splat(-0.5));
+                    let seed = horizon_core::random::position_seed(horizon_core::position::BlockPos::new(p[0],p[1],p[2]));
+                    self.block_model_vertices(state, seed, pose, light, true, out);
                 }
-                drop(model);
                 for part in &v.parts {
                     let Some(display)=part.monitor.as_ref().filter(|_|part.online) else {continue};
                     let pose=base*glam::Mat4::from_quat(rotate(&part.face));

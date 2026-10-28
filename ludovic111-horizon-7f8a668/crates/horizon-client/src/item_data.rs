@@ -18,6 +18,9 @@ pub struct StackData {
     pub repair_cost: u32,
     /// `minecraft:custom_name` as plain text.
     pub custom_name: Option<String>,
+    /// The original structured text component when a name contains styles,
+    /// translations or children. The plain text remains the display fallback.
+    pub custom_name_component: Option<Tag>,
     /// `minecraft:potion_contents.potion`.
     pub potion: Option<Arc<str>>,
     /// `minecraft:trim`: (material, pattern).
@@ -86,6 +89,11 @@ const MODELLED: &[&str] = &[
     "minecraft:written_book_content",
 ];
 impl StackData {
+    fn effective_custom_name_component(&self) -> Option<&Tag> {
+        self.custom_name_component.as_ref().filter(|raw| {
+            read_text(raw).as_ref() == self.custom_name.as_ref()
+        })
+    }
     /// An unmodelled component's saved value.
     pub fn other(&self, id: &str) -> Option<&Tag> {
         self.other.iter().find(|(k, _)| k == id).map(|(_, v)| v)
@@ -151,6 +159,11 @@ impl ItemStack {
     }
     /// Drops an all-default component box so equal stacks compare equal.
     pub fn tidy(&mut self) {
+        if let Some(data) = self.extra.as_mut() {
+            if data.custom_name_component.is_some() && data.effective_custom_name_component().is_none() {
+                data.custom_name_component = None;
+            }
+        }
         if self.extra.as_ref().is_some_and(|d| d.is_empty()) {
             self.extra = None;
         }
@@ -219,6 +232,16 @@ impl ItemStack {
     pub fn custom_name(&self) -> Option<&str> {
         self.data().and_then(|d| d.custom_name.as_deref())
     }
+    pub fn custom_name_component(&self) -> Option<&Tag> {
+        self.data().and_then(StackData::effective_custom_name_component)
+    }
+    /// Set a native text component without flattening its serialized form.
+    pub fn set_custom_name_component(&mut self, component: Option<Tag>) {
+        let data = self.data_mut();
+        data.custom_name = component.as_ref().and_then(read_text);
+        data.custom_name_component = component.filter(|value| matches!(value, Tag::Compound(_) | Tag::List(_)));
+        self.tidy();
+    }
     /// `minecraft:item_name` in the current language (`getItemName`'s
     /// component). It stays in the patch as loaded, so a translatable name
     /// saves and reaches clients unchanged; the ominous banner's is modelled
@@ -236,7 +259,24 @@ impl ItemStack {
     }
     /// `ItemStack.isSameItemSameComponents`.
     pub fn same_item_same_components(&self, other: &Self) -> bool {
-        self.item == other.item && self.damage == other.damage && self.data() == other.data()
+        if self.item != other.item || self.damage != other.damage { return false; }
+        if self.data() == other.data() { return true; }
+        if self.data().and_then(|d| d.custom_name_component.as_ref()).is_none()
+            && other.data().and_then(|d| d.custom_name_component.as_ref()).is_none() {
+            return false;
+        }
+        // Direct edits of the public display string can stale the retained
+        // structured value; compare the representation that will be saved.
+        let clean = |stack: &Self| {
+            let mut data = stack.data().cloned();
+            if let Some(data) = data.as_mut() {
+                if data.custom_name_component.is_some() && data.effective_custom_name_component().is_none() {
+                    data.custom_name_component = None;
+                }
+            }
+            data.filter(|data| !data.is_empty())
+        };
+        clean(self) == clean(other)
     }
     /// `ItemStack.transmuteCopy`: another item keeping every component.
     pub fn transmute(&self, item: &str, count: u32) -> Self {
@@ -320,7 +360,7 @@ fn read_text(t: &Tag) -> Option<String> {
         // A component's root `text` may be empty with the visible words in
         // `extra` (every legacy display name ViaVersion produces looks like
         // this), so flatten the whole component instead of reading one key.
-        Tag::Compound(_) => Some(crate::entity_nbt::name_text(t).plain()),
+        Tag::Compound(_) | Tag::List(_) => Some(crate::entity_nbt::name_text(t).plain()),
         _ => None,
     }
 }
@@ -537,7 +577,8 @@ pub fn components_tag(damage: u32, data: Option<&StackData>) -> Option<Tag> {
             entries.push(("minecraft:repair_cost", Tag::Int(d.repair_cost as i32)));
         }
         if let Some(name) = &d.custom_name {
-            entries.push(("minecraft:custom_name", Tag::String(name.as_str().into())));
+            entries.push(("minecraft:custom_name", d.effective_custom_name_component().cloned()
+                .unwrap_or_else(|| Tag::String(name.as_str().into()))));
         }
         if let Some(potion) = &d.potion {
             entries.push((
@@ -741,6 +782,8 @@ pub fn decode_components(components: Option<&Tag>) -> (u32, Option<Box<StackData
             .unwrap_or(0)
             .max(0) as u32,
         custom_name: c.get("minecraft:custom_name").and_then(read_text),
+        custom_name_component: c.get("minecraft:custom_name")
+            .filter(|value| matches!(value, Tag::Compound(_) | Tag::List(_))).cloned(),
         potion,
         map_id: c.get("minecraft:map_id").and_then(int).map(|v| v as i32),
         banner_patterns: crate::banner::layers_from_nbt(c.get("minecraft:banner_patterns")),
@@ -887,6 +930,8 @@ pub fn command_components(text: &str) -> Result<Tag, String> {
             } else {
                 format!("minecraft:{key}")
             };
+            #[cfg(feature = "ae2-lab")]
+            let tag = if crate::ae2_components::is_known(&id) { crate::ae2_components::normalize(&id, tag)? } else { tag };
             entries.insert(JavaString::from(id.as_str()), tag);
             rest = &value[used..];
         }
@@ -1010,6 +1055,33 @@ mod tests {
         bottle.data_mut().ominous_amplifier = Some(3);
         let (_, back) = decode_components(encode_components(&bottle).as_ref());
         assert_eq!(back.unwrap().ominous_amplifier, Some(3));
+    }
+    #[test]
+    fn structured_custom_name_roundtrips_and_respects_later_plain_edits() {
+        let structured = Tag::compound([
+            ("text", Tag::String("Hello".into())),
+            ("color", Tag::String("red".into())),
+            ("extra", Tag::List(vec![Tag::compound([("translate",Tag::String("item.minecraft.diamond".into()))])])),
+        ]);
+        let mut item = ItemStack::new("minecraft:diamond", 1);
+        item.set_custom_name_component(Some(structured.clone()));
+        let encoded = encode_components(&item).unwrap();
+        assert_eq!(encoded.get("minecraft:custom_name"), Some(&structured));
+        let (_, decoded) = decode_components(Some(&encoded));
+        let mut restored = ItemStack::new("minecraft:diamond", 1);
+        restored.extra = decoded;
+        assert_eq!(encode_components(&restored).unwrap().get("minecraft:custom_name"), Some(&structured));
+        assert!(item.same_item_same_components(&restored));
+        let mut plain = ItemStack::new("minecraft:diamond", 1);
+        plain.data_mut().custom_name = item.custom_name().map(str::to_owned);
+        assert!(!item.same_item_same_components(&plain), "styled and plain names have different components");
+        restored.data_mut().custom_name = Some("Changed".into());
+        let mut changed = ItemStack::new("minecraft:diamond", 1);
+        changed.data_mut().custom_name = Some("Changed".into());
+        assert!(restored.same_item_same_components(&changed));
+        assert_eq!(encode_components(&restored).unwrap().get("minecraft:custom_name"), Some(&Tag::String("Changed".into())));
+        restored.set_custom_name_component(None);
+        assert!(encode_components(&restored).is_none());
     }
     #[test]
     fn canonical_stack_roundtrips_namespaced_components() {

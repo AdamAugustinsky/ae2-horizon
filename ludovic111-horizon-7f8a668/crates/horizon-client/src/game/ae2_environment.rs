@@ -265,7 +265,7 @@ impl Game<'_> {
                 continue;
             }
             if machine.energy > 0.0 {
-                machine.energy = (machine.energy - 8.0*elapsed as f64).max(0.0);
+                machine.private_energy_extract(8.0 * elapsed as f64, true);
                 self.world.modified.insert((p.0 >> 4, p.2 >> 4));
             }
             for d in [
@@ -276,7 +276,25 @@ impl Game<'_> {
                 [-1, 0, 0],
                 [1, 0, 0],
             ] {
-                self.ae2_random_tick_certus([p.0 + d[0], p.1 + d[1], p.2 + d[2]]);
+                let target = [p.0 + d[0], p.1 + d[1], p.2 + d[2]];
+                if !self.world.loaded(target[0], target[2]) {
+                    continue;
+                }
+                let state = self.world.block(target[0], target[1], target[2]);
+                let name = &self.res.facts().get(state).name;
+                let eligible = self.res.items().block_tags.get("ae2:growth_acceleratable")
+                    .is_some_and(|tag| tag.contains(name.as_ref()));
+                if !eligible {
+                    continue;
+                }
+                // GrowthAcceleratorBlockEntity.onTick calls the block's own
+                // randomTick directly (including datapack-added tag members),
+                // without an additional random fluid tick.
+                let pos = horizon_core::position::BlockPos::new(target[0], target[1], target[2]);
+                self.with_level(|b, level, ticks| b.random_tick_block(level, ticks, pos));
+                if let Err(error) = self.process_level_events() {
+                    log::warn!("AE2 growth accelerator random tick: {error}");
+                }
             }
         }
     }

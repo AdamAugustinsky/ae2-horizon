@@ -134,7 +134,7 @@ impl super::Game<'_> {
             if dim != self.dim { continue; }
             self.world.block_entities.record_ae2_me_link(pos, change.a, change.b, change.added);
         }
-        if !changes.is_empty() { let _ = self.ae2_sync_events(); }
+        if !changes.is_empty() { let _ = self.ae2_apply_anchor_callbacks(); }
     }
 }
 #[cfg(test)]

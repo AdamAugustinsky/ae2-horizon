@@ -322,12 +322,15 @@ impl Game<'_> {
                             self.ae2_provider_raw_read_local(key, tag.get("Items").cloned());
                         } else {
                             if touches_ae2 {
-                                // Changed node data can trigger destroy/re-ready
-                                // callbacks which this generic replacement does
-                                // not yet model for the provider registry.
-                                self.ae2_provider_events_fault("unsupported AE2 data-load node lifecycle".into());
+                                // This native /data branch replaces the entity.
+                                // Deliver its actual lifecycle rather than
+                                // permanently poisoning unrelated providers.
+                                self.world.block_entities.replace_from_data(key, new, &tag);
+                                let state = self.world.block(p[0], p[1], p[2]);
+                                self.world.block_entities.record_ae2_loaded_state(key, state.0);
+                            } else {
+                                self.world.block_entities.insert(key, new);
                             }
-                            self.world.block_entities.insert(key, new);
                         }
                     }
                     #[cfg(not(feature = "ae2-lab"))]

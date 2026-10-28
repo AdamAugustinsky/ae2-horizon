@@ -2,6 +2,7 @@
 // Copyright (c) 2013-2014 AlgorithmX2 and the AE2 contributors. LGPL-3.0-or-later; see LICENSE.
 //! A deliberately bounded network simulation. See README for fidelity and host responsibilities.
 pub mod me_tick;
+mod pathing;
 pub mod physical_events;
 pub mod quantum_registry;
 pub mod ready_queue;
@@ -588,6 +589,10 @@ pub struct Network {
     /// different multipart families can physically face one another.
     #[serde(skip)]
     pub external_ports: BTreeMap<(Pos, u8), Pos>,
+    /// Validated live GridNode connection order; identities include attached
+    /// parts and virtual outer nodes, independently of coordinate ordering.
+    #[serde(skip)]
+    pub observed_connection_order: BTreeMap<NodeIdentity, Vec<NodeIdentity>>,
     #[serde(skip)]
     pub committed_channels: Option<CommittedChannels>,
 }
@@ -743,6 +748,34 @@ impl Network {
         }
         self.energy_links
             .insert(if a < b { (a, b) } else { (b, a) });
+        Ok(())
+    }
+    pub fn record_connection_order(&mut self, ordered: &service_events::OrderedServices) -> Result<(), &'static str> {
+        let mut actual = BTreeMap::<NodeIdentity,BTreeSet<NodeIdentity>>::new();
+        for (pos,device) in &self.nodes {
+            let host=*self.node_identities.get(pos).ok_or("pathing host identity missing")?;
+            let peers=actual.entry(host).or_default();
+            for other in self.neighbours(*pos) {
+                peers.insert(*self.node_identities.get(&other).ok_or("pathing peer identity missing")?);
+            }
+            for part in &device.attached {
+                let id=*self.part_identities.get(&(*pos,part.face)).ok_or("pathing part identity missing")?;
+                peers.insert(id);
+            }
+            for part in &device.attached {
+                let id=self.part_identities[&(*pos,part.face)];
+                actual.entry(id).or_default().insert(host);
+            }
+        }
+        let mut observed=BTreeMap::new();
+        for (id,peers) in actual {
+            let connections=ordered.connections(id);
+            if connections.iter().copied().collect::<BTreeSet<_>>() != peers {
+                return Err("ordered pathing edges differ from live graph");
+            }
+            observed.insert(id,connections);
+        }
+        self.observed_connection_order=observed;
         Ok(())
     }
     fn neighbours(&self, p: Pos) -> Vec<Pos> {
@@ -990,7 +1023,6 @@ impl Network {
                 .max_by_key(|mode| mode.ad_hoc_limit())
                 .unwrap_or(self.default_channel_mode);
             let energy = out.power_components[power_component].energy;
-            let mut paths: BTreeMap<Pos, Vec<Pos>> = BTreeMap::new();
             let demands: Vec<_> = group
                 .iter()
                 .copied()
@@ -1023,7 +1055,7 @@ impl Network {
                         .any(|part| part.requires_channel && part.compressed)
                 });
             let mut assigned_groups = BTreeSet::new();
-            let mut channel_paths = Vec::<Vec<Pos>>::new();
+            let mut controller_channel_blocks = 0usize;
             let mut used: BTreeMap<Pos, usize> = BTreeMap::new();
             let mut assigned = BTreeSet::new();
             let mut assigned_parts = BTreeSet::new();
@@ -1049,96 +1081,12 @@ impl Network {
                     }
                 }
                 ControllerState::Online => {
-                    let roots: Vec<_> = group
-                        .iter()
-                        .copied()
-                        .filter(|p| self.nodes[p].kind == DeviceKind::Controller)
-                        .collect();
-                    // AE2 processes dense paths before preferred normal cables, then devices.
-                    // Each queue only feeds itself or a lower-priority queue.
-                    let mut queues: [VecDeque<Pos>; 3] = Default::default();
-                    for p in roots {
-                        paths.insert(p, vec![p]);
-                        queues[0].push_back(p);
-                    }
-                    for level in 0..3 {
-                        while let Some(p) = queues[level].pop_front() {
-                            // Parts are independent demand nodes attached to this
-                            // cable and use each cable on its controller path.
-                            for part in &self.nodes[&p].attached {
-                                if !part.requires_channel {
-                                    continue;
-                                }
-                                let path = &paths[&p];
-                                if (!part.compressed
-                                    || path.iter().all(|q| !self.nodes[q].cannot_carry_compressed))
-                                    && path
-                                        .iter()
-                                        .filter(|q| self.nodes[q].kind != DeviceKind::Controller)
-                                        .all(|q| {
-                                            used.get(q).copied().unwrap_or(0)
-                                                < channel_mode.capacity(self.nodes[q].capacity())
-                                        })
-                                {
-                                    assigned_parts.insert((p, part.face));
-                                    for q in path
-                                        .iter()
-                                        .filter(|q| self.nodes[q].kind != DeviceKind::Controller)
-                                    {
-                                        *used.entry(*q).or_default() += 1;
-                                    }
-                                }
-                            }
-                            for n in self.neighbours(p) {
-                                if !self.nodes.contains_key(&n)
-                                    || !self.connects(p, n)
-                                    || paths.contains_key(&n)
-                                {
-                                    continue;
-                                }
-                                let mut path = paths[&p].clone();
-                                path.push(n);
-                                let kind = self.nodes[&n].kind;
-                                if self.nodes[&n].requires_channel()
-                                    && !assigned_groups.contains(&demand_key(n))
-                                    && path
-                                        .iter()
-                                        .filter(|q| self.nodes[q].kind != DeviceKind::Controller)
-                                        .all(|q| {
-                                            used.get(q).copied().unwrap_or(0)
-                                                < channel_mode.capacity(self.nodes[q].capacity())
-                                        })
-                                {
-                                    let group_key = demand_key(n);
-                                    assigned_groups.insert(group_key);
-                                    assigned.extend(
-                                        demands
-                                            .iter()
-                                            .copied()
-                                            .filter(|p| demand_key(*p) == group_key),
-                                    );
-                                    channel_paths.push(path.clone());
-                                    for q in path
-                                        .iter()
-                                        .filter(|q| self.nodes[q].kind != DeviceKind::Controller)
-                                    {
-                                        *used.entry(*q).or_default() += 1;
-                                    }
-                                }
-                                paths.insert(n, path);
-                                let priority = if kind.carries() {
-                                    if self.nodes[&n].capacity() == 32 {
-                                        0
-                                    } else {
-                                        1
-                                    }
-                                } else {
-                                    2
-                                };
-                                queues[level.max(priority)].push_back(n);
-                            }
-                        }
-                    }
+                    let allocation = pathing::controller(self, &group, channel_mode);
+                    used = allocation.used;
+                    assigned = allocation.hosts;
+                    assigned_parts = allocation.parts;
+                    assigned_groups = allocation.groups;
+                    controller_channel_blocks = allocation.channel_blocks;
                 }
                 _ => {}
             }
@@ -1153,14 +1101,7 @@ impl Network {
                         .sum::<usize>())
                     * (assigned_groups.len() + assigned_parts.len())
             } else {
-                channel_paths
-                    .iter()
-                    .map(|path| path.len().saturating_sub(1) * 2)
-                    .sum::<usize>()
-                    + assigned_parts
-                        .iter()
-                        .map(|(p, _)| paths[p].len() * 2)
-                        .sum::<usize>()
+                controller_channel_blocks
             };
             let idle: f64 = group
                 .iter()
@@ -1410,6 +1351,35 @@ mod tests {
         assert!(n.analyze().unwrap().nodes[&p(2)].channel);
     }
     #[test]
+    fn observed_connections_control_channel_bottleneck_ties() {
+        let p=|x|Pos{x,y:0,z:0};
+        let id=|x|NodeIdentity{host:x as u64,part:None,outer:false};
+        let mut n=Network::default();
+        n.nodes.insert(p(0),Device::new(DeviceKind::Controller));
+        n.nodes.insert(p(1),Device::new(DeviceKind::GlassCable));
+        n.nodes.insert(p(-1),Device::new(DeviceKind::CreativeEnergyCell));
+        for x in 10..19 {n.nodes.insert(p(x*10),Device::new(DeviceKind::Drive));n.connect(p(1),p(x*10)).unwrap();}
+        let mut order=service_events::OrderedServices::default();
+        for (index,pos) in n.nodes.keys().copied().enumerate(){
+            let node=id(index+1); n.node_identities.insert(pos,node);order.add_node(node,None).unwrap();order.ensure_grid(node).unwrap();
+        }
+        let identities=n.node_identities.clone();
+        let identity=|pos|identities[&p(pos)];
+        order.connect(identity(0),identity(1)).unwrap();
+        order.connect(identity(0),identity(-1)).unwrap();
+        for x in (10..19).rev(){order.connect(identity(1),identity(x*10)).unwrap();}
+        n.record_connection_order(&order).unwrap();
+        let observed=n.analyze().unwrap();
+        assert!(!observed.nodes[&p(100)].channel);
+        assert!(observed.nodes[&p(180)].channel);
+        n.observed_connection_order.clear();
+        let coordinates=n.analyze().unwrap();
+        assert!(coordinates.nodes[&p(100)].channel);
+        assert!(!coordinates.nodes[&p(180)].channel);
+        order.disconnect(identity(1),identity(100)).unwrap();
+        assert_eq!(n.record_connection_order(&order),Err("ordered pathing edges differ from live graph"));
+    }
+    #[test]
     fn forced_mode_follows_each_grid_node_and_service_can_unlock() {
         let p = |x| Pos { x, y: 0, z: 0 };
         let id = |host| NodeIdentity {
@@ -1503,6 +1473,10 @@ mod tests {
         assert!(a.nodes[&p(1)].online);
         assert_eq!(a.components[0].channels_in_use, 1);
         assert_eq!(a.nodes[&p(1)].channels_used, 1);
+        // PathingCalculation.propagateAssignments increments every other
+        // member after the consuming member's path has been charged.
+        assert_eq!(a.nodes[&p(10)].channels_used, 1);
+        assert!((a.components[0].idle_per_tick - (13.0 + 2.0 / 128.0)).abs() < 1e-12);
         n.nodes.remove(&p(0));
         let mut power = Device::new(DeviceKind::CreativeEnergyCell);
         power.faces = 63;

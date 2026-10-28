@@ -173,7 +173,7 @@ pub(super) fn ae2_physical_drops(machine: &horizon_client::ae2_world::Machine) -
                 if !matches!(face.as_str(),"down"|"up"|"north"|"south"|"west"|"east") || faces.contains(&face) {continue;}
                 let Some(stack)=facade.get("stack").filter(|n|n.get("count")==Some(&Tag::Int(1))).and_then(horizon_client::save::item_from_nbt) else {continue};
                 if stack.count!=1 || stack.item.as_ref()!="ae2:facade" {continue;}
-                if !matches!(stack.data().and_then(|d|d.other("minecraft:custom_data")).and_then(|t|t.get("ae2:facade_item")),Some(Tag::String(_))) {continue;}
+                if horizon_client::item_tooltip::ae2_facade_texture(&stack).is_none() {continue;}
                 faces.insert(face);
                 out.push(stack);
             }
@@ -909,6 +909,10 @@ mod tests {
             Tag::compound([("face",Tag::String("north".into())),("stack",save::item_to_nbt(&facade))]),
         ]));
         assert_eq!(ae2_physical_drops(&cable).iter().filter(|s|s.item.as_ref()=="ae2:facade").cloned().collect::<Vec<_>>(),vec![facade]);
+        let mut source_facade=ItemStack::new("ae2:facade",1);
+        source_facade.data_mut().set_other("ae2:facade_item",Some(Tag::String("minecraft:stone".into())));
+        cable.config.insert("facades".into(),Tag::List(vec![Tag::compound([("face",Tag::String("south".into())),("stack",save::item_to_nbt(&source_facade))])]));
+        assert_eq!(ae2_physical_drops(&cable).iter().filter(|s|s.item.as_ref()=="ae2:facade").cloned().collect::<Vec<_>>(),vec![source_facade]);
         let mut nested=Machine::new(MachineKind::CableBus);
         let physical=ItemStack::new("minecraft:iron_ingot",3);
         let sending=ItemStack::new("minecraft:diamond",2);

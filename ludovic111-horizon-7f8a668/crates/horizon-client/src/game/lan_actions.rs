@@ -1042,6 +1042,17 @@ impl Game<'_> {
                         if !face.is_empty() && self.as_guest(host,conn,|g|g.ae2_try_monitor_attack((a.pos[0],a.pos[1],a.pos[2]),face)).unwrap_or(false) {
                             host.hub.send_inventory(gi);return;
                         }
+                        let facade = self.as_guest(host, conn, |g| {
+                            g.chat_capture = Some(Vec::new());
+                            let used = g.with_hand(Hand::Main, |g| g.ae2_try_facade_cycle(a.pos, direction(i32::from(a.direction)), false));
+                            (used, g.chat_capture.take().unwrap_or_default())
+                        });
+                        if let Some((true, lines)) = facade {
+                            for line in lines { host.hub.send_to(conn, &C::SystemChat(play::SystemChat {
+                                content: horizon_client::lan::data::component_nbt(&line.component()), overlay: true,
+                            })); }
+                            host.hub.send_inventory(gi); return;
+                        }
                     }
                     let face = direction(i32::from(a.direction));
                     let play = host.play.entry(conn).or_default();
@@ -1258,16 +1269,20 @@ impl Game<'_> {
                         4 => "west",
                         _ => "east",
                     };
-                    if self
-                        .as_guest(host, conn, |g| {
-                            g.with_hand(hand, |g| {
-                                g.ae2_try_remove_facade(p.pos, face)
-                                    || g.ae2_try_remove_part(p.pos,face)
-                                    || g.ae2_try_facade(p.pos, face)
-                            })
-                        })
-                        .unwrap_or(false)
-                    {
+                    let facade = self.as_guest(host, conn, |g| {
+                        g.chat_capture = Some(Vec::new());
+                        let used = g.with_hand(hand, |g| {
+                            g.ae2_try_remove_facade(p.pos, face)
+                                || g.ae2_try_facade_cycle(p.pos, face, true)
+                                || g.ae2_try_remove_part(p.pos,face)
+                                || g.ae2_try_facade(p.pos, face)
+                        });
+                        (used, g.chat_capture.take().unwrap_or_default())
+                    });
+                    if let Some((true, lines)) = facade {
+                        for line in lines { host.hub.send_to(conn, &C::SystemChat(play::SystemChat {
+                            content: horizon_client::lan::data::component_nbt(&line.component()), overlay: true,
+                        })); }
                         host.hub.send_inventory(gi);
                         return;
                     }
@@ -1749,6 +1764,14 @@ impl Game<'_> {
             #[cfg(feature = "ae2-lab")]
             S::CustomPayload(p) if p.channel == "ae2:mouse_wheel" => {
                 self.lan_ae2_item_wheel(host, conn, &p.data);
+            }
+            #[cfg(feature = "ae2-lab")]
+            S::CustomPayload(p) if p.channel == "ae2:clear_encoding" => {
+                self.lan_clear_encoding(host,conn,&p.data);
+            }
+            #[cfg(feature = "ae2-lab")]
+            S::CustomPayload(p) if p.channel == "ae2:pinned_keys" => {
+                self.lan_ae2_pinned_keys(host,conn,&p.data);
             }
             S::CustomPayload(p) if p.channel == horizon_protocol::quiet::CHANNEL => {
                 self.guest_quiet_commands(host, conn, &p.data)

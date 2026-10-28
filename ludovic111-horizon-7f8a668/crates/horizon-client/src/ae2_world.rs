@@ -192,6 +192,9 @@ pub struct Machine {
     /// Real installed cards; never synthetic settings or virtual display slots.
     pub upgrades: Vec<Option<ItemStack>>,
     pub energy: f64,
+    /// MEChestBlockEntity captures its buffer maximum in its constructor. This
+    /// runtime-only value is rebuilt from configuration when the entity loads.
+    pub chest_power_capacity: Option<f64>,
     pub burn_remaining: f64,
     pub burn_rate: f64,
     pub progress: f64,
@@ -204,11 +207,63 @@ impl Machine {
             slots: vec![None; kind.physical_slots()],
             upgrades: vec![None; kind.upgrade_slots()],
             energy: 0.0,
+            chest_power_capacity: (kind == MachineKind::Chest)
+                .then(|| (500.0 * crate::ae2_common_config::gameplay().usage_multiplier)
+                    .min(ae2_machines_core::stored_energy::MAX_MAXIMUM)),
             burn_remaining: 0.0,
             burn_rate: 1.0,
             progress: 0.0,
             config: Compound::new(),
         }
+    }
+    /// Private AEBasePoweredBlockEntity buffer maximum, fixed at construction.
+    pub fn private_power_capacity(&self) -> Option<f64> {
+        match self.kind {
+            MachineKind::Inscriber | MachineKind::Charger | MachineKind::GrowthAccelerator => Some(1600.0),
+            MachineKind::Chest => self.chest_power_capacity,
+            _ => None,
+        }
+    }
+    pub fn set_private_energy(&mut self, amount: f64) {
+        if let Some(maximum) = self.private_power_capacity() {
+            let mut stored = ae2_machines_core::stored_energy::StoredEnergy::new(self.energy, maximum);
+            stored.set_stored(amount);
+            self.energy = stored.stored();
+        }
+    }
+    /// The powered machine and energy-cell source classes use setStored when
+    /// their saved block entity is loaded. Other machine state is untouched.
+    pub fn source_energy_capacity(&self) -> Option<f64> {
+        self.private_power_capacity().or(match self.kind {
+            MachineKind::Controller => Some(8000.0),
+            MachineKind::EnergyAcceptor => Some(0.0),
+            MachineKind::EnergyCell => Some(200_000.0),
+            MachineKind::DenseEnergyCell => Some(1_600_000.0),
+            _ => None,
+        })
+    }
+    pub fn set_saved_energy(&mut self, amount: f64) {
+        if let Some(maximum) = self.source_energy_capacity() {
+            let mut stored = ae2_machines_core::stored_energy::StoredEnergy::new(0.0, maximum);
+            stored.set_stored(amount);
+            self.energy = stored.stored();
+        } else {
+            self.energy = amount;
+        }
+    }
+    pub fn private_energy_insert(&mut self, amount: f64, commit: bool) -> f64 {
+        let Some(maximum) = self.private_power_capacity() else { return 0.0; };
+        let mut stored = ae2_machines_core::stored_energy::StoredEnergy::new(self.energy, maximum);
+        let accepted = stored.insert(amount, commit);
+        if commit { self.energy = stored.stored(); }
+        accepted
+    }
+    pub fn private_energy_extract(&mut self, amount: f64, commit: bool) -> f64 {
+        let Some(maximum) = self.private_power_capacity() else { return 0.0; };
+        let mut stored = ae2_machines_core::stored_energy::StoredEnergy::new(self.energy, maximum);
+        let extracted = stored.extract(amount, commit);
+        if commit { self.energy = stored.stored(); }
+        extracted
     }
     /// Real owned inventory, including crafting CPU escrow. Job metadata and
     /// terminal listings are virtual and must never be emitted as drops.
@@ -287,6 +342,44 @@ mod tests {
     use crate::{containers::BlockEntity, save};
     use horizon_world::nbt::Tag;
     use std::sync::Arc;
+    #[test]
+    fn chest_constructor_capacity_is_runtime_state_not_saved_nbt() {
+        let expected = Machine::new(MachineKind::Chest).chest_power_capacity.unwrap();
+        let mut chest = Machine::new(MachineKind::Chest);
+        chest.chest_power_capacity = Some(expected + 17.0);
+        chest.energy = 42.0;
+        let entity = BlockEntity::Ae2(Box::new(chest));
+        let nbt = save::encode_block_entity((0, 0, 0), &entity, "ae2:chest");
+        let (_, BlockEntity::Ae2(restored)) = save::decode_block_entity(&nbt).unwrap() else {
+            panic!("expected chest")
+        };
+        assert_eq!(restored.energy, 42.0);
+        assert_eq!(restored.chest_power_capacity, Some(expected));
+    }
+    #[test]
+    fn saved_powered_block_and_cell_use_source_stored_energy_bounds() {
+        use ae2_machines_core::stored_energy::MIN_AMOUNT;
+        let mut charger = Machine::new(MachineKind::Charger);
+        charger.set_saved_energy(MIN_AMOUNT / 2.0);
+        assert_eq!(charger.energy, 0.0);
+        assert_eq!(charger.private_energy_insert(MIN_AMOUNT / 2.0, true), 0.0);
+        assert_eq!(charger.private_energy_insert(MIN_AMOUNT, false), MIN_AMOUNT);
+        assert_eq!(charger.energy, 0.0);
+        assert_eq!(charger.private_energy_insert(MIN_AMOUNT, true), MIN_AMOUNT);
+        assert_eq!(charger.energy, MIN_AMOUNT);
+        charger.set_saved_energy(1601.0);
+        assert_eq!(charger.energy, 1600.0);
+        let mut cell = Machine::new(MachineKind::EnergyCell);
+        cell.set_saved_energy(200_001.0);
+        assert_eq!(cell.energy, 200_000.0);
+        cell.set_saved_energy(MIN_AMOUNT / 2.0);
+        assert_eq!(cell.energy, 0.0);
+        cell.set_saved_energy(-3.0);
+        assert_eq!(cell.energy, 0.0);
+        let mut other = Machine::new(MachineKind::VibrationChamber);
+        other.set_saved_energy(MIN_AMOUNT / 2.0);
+        assert_eq!(other.energy, MIN_AMOUNT / 2.0);
+    }
     #[test]
     fn debug_item_generator_persists_filter_but_never_persists_or_drops_generated_stacks() {
         let mut machine = Machine::new(MachineKind::DebugItemGenerator);

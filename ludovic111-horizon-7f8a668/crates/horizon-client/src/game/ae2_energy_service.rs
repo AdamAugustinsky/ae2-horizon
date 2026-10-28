@@ -62,6 +62,14 @@ impl EnergyService {
         Ok(Self{per_node_capacity,local_identity_order,..Self::default()})
     }
     pub fn local(&self)->f64{self.local}
+    /// GridEnergyStorage updates its maximum when node membership changes.
+    pub fn reconfigure_node_capacity(&mut self, per_node_capacity:f64)->Result<(),&'static str>{
+        if !per_node_capacity.is_finite() || !(1.0..=1_000_000.0).contains(&per_node_capacity) {return Err("invalid grid storage per node")}
+        self.per_node_capacity=per_node_capacity;
+        self.local=self.local.min(self.local_capacity());
+        self.update_local_flags();
+        Ok(())
+    }
     pub fn nodes(&self)->usize{self.members.len()}
     pub fn local_capacity(&self)->f64{(self.per_node_capacity*self.members.len() as f64).min(CREATIVE_STORED)}
     pub fn maximum(&self)->f64{self.local_capacity()+self.stores.values().filter(|s|s.can_extract).map(|s|s.capacity).sum::<f64>()}

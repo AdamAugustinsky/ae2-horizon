@@ -921,6 +921,8 @@ impl Game<'_> {
         let Some(mut host) = self.lan.take() else {
             return;
         };
+        #[cfg(feature = "ae2-lab")]
+        { self.ae2_lan_active = true; }
         // What the tick sends a guest goes to its connection at the end.
         let holding = lan::Holding::start();
         // The host's own commands' (and command blocks') players moving
@@ -1120,6 +1122,10 @@ impl Game<'_> {
         self.ae2_compass_sync(&host);
         #[cfg(feature = "ae2-lab")]
         self.ae2_flush_fx(&host);
+        #[cfg(feature = "ae2-lab")]
+        self.ae2_flush_job_status(&host);
+        #[cfg(feature = "ae2-lab")]
+        { self.ae2_lan_active = false; }
         drop(holding);
         lan::flush_all(host.hub.guests.iter().map(|g| &g.sender));
         self.lan = Some(host);

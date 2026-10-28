@@ -107,6 +107,29 @@ pub fn encode(slots: &[Option<ItemStack>]) -> Result<Vec<Tag>, String> {
         })
         .collect()
 }
+/// ItemContainerContents.CODEC stores sparse `{slot, item}` compounds.
+pub fn decode_source(cards: &[Tag], max: usize) -> Result<Vec<Option<ItemStack>>, String> {
+    let mut slots = vec![None; max];
+    for entry in cards {
+        let Some(Tag::Int(index)) = entry.get("slot") else { return Err("invalid source upgrade slot".into()); };
+        let index = usize::try_from(*index).map_err(|_| "invalid source upgrade slot")?;
+        let target = slots.get_mut(index).ok_or("source upgrade slot outside inventory")?;
+        if target.is_some() { return Err("duplicate source upgrade slot".into()); }
+        let tag=entry.get("item").ok_or("invalid source upgrade item")?;
+        if !matches!(tag.get("count"),None|Some(Tag::Byte(1))|Some(Tag::Short(1))|Some(Tag::Int(1))|Some(Tag::Long(1))) {return Err("invalid source upgrade count".into());}
+        let item = save::item_from_nbt(tag).ok_or("invalid source upgrade item")?;
+        if item.count != 1 { return Err("stacked source upgrade".into()); }
+        *target = Some(item);
+    }
+    Ok(slots)
+}
+pub fn encode_source(slots: &[Option<ItemStack>]) -> Result<Vec<Tag>, String> {
+    slots.iter().enumerate().filter_map(|(slot,item)|item.as_ref().map(|item|(slot,item)))
+        .map(|(slot,item)| {
+            if item.count != 1 { return Err("stacked source upgrade".into()); }
+            Ok(Tag::compound([("slot",Tag::Int(slot as i32)),("item",save::item_to_nbt(item))]))
+        }).collect()
+}
 #[derive(Clone, Debug)]
 pub struct Inventory {
     owner: String,
@@ -123,7 +146,10 @@ impl Inventory {
             Some(Tag::Compound(map)) => map.clone(),
             _ => return Err("invalid upgrade owner custom data".into()),
         };
-        let slots = if stack.item.starts_with("ae2:wireless_") {
+        let slots = if let Some(source) = stack.data().and_then(|data|data.other("ae2:upgrades")) {
+            let Tag::List(cards) = source else { return Err("invalid source upgrades component".into()); };
+            decode_source(cards,max)?
+        } else if stack.item.starts_with("ae2:wireless_") {
             match custom.get(&"ae2_wireless_upgrades".into()) {
                 None => vec![None; max],
                 Some(Tag::List(cards)) => decode(cards, max)?,
@@ -187,6 +213,7 @@ impl Inventory {
             return Err("wrong item-upgrade owner".into());
         }
         self.validate()?;
+        let source_cards = crate::ae2_components::normalize("ae2:upgrades",Tag::List(encode_source(&self.slots)?))?;
         let mut custom = match stack.data().and_then(|d| d.other("minecraft:custom_data")) {
             None => Compound::new(),
             Some(Tag::Compound(map)) => map.clone(),
@@ -225,38 +252,56 @@ impl Inventory {
         } else {
             None
         };
+        let mut capacity_component = None;
+        let mut storage_component_change = None;
         if let Some((base, maximum, key)) = power {
             if (maximum - base).abs() < 0.0001 {
                 custom.remove(&"ae2:energy_capacity".into());
             } else {
                 custom.insert("ae2:energy_capacity".into(), Tag::Double(maximum.to_bits()));
+                capacity_component = Some(Tag::Double(maximum.to_bits()));
             }
-            if let Some(value) = custom.get(&key.into()) {
-                let Tag::Double(bits) = value else {
-                    return Err("invalid stored item energy".into());
-                };
-                let current = f64::from_bits(*bits);
-                if !current.is_finite() || current < 0.0 {
-                    return Err("invalid stored item energy".into());
-                }
-                if current > maximum {
-                    if maximum < 0.0001 {
-                        custom.remove(&key.into());
-                    } else {
-                        custom.insert(key.into(), Tag::Double(maximum.to_bits()));
-                    }
-                }
+            let current = crate::ae2_powered_items::component_power_value(stack, "ae2:stored_energy", key, 0.0)?;
+            let next = current.min(maximum);
+            if current > maximum || stack.data().and_then(|data|data.other("ae2:stored_energy")).is_some() {
+                if next < 0.0001 { custom.remove(&key.into()); }
+                else { custom.insert(key.into(), Tag::Double(next.to_bits())); }
+                if current > maximum { storage_component_change = Some((next >= 0.0001).then(|| Tag::Double(next.to_bits()))); }
             }
         }
         stack
             .data_mut()
             .set_other("minecraft:custom_data", Some(Tag::Compound(custom)));
+        stack.data_mut().set_other("ae2:upgrades", Some(source_cards));
+        if power.is_some() {
+            stack.data_mut().set_other("ae2:energy_capacity", capacity_component);
+        }
+        if let Some(value) = storage_component_change {
+            stack.data_mut().set_other("ae2:stored_energy", value);
+        }
         Ok(())
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_upgrade_slots_override_legacy_and_roundtrip_physical_components() {
+        let mut owner=ItemStack::new("ae2:matter_cannon",1);
+        let mut card=ItemStack::new("ae2:energy_card",1);card.data_mut().custom_name=Some("Kept card".into());
+        owner.data_mut().set_other("ae2:upgrades",Some(Tag::List(vec![Tag::compound([("slot",Tag::Int(2)),("item",save::item_to_nbt(&card))])])));
+        owner.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2_cell_settings",Tag::compound([("upgrades",Tag::List(vec![])),("filters",Tag::List(vec![]))]))])));
+        owner.data_mut().set_other("ae2:stored_energy",Some(Tag::Double(200_000.0f64.to_bits())));
+        let mut upgrades=Inventory::read(&owner).unwrap();assert_eq!(upgrades.slots[2],Some(card.clone()));
+        upgrades.store(&mut owner).unwrap();
+        let reloaded=save::item_from_nbt(&save::item_to_nbt(&owner)).unwrap();
+        assert_eq!(Inventory::read(&reloaded).unwrap().slots[2],Some(card));
+        assert_eq!(crate::ae2_powered_items::energy(&reloaded).unwrap(),(200_000.0,1_800_000.0));
+        upgrades.slots[2]=None;upgrades.store(&mut owner).unwrap();
+        assert_eq!(crate::ae2_powered_items::energy(&owner).unwrap(),(200_000.0,200_000.0));
+        let mut bad=owner.clone();bad.data_mut().set_other("ae2:upgrades",Some(Tag::String("invalid".into())));
+        assert!(Inventory::read(&bad).is_err());
+    }
     #[test]
     fn physical_upgrade_holes_keep_source_removal_and_first_empty_insertion_order() {
         let mut tool = ItemStack::new("ae2:matter_cannon", 1);

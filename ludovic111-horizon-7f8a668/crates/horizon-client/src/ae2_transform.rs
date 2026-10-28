@@ -5,7 +5,7 @@ use crate::{
     entities::ItemEntity,
     items::{ItemStack, Items},
 };
-use horizon_world::nbt::{Compound, Tag};
+use horizon_world::nbt::Tag;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 #[derive(Clone, Debug)]
@@ -165,15 +165,9 @@ impl Rule {
             let frequency = millis
                 .wrapping_mul(100)
                 .wrapping_add(SEED.fetch_add(1, Ordering::Relaxed) % 100);
-            let mut data = match output.data().and_then(|d| d.other("minecraft:custom_data")) {
-                None => Compound::new(),
-                Some(Tag::Compound(map)) => map.clone(),
-                _ => return Err("invalid transform output custom data".into()),
-            };
-            data.insert("ae2:entangled_singularity_id".into(), Tag::Long(frequency));
-            output
-                .data_mut()
-                .set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+            // QuantumBridgeBlockEntity.assignFrequency writes the AE2
+            // component itself, preserving unrelated custom data unchanged.
+            output.data_mut().set_other("ae2:entangled_singularity_id", Some(Tag::Long(frequency)));
         }
         Ok(output)
     }
@@ -252,13 +246,18 @@ mod tests {
         let pair = rule.assemble().unwrap();
         assert_eq!(pair.count, 2);
         assert!(matches!(
-            pair.data()
-                .unwrap()
-                .other("minecraft:custom_data")
-                .unwrap()
-                .get("ae2:entangled_singularity_id"),
+            pair.data().unwrap().other("ae2:entangled_singularity_id"),
             Some(Tag::Long(_))
         ));
+        assert!(pair.data().unwrap().other("minecraft:custom_data").is_none());
+        let mut tagged_rule = rule.clone();
+        let marker = Tag::compound([("marker", Tag::Int(7))]);
+        tagged_rule.output.data_mut().set_other("minecraft:custom_data", Some(marker.clone()));
+        let tagged = tagged_rule.assemble().unwrap();
+        assert_eq!(tagged.data().unwrap().other("minecraft:custom_data"), Some(&marker));
+        assert!(matches!(tagged.data().unwrap().other("ae2:entangled_singularity_id"), Some(Tag::Long(_))));
+        let saved = crate::save::item_to_nbt(&tagged);
+        assert_eq!(crate::save::item_from_nbt(&saved).unwrap(), tagged);
     }
     #[test]
     fn all_nearby_ingredients_are_claimed_before_any_actual_stack_is_consumed() {

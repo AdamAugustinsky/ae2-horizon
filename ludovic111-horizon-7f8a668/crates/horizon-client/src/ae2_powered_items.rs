@@ -1,6 +1,6 @@
 //! AE2 19.2.18 AEBasePoweredItem, EntropyManipulatorItem and ChargedStaffItem.
-//! LGPL-3.0-or-later. Source components are namespaced entries in native
-//! custom_data so the Rust host can synchronize them without a JVM codec.
+//! LGPL-3.0-or-later. Source components take precedence; older native
+//! custom-data saves remain readable.
 use crate::items::ItemStack;
 use crate::{crafting::Recipes, items::Items};
 use horizon_world::nbt::{Compound, Tag};
@@ -62,10 +62,8 @@ pub fn energy_tooltip(label: &str, current: f64, maximum: f64) -> crate::text::T
         .append(Text::colored(")", 0xaaaaaa))
 }
 pub fn selected_color(stack: &ItemStack) -> Option<u8> {
-    let value = stack
-        .data()?
-        .other("minecraft:custom_data")?
-        .get("ae2:selected_color")?;
+    let data=stack.data()?;
+    let value=data.other("ae2:selected_color").or_else(||data.other("minecraft:custom_data").and_then(|custom|custom.get("ae2:selected_color")))?;
     let Tag::String(value) = value else {
         return None;
     };
@@ -275,11 +273,32 @@ fn number(data: &Compound, name: &str, default: f64) -> Result<f64, String> {
     }
     Ok(value)
 }
+/// Read AEBasePoweredItem's persistent double component, with the native
+/// legacy field only when that component is absent.
+pub fn component_power_value(stack: &ItemStack, component: &str, legacy: &str, default: f64) -> Result<f64, String> {
+    if let Some(value) = stack.data().and_then(|data| data.other(component)) {
+        let Tag::Double(bits) = value else { return Err(format!("invalid {component}")); };
+        let value = f64::from_bits(*bits);
+        if !value.is_finite() || (value < 0.0 && component != CAPACITY) { return Err(format!("invalid {component}")); }
+        return Ok(value);
+    }
+    number(&custom(stack)?, legacy, default)
+}
+/// Keep legacy readers synchronized while writing the actual source component.
+/// Removing the source value also removes its old alias, so zero stays zero.
+pub fn set_component_power_value(stack: &mut ItemStack, component: &str, legacy: &str, value: Option<f64>) -> Result<(), String> {
+    if value.is_some_and(|v| !v.is_finite() || (v < 0.0 && component != CAPACITY)) { return Err(format!("invalid {component}")); }
+    let mut data = custom(stack)?;
+    if let Some(value) = value { data.insert(legacy.into(), Tag::Double(value.to_bits())); }
+    else { data.remove(&legacy.into()); }
+    stack.data_mut().set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+    stack.data_mut().set_other(component, value.map(|value| Tag::Double(value.to_bits())));
+    Ok(())
+}
 pub fn energy(stack: &ItemStack) -> Result<(f64, f64), String> {
     let (base, _) = profile(stack).ok_or("not an AE2 powered tool")?;
-    let data = custom(stack)?;
-    let capacity = number(&data, CAPACITY, base)?;
-    Ok((number(&data, STORED, 0.0)?, capacity))
+    let capacity = component_power_value(stack, CAPACITY, CAPACITY, base)?;
+    Ok((component_power_value(stack, STORED, STORED, 0.0)?, capacity))
 }
 pub fn charge_rate(stack: &ItemStack) -> Result<f64, String> {
     let (_, rate) = profile(stack).ok_or("not an AE2 powered tool")?;
@@ -288,48 +307,10 @@ pub fn charge_rate(stack: &ItemStack) -> Result<f64, String> {
 }
 /// Source physical upgrade limits. Returns (energy multiplier, speed cards).
 pub fn tool_upgrades(stack: &ItemStack) -> Result<(u8, u8), String> {
-    let max = match stack.item.as_ref() {
-        "ae2:matter_cannon" => 4,
-        "ae2:color_applicator" => 2,
-        _ => return Ok((0, 0)),
-    };
-    let data = custom(stack)?;
-    let Some(settings) = data.get(&"ae2_cell_settings".into()) else {
-        return Ok((0, 0));
-    };
-    let Some(Tag::List(cards)) = settings.get("upgrades") else {
-        return Err("invalid tool upgrades".into());
-    };
-    crate::ae2_upgrade_inventory::decode(cards,max)?;
-    if cards.len() > max {
-        return Err("too many tool upgrades".into());
-    }
-    let mut counts = std::collections::BTreeMap::new();
-    for card in cards {
-        if card.get("count") != Some(&Tag::Int(1)) {
-            return Err("invalid tool card count".into());
-        }
-        let card = crate::save::item_from_nbt(card).ok_or("invalid tool card")?;
-        *counts.entry(card.item.to_string()).or_insert(0u8) += 1;
-    }
-    let color = stack.item.as_ref() == "ae2:color_applicator";
-    for (card, count) in &counts {
-        let limit = match card.as_str() {
-            "ae2:energy_card" => 2,
-            "ae2:speed_card" if !color => 4,
-            "ae2:fuzzy_card" | "ae2:inverter_card" if !color => 1,
-            "ae2:equal_distribution_card" if color => 1,
-            "ae2:void_card" => 1,
-            _ => return Err("unsupported tool card".into()),
-        };
-        if *count > limit {
-            return Err("too many tool cards of this type".into());
-        }
-    }
-    Ok((
-        counts.get("ae2:energy_card").copied().unwrap_or(0),
-        counts.get("ae2:speed_card").copied().unwrap_or(0),
-    ))
+    if !matches!(stack.item.as_ref(),"ae2:matter_cannon" | "ae2:color_applicator") {return Ok((0,0));}
+    let inventory=crate::ae2_upgrade_inventory::Inventory::read(stack)?;
+    let count=|id:&str|inventory.slots.iter().flatten().filter(|card|card.item.as_ref()==id).count() as u8;
+    Ok((count("ae2:energy_card"),count("ae2:speed_card")))
 }
 pub fn transfer(
     stack: &mut ItemStack,
@@ -347,20 +328,12 @@ pub fn transfer(
         current
     });
     if !simulate {
-        let mut data = custom(stack)?;
         let next = if insert {
             current + amount.min(capacity-current)
         } else {
             current - moved
         };
-        if next < 0.0001 {
-            data.remove(&STORED.into());
-        } else {
-            data.insert(STORED.into(), Tag::Double(next.to_bits()));
-        }
-        stack
-            .data_mut()
-            .set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+        set_component_power_value(stack, STORED, STORED, (next >= 0.0001).then_some(next))?;
     }
     Ok(moved)
 }
@@ -430,6 +403,23 @@ mod tests {
 }
 #[cfg(test)] mod source_energy_tests {
     use super::*;
+    #[test]
+    fn source_components_override_legacy_and_mutations_update_both() {
+        let mut stack=ItemStack::new("ae2:charged_staff",1);
+        stack.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([(STORED,Tag::Double(90.0f64.to_bits())),(CAPACITY,Tag::Double(8000.0f64.to_bits()))])));
+        stack.data_mut().set_other(STORED,Some(Tag::Double(20.0f64.to_bits())));
+        stack.data_mut().set_other(CAPACITY,Some(Tag::Double(50.0f64.to_bits())));
+        assert_eq!(energy(&stack).unwrap(),(20.0,50.0));
+        assert_eq!(transfer(&mut stack,10.0,true,false).unwrap(),10.0);
+        assert_eq!(energy(&stack).unwrap(),(30.0,50.0));
+        assert_eq!(stack.data().unwrap().other(STORED),Some(&Tag::Double(30.0f64.to_bits())));
+        assert_eq!(custom(&stack).unwrap().get(&STORED.into()),Some(&Tag::Double(30.0f64.to_bits())));
+        transfer(&mut stack,30.0,false,false).unwrap();
+        assert!(stack.data().unwrap().other(STORED).is_none());
+        assert!(!custom(&stack).unwrap().contains_key(&STORED.into()));
+        stack.data_mut().set_other(STORED,Some(Tag::String("invalid".into())));
+        assert!(energy(&stack).is_err());
+    }
     fn overfull()->ItemStack {let mut stack=ItemStack::new("ae2:charged_staff",1);stack.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([(STORED,Tag::Double(9000.0f64.to_bits())),(CAPACITY,Tag::Double(2000.0f64.to_bits()))])));stack}
     #[test]
     fn source_reads_and_extracts_over_capacity_power_but_insertion_clamps_it() {

@@ -74,7 +74,15 @@ pub(super) struct MonitorVisual {
     pub craftable: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct Facade { pub face:String, pub block:String }
+pub(super) struct Facade {
+    pub face: String,
+    pub block: String,
+    /// The facade's public material item; a block item may use a distinct ID.
+    #[serde(default)]
+    pub material: String,
+    #[serde(default)]
+    pub properties: BTreeMap<String, String>,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AnchorTransfer { expected: usize, chunks: Vec<[i32;2]> }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,8 +169,16 @@ pub(super) fn visual(pos: (i32, i32, i32), entity: &BlockEntity, powered: bool) 
             if !matches!(face.as_str(),"down"|"up"|"north"|"south"|"west"|"east") || seen.contains(&face) {continue;}
             let Some(stack)=entry.get("stack").filter(|t|t.get("count")==Some(&Tag::Int(1))).and_then(horizon_client::save::item_from_nbt) else {continue};
             if stack.count!=1 || stack.item.as_ref()!="ae2:facade" {continue;}
-            let Some(block)=stack.data().and_then(|d|d.other("minecraft:custom_data")).and_then(|t|text(t.get("ae2:facade_item"))) else {continue};
-            if block.len()>128 {continue} seen.insert(face.clone()); facades.push(Facade{face,block});
+            let Some(material)=horizon_client::item_tooltip::ae2_facade_texture(&stack) else {continue};
+            let (block, properties) = match entry.get("state") {
+                Some(tag) => match horizon_world::chunk::BlockState::from_nbt(tag) {
+                    Ok(state) if state.name.len() <= 128 && state.properties.len() <= 16
+                        && state.properties.iter().all(|(k,v)| k.len() <= 64 && v.len() <= 64) => (state.name, state.properties),
+                    _ => continue,
+                },
+                None => (material.clone(), BTreeMap::new()),
+            };
+            if material.len()>128 {continue} seen.insert(face.clone()); facades.push(Facade{face,block,material,properties});
         }
     }
     facades.sort_by(|a,b|a.face.cmp(&b.face));
@@ -383,7 +399,8 @@ impl Game<'_> {
                 || v.slots.len() > 10
                 || v.parts.len() > 6
                 || v.facades.len() > 6
-                || v.facades.iter().any(|f|f.face.len()>16 || f.block.len()>128)
+                || v.facades.iter().any(|f| f.face.len()>16 || f.block.len()>128 || f.material.len()>128 || f.properties.len()>16
+                    || f.properties.iter().any(|(k,v)| k.len()>64 || v.len()>64))
                 || v.connections.len() > 6
                 || v.paint_dots.len() > 43
                 || v.anchor_chunks.len()>MAX_SOURCE_CHUNKS
@@ -440,6 +457,24 @@ mod tests {
         assert!(apply_anchor_fragment(&mut v,AnchorFragment{pos,total:2,offset:0,chunks:vec![[0,0]]}));
         assert!(!apply_anchor_fragment(&mut v,AnchorFragment{pos,total:2,offset:2,chunks:vec![[1,0]]}));
         assert_eq!(v.anchor_chunks,old);
+    }
+    #[test]
+    fn source_facade_projection_preserves_only_material_and_public_state() {
+        use horizon_client::{ae2_world::{Machine,MachineKind},items::ItemStack,save};
+        let mut facade=ItemStack::new("ae2:facade",1);
+        facade.data_mut().set_other("ae2:facade_item",Some(Tag::String("example:oak_log_item".into())));
+        facade.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("secret",Tag::Int(42))])));
+        let mut machine=Machine::new(MachineKind::CableBus);
+        let state=horizon_world::chunk::BlockState{name:"minecraft:oak_log".into(),properties:BTreeMap::from([("axis".into(),"z".into())])};
+        machine.config.insert("facades".into(),Tag::List(vec![Tag::compound([
+            ("face",Tag::String("south".into())),("stack",save::item_to_nbt(&facade)),("state",state.to_nbt()),
+        ])]));
+        let projection=visual((1,2,3),&BlockEntity::Ae2(Box::new(machine)),false).unwrap();
+        assert_eq!(projection.facades[0].block,"minecraft:oak_log");
+        assert_eq!(projection.facades[0].material,"example:oak_log_item");
+        assert_eq!(projection.facades[0].properties.get("axis").map(String::as_str),Some("z"));
+        let encoded=serde_json::to_string(&projection).unwrap();assert!(!encoded.contains("secret"));
+        assert!(encoded.contains("\"axis\":\"z\""));
     }
     #[test]
     fn visual_projection_exposes_ids_not_item_components() {

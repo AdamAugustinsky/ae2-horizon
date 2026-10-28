@@ -98,6 +98,18 @@ mod bus_memory {
             put(&mut settings,"storage_filter",&text(part,"storage_filter","extractable_only")?);
         }
         if id=="ae2:formation_plane" {put(&mut settings,"place_block",if flag(part,"formation_entity",false){"no"}else{"yes"});}
+        let source_filters=state.config.iter().map(|entry|{
+            let Some(key)=entry else{return Ok(Tag::Compound(Compound::new()))};
+            let raw=ae2_cell_core::ItemKey::from(key);
+            let fluid=ae2_lab::prototype(&raw).is_err();
+            horizon_client::ae2_generic_stack::encode(&horizon_client::ae2_generic_stack::GenericStack{key:raw,fluid,amount:0})
+        }).collect::<Result<Vec<_>,String>>()?;
+        let mut source_settings=Compound::new();
+        for (key,value) in &settings {
+            let Tag::String(value)=value else{return Err("invalid bus setting".into())};
+            let key=key.to_string_lossy();let key=if key==FUZZY{"fuzzy_mode"}else{key.as_str()};
+            source_settings.insert(key.into(),Tag::String(value.to_string().map_err(|_|"invalid setting")?.to_ascii_uppercase().as_str().into()));
+        }
         let (items,fluids)=encode_ghosts(&state.config)?;
         let mut body=Compound::new();body.insert("source".into(),Tag::String(id.as_str().into()));
         body.insert("settings".into(),Tag::Compound(settings));
@@ -113,11 +125,60 @@ mod bus_memory {
             body.insert("priority".into(),Tag::Int(priority));
         }
         if let Some(name)=name{body.insert("name".into(),Tag::String(name.into()));}
+        let source_priority=body.get(&"priority".into()).cloned();
         let mut custom=match card.data().and_then(|d|d.other("minecraft:custom_data")){None=>Compound::new(),Some(Tag::Compound(v))=>v.clone(),_=>return Err("invalid card data".into())};
-        custom.remove(&P2P.into());custom.insert(KEY.into(),Tag::Compound(body));card.data_mut().set_other("minecraft:custom_data",Some(Tag::Compound(custom)));Ok(())
+        custom.remove(&P2P.into());custom.insert(KEY.into(),Tag::Compound(body));card.data_mut().set_other("minecraft:custom_data",Some(Tag::Compound(custom)));
+        let description=format!("item.ae2.{}",id.strip_prefix("ae2:").unwrap_or(&id));
+        card.data_mut().set_other("ae2:exported_settings_source",Some(Tag::compound([("translate",Tag::String(description.as_str().into()))])));
+        card.data_mut().set_other("ae2:exported_settings",Some(Tag::Compound(source_settings)));
+        card.data_mut().set_other("ae2:exported_upgrades",Some(Tag::List(groups.iter().map(save::item_to_nbt).collect())));
+        card.data_mut().set_other("ae2:exported_config_inv",Some(Tag::List(source_filters)));
+        card.data_mut().set_other("ae2:exported_priority",source_priority);
+        card.data_mut().set_other("ae2:exported_custom_name",name.map(|value|Tag::String(value.into())));
+        Ok(())
     }
     pub(in crate::game) fn read_bus(card:&ItemStack,target:&str)->Result<Option<SavedBus>,String>{
         if card.item.as_ref()!="ae2:memory_card"||card.count!=1||!KINDS.contains(&target){return Err("invalid card or bus".into())}
+        if let Some(data)=card.data(){
+            let ids=["ae2:exported_settings_source","ae2:exported_settings","ae2:exported_upgrades","ae2:exported_config_inv","ae2:exported_priority","ae2:exported_custom_name"];
+            if ids.iter().any(|id|data.other(id).is_some()){
+                let expected=format!("item.ae2.{}",target.strip_prefix("ae2:").unwrap_or(target));
+                let matching=source_description_matches(data.other("ae2:exported_settings_source"),&expected);
+                let mut body=Compound::new();body.insert("source".into(),Tag::String(if matching{target}else{"horizon:generic"}.into()));
+                if let Some(settings)=data.other("ae2:exported_settings"){
+                    let Tag::Compound(settings)=settings else{return Err("invalid settings".into())};
+                    let mut mapped=Compound::new();
+                    for (key,value) in settings {
+                        let Tag::String(value)=value else{return Err("invalid setting type".into())};
+                        let value=value.to_string().map_err(|_|"invalid setting")?;let lower=value.to_ascii_lowercase();
+                        if value!=lower.to_ascii_uppercase(){continue}
+                        let key=key.to_string_lossy();put(&mut mapped,if key=="fuzzy_mode"{FUZZY}else{key.as_str()},&lower);
+                    }
+                    body.insert("settings".into(),Tag::Compound(mapped));
+                }
+                if let Some(upgrades)=data.other("ae2:exported_upgrades"){body.insert("upgrades".into(),upgrades.clone());}
+                if let Some(priority)=data.other("ae2:exported_priority"){
+                    body.insert("priority".into(),horizon_client::ae2_components::normalize("ae2:exported_priority",priority.clone())?);
+                }
+                if let Some(config)=data.other("ae2:exported_config_inv"){
+                    let Tag::List(entries)=config else{return Err("invalid exported config".into())};
+                    let mut ghosts=vec![None;63];
+                    for (i,tag) in entries.iter().take(63).enumerate(){
+                        ghosts[i]=horizon_client::ae2_generic_stack::decode_tolerant(tag)?.map(|value|Key::from(&value.key));
+                    }
+                    let (items,fluids)=encode_ghosts(&ghosts)?;body.insert("config_items".into(),items);body.insert("config_fluids".into(),fluids);
+                }
+                if matching {if let Some(name)=data.other("ae2:exported_custom_name"){
+                    let name=match name{Tag::String(value)=>value.clone(),Tag::Compound(_)=>match name.get("text"){Some(Tag::String(value))=>value.clone(),_=>return Err("unsupported structured bus name".into())},_=>return Err("invalid name".into())};
+                    body.insert("name".into(),Tag::String(name));
+                }}
+                let mut proxy=card.clone();proxy.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([(KEY,Tag::Compound(body))])));
+                return read_bus_legacy(&proxy,target);
+            }
+        }
+        read_bus_legacy(card,target)
+    }
+    fn read_bus_legacy(card:&ItemStack,target:&str)->Result<Option<SavedBus>,String>{
         let Some(custom)=card.data().and_then(|d|d.other("minecraft:custom_data"))else{return Ok(None)};
         let Some(body)=custom.get(KEY)else{return Ok(None)};if !matches!(body,Tag::Compound(_)){return Err("invalid card body".into())}
         let matching=body.get("source")==Some(&Tag::String(target.into()));
@@ -228,6 +289,10 @@ mod bus_memory {
     }
     pub(in crate::game) fn bus_priority_from_card(card:&ItemStack)->Result<Option<i32>,String>{
         if card.item.as_ref()!="ae2:memory_card"||card.count!=1{return Err("invalid card".into())}
+        if bus_source_from_card(card).is_some()&&card.data().and_then(|d|d.other("ae2:exported_settings_source")).is_some(){
+            if let Some(value)=card.data().and_then(|d|d.other("ae2:exported_priority")){return match horizon_client::ae2_components::normalize("ae2:exported_priority",value.clone())?{Tag::Int(value)=>Ok(Some(value)),_=>unreachable!()}}
+            return Ok(None)
+        }
         let Some(data)=card.data().and_then(|d|d.other("minecraft:custom_data"))else{return Ok(None)};
         let Some(body)=data.get(KEY)else{return Ok(None)};
         let is_bus=KINDS.iter().any(|id|body.get("source")==Some(&Tag::String((*id).into())));
@@ -235,6 +300,9 @@ mod bus_memory {
         match body.get("priority"){None=>Ok(None),Some(Tag::Int(v))=>Ok(Some(*v)),_=>Err("invalid bus priority".into())}
     }
     pub(in crate::game) fn bus_source_from_card(card:&ItemStack)->Option<&'static str>{
+        if let Some(source)=card.data().and_then(|d|d.other("ae2:exported_settings_source")){
+            return KINDS.iter().copied().find(|id|source_description_matches(Some(source),&format!("item.ae2.{}",id.strip_prefix("ae2:").unwrap_or(id))));
+        }
         let body=card.data()?.other("minecraft:custom_data")?.get(KEY)?;
         KINDS.iter().copied().find(|id|body.get("source")==Some(&Tag::String((*id).into())))
     }
@@ -242,6 +310,7 @@ mod bus_memory {
     /// export before handing it to the existing nine-slot Interface decoder.
     pub(in crate::game) fn bus_as_interface(card:&ItemStack)->Result<Option<SavedInterface>,String>{
         if bus_source_from_card(card).is_none(){return Ok(None)}
+        if card.data().and_then(|d|d.other("ae2:exported_settings_source")).is_some(){return read_source_interface(card,true)}
         let saved=read_bus(card,"ae2:storage_bus")?.ok_or("missing bus card")?;
         let ghosts=if let Some(mut config)=saved.ghosts {
             for slot in config.iter_mut().skip(9){*slot=None;}
@@ -253,12 +322,12 @@ mod bus_memory {
         });
         Ok(Some(SavedInterface{
             fuzzy:setting(&saved.settings,FUZZY,FUZZY_VALUES)?,
-            priority:saved.priority,ghosts,desired,name:None,part_source:true,
+            priority:saved.priority,ghosts,source_ghosts:None,desired,name:None,part_source:true,source_is_interface:false,
         }))
     }
     pub(in crate::game) fn bus_as_vibration(saved:&SavedBus)->SavedVibration{
         let mut cards=Vec::new();
-        if let Some(desired)=saved.desired.as_ref(){for item in desired.iter().filter(|s|s.item.as_ref()=="ae2:speed_card"){
+        if let Some(desired)=saved.desired.as_ref(){for item in desired.iter().filter(|s|matches!(s.item.as_ref(),"ae2:speed_card"|"ae2:energy_card")){
             for _ in 0..item.count.min(3){if cards.len()<3{cards.push(moved_copy(item,1));}}
         }}
         SavedVibration{desired:cards,name:None}
@@ -350,9 +419,28 @@ mod bus_memory {
             let mut state=ae2_buses::bus_state(&source).unwrap();state.config[0]=Some(Key::from(&ae2_lab::key(&ItemStack::new("minecraft:diamond",1)).unwrap()));state.config[40]=Some(Key{id:"minecraft:water".into(),components:Vec::new()});store_state(&mut source,&state);
             ae2_buses::store_bus_upgrade_slots(&mut source,&vec![Some(ItemStack::new("ae2:capacity_card",1)),Some(ItemStack::new("ae2:fuzzy_card",1)),None,None,None]).unwrap();
             let mut card=ItemStack::new("ae2:memory_card",1);save_bus(&mut card,&source,Some("Bus")).unwrap();
-            let generic=bus_as_interface(&card).unwrap().unwrap();assert!(generic.part_source);assert_eq!(generic.priority,Some(18));assert_eq!(generic.desired.unwrap().unwrap().item.as_ref(),"ae2:fuzzy_card");
+            let generic=bus_as_interface(&card).unwrap().unwrap();assert!(!generic.source_is_interface);assert_eq!(generic.priority,Some(18));assert_eq!(generic.desired.unwrap().unwrap().item.as_ref(),"ae2:fuzzy_card");
             assert_eq!(bus_priority_from_card(&card).unwrap(),Some(18));
-            let (items,fluids)=generic.ghosts.unwrap();assert_eq!(save::decode_items(Some(&items),9)[0].as_ref().unwrap().item.as_ref(),"minecraft:diamond");assert_eq!(fluids,Tag::List(vec![]));
+            let filters=generic.source_ghosts.unwrap();assert_eq!(filters.len(),9);assert_eq!(filters[0].as_ref().unwrap().key.item_id,"minecraft:diamond");assert!(filters[1..].iter().all(Option::is_none));
+        }
+        #[test]
+        fn source_only_bus_card_roundtrips_filters_and_moves_grouped_cards(){
+            let mut source=part("ae2:export_bus");let mut state=ae2_buses::bus_state(&source).unwrap();
+            let mut diamond=ItemStack::new("minecraft:diamond",1);diamond.data_mut().custom_name=Some("key".into());
+            state.config[0]=Some(Key::from(&ae2_lab::key(&diamond).unwrap()));state.config[3]=Some(Key{id:"minecraft:water".into(),components:Vec::new()});
+            state.redstone=Redstone::High;state.schedule=Schedule::RoundRobin;store_state(&mut source,&state);
+            ae2_buses::store_bus_upgrade_slots(&mut source,&vec![Some(ItemStack::new("ae2:speed_card",1)),Some(ItemStack::new("ae2:speed_card",1)),None,None,None]).unwrap();
+            let mut card=ItemStack::new("ae2:memory_card",1);save_bus(&mut card,&source,Some("Bus")).unwrap();
+            let Some(Tag::List(filters))=card.data().unwrap().other("ae2:exported_config_inv")else{panic!("missing source config")};
+            assert_eq!(filters[0].get("#"),Some(&Tag::Long(0)));assert_eq!(filters[3].get("#"),Some(&Tag::Long(0)));assert_eq!(filters.len(),63);
+            let Some(Tag::List(cards))=card.data().unwrap().other("ae2:exported_upgrades")else{panic!("missing upgrades")};assert_eq!(cards[0].get("count"),Some(&Tag::Int(2)));
+            card.data_mut().set_other("minecraft:custom_data",None);let saved=read_bus(&card,"ae2:export_bus").unwrap().unwrap();assert!(saved.matching);assert_eq!(saved.name.as_deref(),Some("Bus"));
+            let mut target=part("ae2:export_bus");let mut player=vec![None;36];player[0]=Some(ItemStack::new("ae2:speed_card",2));let mut pocket=None;
+            let changes=apply_bus(&mut target,&mut player,&mut pocket,&saved,false).unwrap();assert_eq!(changes.missing,0);assert!(changes.drops.is_empty());
+            assert_eq!(ae2_buses::bus_state(&target).unwrap().config,state.config);assert_eq!(ae2_buses::bus_state(&target).unwrap().schedule,Schedule::RoundRobin);
+            assert_eq!(ae2_buses::bus_upgrade_slots(&target).unwrap().iter().flatten().count(),2);
+            card.data_mut().set_other("ae2:exported_settings",Some(Tag::compound([("redstone_controlled",Tag::String("high_signal".into()))])));
+            assert!(!read_bus(&card,"ae2:export_bus").unwrap().unwrap().settings.contains_key(&"redstone_controlled".into()));
         }
     }
 }

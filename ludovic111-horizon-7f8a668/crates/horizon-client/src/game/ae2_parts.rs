@@ -266,8 +266,7 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
-    /// Physical facade item, with an embedded block-item ID in the native
-    /// custom-data adaptation of AE2's FACADE_ITEM component.
+    /// Physical facade item, with a source component or legacy native texture.
     pub(super) fn ae2_try_facade(&mut self, hit: [i32; 3], face: [i32; 3]) -> bool {
         let side = match face {
             [0, -1, 0] => "down",
@@ -284,26 +283,27 @@ impl Game<'_> {
         if held.item.as_ref() != "ae2:facade" || held.count == 0 {
             return false;
         }
-        let Some(Tag::String(id)) = held
-            .data()
-            .and_then(|d| d.other("minecraft:custom_data"))
-            .and_then(|t| t.get("ae2:facade_item"))
-        else {
-            return false;
-        };
-        let Ok(id) = id.to_string() else { return false };
-        let Some(block) = self.pack.assets.registry.default_state(&id) else {
-            return false;
-        };
-        let facts = self.res.facts().get(block);
-        if !facts.full_collision || facts.block_entity || facts.item.as_ref() != id {
-            return false;
-        }
+        let Some(id)=horizon_client::item_tooltip::ae2_facade_texture(&held) else{return false;};
+        // FacadeItem.createPartFromItemStack accepts any non-empty registered
+        // item. Block.byItem maps non-block items to glass at placement time;
+        // the crafting recipe's whitelist is not a placement restriction.
+        if id == "minecraft:air" { return false; }
+        let Some(material) = self.res.items().get(&id) else { return false; };
+        let Some(block) = material.block
+            .filter(|id| !self.res.facts().is_air(*id))
+            .or_else(|| self.pack.assets.registry.default_state("minecraft:glass"))
+        else { return false; };
+        let Some(facade_state) = self.pack.assets.registry.state(block).map(|state|state.to_nbt()) else {return false;};
+        // FacadePart.getItemStack reconstructs a fresh facade from the placed
+        // block's item. Preserve that exact physical return, including glass
+        // for non-block material and no unrelated held-item components.
+        let material_id = self.res.facts().get(block).item.clone();
         let pos = (hit[0], hit[1], hit[2]);
         let Some(BlockEntity::Ae2(machine)) = self.world.block_entities.get_mut(&pos) else {
             return false;
         };
-        if machine.kind != MachineKind::CableBus || cable_device(machine).is_none() {
+        if machine.kind != MachineKind::CableBus || cable_device(machine).is_none()
+            || (machine.config.get(&"ae2_centerless".into())==Some(&Tag::Byte(1)) && !machine.config.contains_key(&"cable".into())) {
             return false;
         }
         let facades = machine
@@ -320,13 +320,12 @@ impl Game<'_> {
         {
             return false;
         }
-        let one = ItemStack {
-            count: 1,
-            ..held.clone()
-        };
+        let mut one = ItemStack::new("ae2:facade", 1);
+        one.data_mut().set_other("ae2:facade_item", Some(Tag::String(material_id.as_ref().into())));
         facades.push(Tag::compound([
             ("face", Tag::String(side.into())),
             ("stack", horizon_client::save::item_to_nbt(&one)),
+            ("state", facade_state),
         ]));
         if !self.creative {
             *self.held_mut() = (held.count > 1).then_some(ItemStack {
@@ -335,6 +334,182 @@ impl Game<'_> {
             });
         }
         self.world.modified.insert((pos.0 >> 4, pos.2 >> 4));
+        true
+    }
+    /// FacadePart.handleInteraction: right-click cycles the selected block
+    /// property; left-click selects the next property on the held wrench.
+    pub(super) fn ae2_try_facade_cycle(
+        &mut self,
+        hit: [i32; 3],
+        face: [i32; 3],
+        cycle_state: bool,
+    ) -> bool {
+        let side = match face {
+            [0, -1, 0] => "down",
+            [0, 1, 0] => "up",
+            [0, 0, -1] => "north",
+            [0, 0, 1] => "south",
+            [-1, 0, 0] => "west",
+            [1, 0, 0] => "east",
+            _ => return false,
+        };
+        if self.keys.contains(&super::KeyCode::ShiftLeft)
+            || !self
+                .held()
+                .is_some_and(|item| self.ae2_wrench_can_rotate(item))
+        {
+            return false;
+        }
+        let pos = (hit[0], hit[1], hit[2]);
+        let Some(BlockEntity::Ae2(machine)) = self.world.block_entities.get(&pos) else {
+            return false;
+        };
+        if machine.kind != MachineKind::CableBus {
+            return false;
+        }
+        let Some(Tag::List(facades)) = machine.config.get(&"facades".into()) else {
+            return false;
+        };
+        let mut matches = facades
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.get("face") == Some(&Tag::String(side.into())));
+        let Some((index, entry)) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return true;
+        }
+        let entry = entry.clone();
+        let Some(stack) = entry
+            .get("stack")
+            .and_then(horizon_client::save::item_from_nbt)
+        else {
+            return true;
+        };
+        let Some(block) = horizon_client::item_tooltip::ae2_facade_texture(&stack) else {
+            return true;
+        };
+        let registry = &self.pack.assets.registry;
+        let Some(default) = self.res.items().get(&block)
+            .and_then(|item| item.block)
+            .filter(|id| !self.res.facts().is_air(*id))
+            .or_else(|| registry.default_state("minecraft:glass"))
+            .and_then(|id| registry.state(id))
+            .cloned()
+        else {
+            return true;
+        };
+        let requested = entry
+            .get("state")
+            .and_then(|tag| horizon_world::chunk::BlockState::from_nbt(tag).ok())
+            .unwrap_or_else(|| default.clone());
+        if requested.name != default.name {
+            return true;
+        }
+        let Some(state) = registry
+            .resolve(&requested)
+            .ok()
+            .and_then(|id| registry.state(id))
+            .cloned()
+        else {
+            return true;
+        };
+        let properties: Vec<_> = state.properties.keys().cloned().collect();
+        let Some(first) = properties.first() else {
+            return false;
+        };
+        let selected = self
+            .held()
+            .and_then(|item| item.data())
+            .and_then(|data| data.other("ae2:facade_cycle_property"))
+            .and_then(|tag| {
+                if let Tag::String(value) = tag {
+                    value.to_string().ok()
+                } else {
+                    None
+                }
+            });
+        let property = selected
+            .filter(|key| state.properties.contains_key(key))
+            .unwrap_or_else(|| first.clone());
+        if !cycle_state {
+            let current = properties
+                .iter()
+                .position(|key| *key == property)
+                .unwrap_or(0);
+            let next = &properties[(current + 1) % properties.len()];
+            let Some(mut wrench) = self.held().cloned() else {
+                return true;
+            };
+            wrench.data_mut().set_other(
+                "ae2:facade_cycle_property",
+                if next == first {
+                    None
+                } else {
+                    Some(Tag::String(next.as_str().into()))
+                },
+            );
+            horizon_client::ae2_stack_identity::synchronize_tracked(&wrench);
+            *self.held_mut() = Some(wrench);
+            self.system_message(horizon_client::text::Text::literal(format!(
+                "Facade property: {next}"
+            )));
+            return true;
+        }
+        let mut values = Vec::new();
+        for i in 0..registry.len() {
+            let Some(candidate) = registry.state(horizon_world::registry::BlockStateId(i as u32))
+            else {
+                continue;
+            };
+            if candidate.name != state.name
+                || candidate.properties.iter().any(|(key, value)| {
+                    key != &property && state.properties.get(key) != Some(value)
+                })
+            {
+                continue;
+            }
+            if let Some(value) = candidate.properties.get(&property) {
+                if !values.contains(value) {
+                    values.push(value.clone());
+                }
+            }
+        }
+        let Some(current) = state
+            .properties
+            .get(&property)
+            .and_then(|value| values.iter().position(|candidate| candidate == value))
+        else {
+            return true;
+        };
+        let mut next = state.clone();
+        next.properties.insert(
+            property.clone(),
+            values[(current + 1) % values.len()].clone(),
+        );
+        if registry.id(&next).is_none() {
+            return true;
+        }
+        let Some(BlockEntity::Ae2(machine)) = self.world.block_entities.get_mut(&pos) else {
+            return true;
+        };
+        let Some(Tag::List(facades)) = machine.config.get_mut(&"facades".into()) else {
+            return true;
+        };
+        if facades.get(index) != Some(&entry) {
+            return true;
+        }
+        let Some(Tag::Compound(target)) = facades.get_mut(index) else {
+            return true;
+        };
+        target.insert("state".into(), next.to_nbt());
+        self.world.modified.insert((pos.0 >> 4, pos.2 >> 4));
+        if next.properties.get(&property) == default.properties.get(&property) {
+            self.system_message(horizon_client::text::Text::literal(format!(
+                "Facade property wrapped: {property}"
+            )));
+        }
         true
     }
     /// Remove the physically stored facade using a quartz wrench while sneaking.

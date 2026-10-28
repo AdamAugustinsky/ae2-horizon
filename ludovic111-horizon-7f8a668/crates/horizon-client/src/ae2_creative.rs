@@ -51,7 +51,11 @@ pub(crate) fn stack(source: &str) -> Result<ItemStack, String> {
                 } else { value };
                 custom.insert(key.into(), value);
             }
-            "ae2:energy_capacity" | "ae2:facade_item" => {
+            "ae2:facade_item" => {
+                stack.data_mut().set_other("ae2:facade_item",Some(value.clone()));
+                custom.insert(name, value);
+            }
+            "ae2:energy_capacity" => {
                 custom.insert(name, value);
             }
             "ae2:upgrades" => {

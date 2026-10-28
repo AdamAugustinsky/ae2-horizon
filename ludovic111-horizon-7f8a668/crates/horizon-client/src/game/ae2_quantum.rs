@@ -17,9 +17,9 @@ enum QuantumEvent {
 }
 
 /// Runtime registrations are usable only while every physical frame and
-/// frequency still matches the observed callback sequence. Unobserved loads,
-/// frame changes and other inventory paths retain the bounded old fallback.
-#[derive(Default)]
+/// frequency still matches the observed callback sequence. If a transition
+/// was not observed, no coordinate-based pairing is manufactured.
+#[derive(Clone, Default)]
 pub(super) struct QuantumRuntime {
     frames: BTreeMap<NetworkPos,(NodeIdentity,i64)>,
     members: BTreeMap<NetworkPos,BTreeSet<NetworkPos>>,
@@ -41,36 +41,42 @@ pub(super) struct QuantumRuntime {
     pending: Vec<QuantumEvent>,
 }
 impl QuantumRuntime {
+    fn invalidate(&mut self, reason:&str) {
+        if !self.source_invalid && std::env::var_os("HORIZON_AE2_QUANTUM_TRACE").is_some() {
+            log::info!("AE2 quantum source state invalidated: {reason}");
+        }
+        self.source_invalid=true;
+    }
     fn links(&mut self,events:Vec<ae2_network_core::quantum_registry::LinkEvent>) {
         self.pending.extend(events.into_iter().map(|event|QuantumEvent::Link{a:event.a,b:event.b,added:event.added}));
     }
     pub(super) fn node_ready(&mut self,id:NodeIdentity) {
         self.ready_nodes.insert(id);
         if !self.source_invalid && self.source_registry.sides(id).is_some()
-            && self.source_registry.set_node_live(id,true).is_err() {self.source_invalid=true;}
+            && self.source_registry.set_node_live(id,true).is_err() {self.invalidate("node_ready set_node_live");}
     }
     fn source_status(&mut self,center:NetworkPos,id:NodeIdentity,frequency:i64) {
         if self.source_invalid{return}
         match self.source_registry.update(id,frequency) {
             Ok(events)=>self.links(events),
-            Err(_)=>{self.source_invalid=true;return}
+            Err(_)=>{self.invalidate("source_status update");return}
         }
         self.source_frames.insert(center,(id,frequency));
     }
     fn forget_registration(&mut self,center:NetworkPos) {
         if let Some((id,_))=self.source_frames.remove(&center) {
             if !self.source_invalid {
-                match self.source_registry.destroy(id) {Ok(events)=>self.links(events),Err(_)=>self.source_invalid=true}
+                match self.source_registry.destroy(id) {Ok(events)=>self.links(events),Err(_)=>self.invalidate("forget_registration destroy")}
             }
         }
     }
     fn form_at(&mut self, pos:NetworkPos, nodes:&PhysicalNodes,physical:&BTreeMap<NetworkPos,(NodeIdentity,i64)>) {
         let Some((&center, frame))=nodes.iter().find(|(_,frame)|frame.contains_key(&pos)) else{return};
-        let Some(&(id,frequency))=physical.get(&center) else{self.source_invalid=true;return};
+        let Some(&(id,frequency))=physical.get(&center) else{self.invalidate("form_at center unavailable");return};
         let newly_formed=self.formed.get(&center)!=Some(frame);
         if newly_formed {
             if self.formed.contains_key(&center) {self.destroy_formation(center);}
-            if !self.source_invalid && self.source_registry.form_with_node(id,self.ready_nodes.contains(&id)).is_err() {self.source_invalid=true;}
+            if !self.source_invalid && self.source_registry.form_with_node(id,self.ready_nodes.contains(&id)).is_err() {self.invalidate("form_at duplicate");}
         }
         for (id,faces) in frame.values() {self.visual.insert(*id,true);self.faces.insert(*id,*faces);}
         if newly_formed {
@@ -115,22 +121,55 @@ impl QuantumRuntime {
         self.visual.remove(&id);
         self.faces.remove(&id);
         self.ready_nodes.remove(&id);
+        self.ready_ticked.remove(&id);
+    }
+    /// Replay the observed onChunkUnloaded callback for this exact BE.
+    /// disconnect(false) destroys the cluster and peer connection, but
+    /// updateStatus(..., false) deliberately does not change member faces.
+    pub(super) fn unloaded(&mut self, pos:NetworkPos, incarnation:u64) -> Vec<ae2_network_core::quantum_registry::LinkEvent> {
+        let id=NodeIdentity{host:incarnation,part:None,outer:false};
+        let centers:Vec<_>=self.formed.iter().filter_map(|(center,frame)|
+            frame.get(&pos).is_some_and(|(node,_)|*node==id).then_some(*center)).collect();
+        let mut links=Vec::new();
+        for center in centers {
+            self.formed.remove(&center);
+            if let Some((node,_))=self.source_frames.remove(&center) {
+                if !self.source_invalid {
+                    match self.source_registry.destroy(node) {
+                        Ok(events)=>links.extend(events),
+                        Err(_)=>self.invalidate("unload destroy"),
+                    }
+                }
+            } else if !self.source_invalid {self.invalidate("unload registration missing");}
+            if self.active {
+                if let Some((node,_))=self.frames.remove(&center) {
+                    if self.registry.destroy(node).is_err(){self.active=false;}
+                } else {self.active=false;}
+                self.members.remove(&center);
+            }
+        }
+        self.visual.remove(&id);
+        self.faces.remove(&id);
+        self.ready_nodes.remove(&id);
+        self.ready_ticked.remove(&id);
+        links
     }
     /// A chunk unload is not a world-affecting destroy. Drop its cluster and
     /// registrations without inventing an ordinary neighbor callback.
-    fn forget_unloaded(&mut self,nodes:&PhysicalNodes) {
-        let stale:Vec<_>=self.formed.iter().filter_map(|(center,frame)|(nodes.get(center)!=Some(frame)).then_some(*center)).collect();
+    fn forget_unloaded(&mut self,nodes:&PhysicalNodes,pending:&BTreeSet<NetworkPos>) {
+        let stale:Vec<_>=self.formed.iter().filter_map(|(center,frame)|
+            (nodes.get(center)!=Some(frame) && !pending.contains(center)).then_some(*center)).collect();
         // World streaming batches BE removal without source-observed cluster
         // callback order. Do not manufacture an ordered teardown sequence.
-        if !stale.is_empty(){self.source_invalid=true;}
+        if !stale.is_empty(){self.invalidate(&format!("unobserved physical removal: {stale:?}"));}
         for center in stale {self.formed.remove(&center);self.source_frames.remove(&center);}
     }
     pub(super) fn flush_events(&mut self,world:&horizon_client::world::World,dim:Dim,anchor:(i32,i32,i32)) {
         for event in std::mem::take(&mut self.pending) {
             match event {
                 QuantumEvent::Faces{pos,id,faces}=>{
-                    let Some((owner,local))=super::ae2_global::GridAddress::from_network(pos).and_then(|a|a.local_parts()) else{self.source_invalid=true;continue};
-                    if owner!=dim || world.block_entities.incarnation(&local)!=Some(id.host) {self.source_invalid=true;continue}
+                    let Some((owner,local))=super::ae2_global::GridAddress::from_network(pos).and_then(|a|a.local_parts()) else{self.invalidate("flush invalid position");continue};
+                    if owner!=dim || world.block_entities.incarnation(&local)!=Some(id.host) {self.invalidate(&format!("flush face identity mismatch {local:?} {id:?}"));continue}
                     world.block_entities.record_ae2_quantum_faces(local,id.host,faces);
                 }
                 QuantumEvent::Link{a,b,added}=>world.block_entities.record_ae2_quantum_link(anchor,a,b,added),
@@ -170,7 +209,7 @@ impl QuantumRuntime {
     }
     /// A real neighbor callback can destroy one previously observed cluster.
     /// Unknown source/order or a more complex change invalidates this bounded
-    /// runtime so the caller keeps the existing conservative fallback.
+    /// runtime so the caller does not manufacture source connections.
     pub(super) fn neighbor_changed(&mut self,world:&horizon_client::world::World,dim:Dim,facts:&horizon_client::blocks::BlockFacts,pos:(i32,i32,i32),source:Option<(i32,i32,i32)>) {
         let Some(target)=super::ae2_global::GridAddress::from_local(dim,pos).map(|a|a.network_pos()) else{self.active=false;return};
         let (local,_,nodes) = physical_frames(world,dim,facts);
@@ -179,7 +218,7 @@ impl QuantumRuntime {
         let recheck=if let Some(frame)=existing {
             if let (Some(changed),Some(source))=(changed,source) {
                 frame.contains_key(&changed) || matches!(world.block_entities.get(&source),Some(BlockEntity::Ae2(m)) if matches!(m.kind,MachineKind::QuantumRing|MachineKind::QuantumLink))
-            } else {self.source_invalid=true;false}
+            } else {self.invalidate("neighbor source unavailable");false}
         } else {true};
         if recheck {self.neighbor_formation(target,&nodes,&local);}
         if !self.active{return}
@@ -227,6 +266,19 @@ impl QuantumRuntime {
         self.frames=physical;self.members=members;
     }
 }
+/// Streaming drops a chunk's block states before it serializes the still
+/// resident BEs and only then emits their bulk-unload journal. This frame is
+/// pending that observed callback only if every original identity is still
+/// present and at least one of its physical chunks has already been removed.
+fn pending_chunk_unload(frame:&FrameNodes,mut state:impl FnMut(NetworkPos)->Option<(u64,bool)>)->bool {
+    let mut missing_chunk=false;
+    for (&pos,&(id,_)) in frame {
+        let Some((incarnation,loaded))=state(pos) else{return false};
+        if incarnation!=id.host{return false}
+        missing_chunk|=!loaded;
+    }
+    missing_chunk
+}
 fn adjacent(a:NetworkPos,b:NetworkPos)->bool {
     i64::from(a.x).abs_diff(i64::from(b.x))+i64::from(a.y).abs_diff(i64::from(b.y))+i64::from(a.z).abs_diff(i64::from(b.z))==1
 }
@@ -254,12 +306,21 @@ fn physical_frames(world:&horizon_client::world::World,dim:Dim,facts:&horizon_cl
 }
 
 pub(super) fn frequency(stack: &ItemStack) -> Option<i64> {
-    match stack
-        .data()?
-        .other("minecraft:custom_data")?
-        .get("ae2:entangled_singularity_id")?
-    {
-        Tag::Long(n) if *n != 0 => Some(*n),
+    let data = stack.data()?;
+    // Older native saves stored this inside custom data. Prefer the real AE2
+    // component when present, including zero: the source slot validator tests
+    // component presence while a zero frequency simply has no connection.
+    let value = data.other("ae2:entangled_singularity_id").or_else(|| {
+        data.other("minecraft:custom_data").and_then(|tag| tag.get("ae2:entangled_singularity_id"))
+    })?;
+    // Codec.LONG reads NbtOps' numeric values through Number.longValue().
+    match value {
+        Tag::Byte(n) => Some(i64::from(*n)),
+        Tag::Short(n) => Some(i64::from(*n)),
+        Tag::Int(n) => Some(i64::from(*n)),
+        Tag::Long(n) => Some(*n),
+        Tag::Float(n) => Some(f32::from_bits(*n) as i64),
+        Tag::Double(n) => Some(f64::from_bits(*n) as i64),
         _ => None,
     }
 }
@@ -280,9 +341,8 @@ impl Game<'_> {
         if self.ae2_quantum_runtime.borrow().ready_ticked.contains(&id){return}
         let Some(pos)=self.ae2_local_address(local).map(|a|a.network_pos()) else{return};
         let (physical,members,nodes)=self.ae2_quantum_physical_frames();
-        // If frame readiness is interleaved across chunks, earlier real
-        // serverTick callbacks may already have affected registration. Keep
-        // the existing fallback instead of guessing their ordering.
+        // Interleaved readiness invalidates the older all-ready registry.
+        // The source registry still follows each real callback individually.
         let all_ready=members.values().flatten().all(|pos|{
             let Some(address)=super::ae2_global::GridAddress::from_network(*pos) else{return false};
             let Some((dim,p))=self.ae2_address_parts(address) else{return false};
@@ -326,8 +386,8 @@ impl Game<'_> {
         if !runtime.formed.contains_key(&target){return}
         if let Some(&(id,value))=physical.get(&target) {
             if runtime.source_frames.get(&target).is_some_and(|(old,_)|*old==id) {runtime.source_status(target,id,value);}
-            else {runtime.source_invalid=true;}
-        } else {runtime.source_invalid=true;}
+            else {runtime.invalidate("inventory registration identity mismatch");}
+        } else {runtime.invalidate("inventory center missing");}
         runtime.observe(physical,target);if runtime.active {runtime.members=members;}
         runtime.flush_events(&self.world,self.dim,local);
     }
@@ -342,11 +402,23 @@ impl Game<'_> {
         self.ae2_quantum_runtime.borrow().visual.get(&id).copied()
     }
     pub(super) fn ae2_connect_quantum(&self, network: &mut Network) {
-        let mut frequencies: BTreeMap<i64, Vec<NetworkPos>> = BTreeMap::new();
+        // Process ordered unloads before comparing the registry to the live
+        // physical scan; otherwise a normal chunk unload looks unobserved.
+        let _ = self.ae2_sync_events();
         let (physical,_,nodes)=self.ae2_quantum_physical_frames();
         let mut runtime=self.ae2_quantum_runtime.borrow_mut();
-        runtime.forget_unloaded(&nodes);
-        if runtime.source_frames.iter().any(|(center,recorded)|physical.get(center)!=Some(recorded)) {runtime.source_invalid=true;}
+        let pending:BTreeSet<_>=runtime.formed.iter().filter_map(|(center,frame)|{
+            (nodes.get(center)!=Some(frame) && pending_chunk_unload(frame,|pos|{
+                let (dim,local)=super::ae2_global::GridAddress::from_network(pos)?.local_parts()?;
+                let world=self.ae2_world_for(dim)?;
+                Some((world.block_entities.incarnation(&local)?,world.chunks.contains_key(&(local.0>>4,local.2>>4))))
+            })).then_some(*center)
+        }).collect();
+        runtime.forget_unloaded(&nodes,&pending);
+        if let Some((center,recorded))=runtime.source_frames.iter().find(|(center,recorded)|!pending.contains(center) && physical.get(center)!=Some(recorded)) {
+            let message=format!("physical source mismatch {center:?}: expected {recorded:?}, actual {:?}",physical.get(center));
+            runtime.invalidate(&message);
+        }
         for (dim, world) in self.ae2_loaded_worlds() {
             let blocks = world
                 .block_entities
@@ -386,17 +458,6 @@ impl Game<'_> {
                     }
                 }
             }
-            for frame in QuantumFrame::scan(&blocks) {
-                let p = (frame.center.0, frame.center.1, frame.center.2);
-                if let Some(BlockEntity::Ae2(m)) = world.block_entities.get(&p) {
-                    if let Some(f) = m.slots.first().and_then(Option::as_ref).and_then(frequency) {
-                        if let Some(address) = self.ae2_dimension_address(dim, p) {
-                            let center=address.network_pos();
-                            if runtime.formed.contains_key(&center) && physical.get(&center).is_some_and(|(id,_)|runtime.ready_nodes.contains(id) && runtime.ready_ticked.contains(id)) {frequencies.entry(f).or_default().push(center);}
-                        }
-                    }
-                }
-            }
         }
         if !runtime.source_invalid {
             for (a,b) in runtime.source_registry.links() {
@@ -415,12 +476,9 @@ impl Game<'_> {
             }
             return;
         }
-        for endpoints in frequencies.values_mut() {
-            endpoints.sort();
-            if let [a, b, ..] = endpoints.as_slice() {
-                let _ = network.connect(*a, *b);
-            }
-        }
+        // Unknown callback state cannot establish a source connection.
+        // In particular, sorted physical endpoints invent the wrong pair
+        // when three clusters share a frequency.
     }
 
     /// Called for the original explosion entity snapshot before vanilla item
@@ -494,6 +552,38 @@ impl Game<'_> {
  use super::*;
  fn p(x:i32)->NetworkPos{NetworkPos{x,y:0,z:0}}
  fn id(x:u64)->NodeIdentity{NodeIdentity{host:x,part:None,outer:false}}
+ #[test]fn source_singularity_component_and_legacy_data_select_frequency(){
+  let mut stack=ItemStack::new("minecraft:diamond",1);
+  assert_eq!(frequency(&stack),None);
+  stack.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2:entangled_singularity_id",Tag::Long(17))])));
+  assert_eq!(frequency(&stack),Some(17),"earlier native saves remain readable");
+  stack.data_mut().set_other("ae2:entangled_singularity_id",Some(Tag::Long(0)));
+  assert_eq!(frequency(&stack),Some(0),"a present zero component is insertable but does not connect");
+  stack.data_mut().set_other("ae2:entangled_singularity_id",Some(Tag::Long(-42)));
+  assert_eq!(frequency(&stack),Some(-42),"the actual AE2 component takes precedence");
+  stack.data_mut().set_other("ae2:entangled_singularity_id",Some(Tag::Int(42)));
+  assert_eq!(frequency(&stack),Some(42),"Codec.LONG accepts an unsuffixed integer argument");
+  stack.data_mut().set_other("ae2:entangled_singularity_id",Some(Tag::Double(42.75f64.to_bits())));
+  assert_eq!(frequency(&stack),Some(42),"Number.longValue truncates a floating value");
+  stack.data_mut().set_other("ae2:entangled_singularity_id",Some(Tag::String("invalid".into())));
+  assert_eq!(frequency(&stack),None,"an invalid source component must not select stale legacy data");
+ }
+ #[test]fn source_component_registration_suggests_and_rejects_invalid_item_arguments(){
+  use horizon_client::command::{Registries,Reader,SuggestionsBuilder,item::{parse_stack,suggest_stack}};
+  let mut reg=Registries::default();reg.items.push("ae2:quantum_entangled_singularity".into());
+  horizon_client::ae2_components::register(&mut reg);horizon_client::ae2_components::register(&mut reg);
+  assert_eq!(reg.persistent_components.len(),35,"registration is idempotent");
+  assert_eq!(reg.ids("minecraft:data_component_type").len(),35);
+  let prefix="ae2:quantum_entangled_singularity[ae2:entangled";
+  let mut suggestions=SuggestionsBuilder::new(prefix,0);suggest_stack(&mut suggestions,&reg);
+  assert!(suggestions.out.iter().any(|s|s.text=="ae2:entangled_singularity_id="));
+  let mut valid=Reader::new("ae2:quantum_entangled_singularity[ae2:entangled_singularity_id=42]");
+  assert!(parse_stack(&mut valid,&reg).is_ok());
+  let mut malformed=Reader::new("ae2:quantum_entangled_singularity[ae2:entangled_singularity_id=\"bad\"]");
+  assert!(parse_stack(&mut malformed,&reg).is_err());assert_eq!(malformed.cursor,0);
+  let mut unknown=Reader::new("ae2:quantum_entangled_singularity[ae2:not_registered=1]");
+  assert!(parse_stack(&mut unknown,&reg).is_err());assert_eq!(unknown.cursor,0);
+ }
  #[test]fn callback_order_preserves_first_pair_and_unobserved_changes_fail_closed(){
   let mut runtime=QuantumRuntime::default();let mut frames=BTreeMap::from([(p(0),(id(1),0)),(p(10),(id(2),0)),(p(20),(id(3),42))]);
   runtime.observe(frames.clone(),p(20));assert!(runtime.active);
@@ -540,11 +630,11 @@ impl Game<'_> {
   let frame=FrameNodes::from([(p(0),(id(1),3)),(p(1),(id(2),63))]);
   let mut nodes=PhysicalNodes::from([(p(0),frame.clone())]);
   let physical=BTreeMap::from([(p(0),(id(1),0))]);
-  runtime.forget_unloaded(&nodes);assert!(runtime.formed.is_empty());assert!(runtime.faces.is_empty());
+  runtime.forget_unloaded(&nodes,&BTreeSet::new());assert!(runtime.formed.is_empty());assert!(runtime.faces.is_empty());
   runtime.neighbor_formation(p(1),&nodes,&physical);assert_eq!(runtime.faces.get(&id(1)),Some(&3));assert_eq!(runtime.visual.get(&id(2)),Some(&true));
   runtime.removed(p(1),2);assert!(runtime.formed.is_empty());assert_eq!(runtime.visual.get(&id(1)),Some(&false));assert!(!runtime.faces.contains_key(&id(1)));
   nodes.get_mut(&p(0)).unwrap().insert(p(1),(id(3),63));
-  runtime.forget_unloaded(&nodes);assert!(!runtime.faces.contains_key(&id(3)),"silent replacement must not invent formation");
+  runtime.forget_unloaded(&nodes,&BTreeSet::new());assert!(!runtime.faces.contains_key(&id(3)),"silent replacement must not invent formation");
   runtime.neighbor_formation(p(0),&nodes,&physical);assert_eq!(runtime.faces.get(&id(3)),Some(&63));
  }
  #[test]fn partial_ready_center_registers_without_connecting_until_its_actual_tick(){
@@ -586,7 +676,52 @@ impl Game<'_> {
   assert_eq!(runtime.pending,vec![QuantumEvent::Faces{pos:p(0),id:id(1),faces:63},QuantumEvent::Faces{pos:p(10),id:id(2),faces:63},QuantumEvent::Link{a:id(2),b:id(1),added:true}]);
   runtime.pending.clear();runtime.removed(p(0),1);
   assert_eq!(runtime.pending,vec![QuantumEvent::Link{a:id(1),b:id(2),added:false},QuantumEvent::Faces{pos:p(0),id:id(1),faces:0}]);
-  runtime.pending.clear();runtime.forget_unloaded(&PhysicalNodes::new());
+  runtime.pending.clear();runtime.forget_unloaded(&PhysicalNodes::new(),&BTreeSet::new());
   assert!(runtime.source_invalid);assert!(runtime.pending.is_empty(),"unobserved unload cannot invent source-ordered events");
+ }
+ #[test]fn observed_unload_disconnects_first_pair_without_promoting_third_or_changing_other_faces(){
+  let mut runtime=QuantumRuntime::default();
+  for n in [1,2,3,4] {runtime.node_ready(id(n));}
+  let physical=BTreeMap::from([(p(0),(id(1),42)),(p(10),(id(2),42)),(p(20),(id(3),42))]);
+  let nodes=PhysicalNodes::from([
+   (p(0),FrameNodes::from([(p(0),(id(1),3)),(p(1),(id(4),63))])),
+   (p(10),FrameNodes::from([(p(10),(id(2),63))])),
+   (p(20),FrameNodes::from([(p(20),(id(3),63))])),
+  ]);
+  // Actual registration order, deliberately different from position order.
+  for pos in [p(20),p(0),p(10)] {runtime.form_at(pos,&nodes,&physical);}
+  assert_eq!(runtime.source_registry.peer(id(3)),Some(id(1)));
+  assert_eq!(runtime.source_registry.peer(id(2)),None);
+  runtime.pending.clear();
+  let physical_without_first=PhysicalNodes::from([(p(10),nodes[&p(10)].clone()),(p(20),nodes[&p(20)].clone())]);
+  runtime.forget_unloaded(&physical_without_first,&BTreeSet::from([p(0)]));
+  assert!(!runtime.source_invalid,"saving a removed chunk before its BE journal is not an unknown transition");
+  assert_eq!(runtime.source_registry.peer(id(3)),Some(id(1)));
+  assert!(runtime.unloaded(p(1),999).is_empty(),"stale identity cannot tear down a replacement");
+  let events=runtime.unloaded(p(1),4);
+  assert_eq!(events,vec![ae2_network_core::quantum_registry::LinkEvent{a:id(1),b:id(3),added:false}]);
+  assert!(!runtime.source_invalid);
+  assert!(runtime.pending.is_empty(),"disconnect(false) emits no world-affecting face updates");
+  assert_eq!(runtime.faces.get(&id(1)),Some(&3),"the still-loaded center keeps its constructed face state");
+  assert_eq!(runtime.visual.get(&id(1)),Some(&true));
+  assert_eq!(runtime.source_registry.peer(id(3)),None);
+  assert_eq!(runtime.source_registry.peer(id(2)),None);
+  assert!(runtime.unloaded(p(0),1).is_empty(),"remaining members cannot destroy the same cluster twice");
+  let reloaded=BTreeMap::from([(p(0),(id(5),42)),(p(10),(id(2),42)),(p(20),(id(3),42))]);
+  let mut reloaded_nodes=nodes.clone();
+  reloaded_nodes.insert(p(0),FrameNodes::from([(p(0),(id(5),3)),(p(1),(id(6),63))]));
+  runtime.node_ready(id(5));runtime.node_ready(id(6));
+  runtime.form_at(p(0),&reloaded_nodes,&reloaded);
+  assert_eq!(runtime.source_registry.peer(id(5)),Some(id(3)));
+  assert_eq!(runtime.source_registry.peer(id(2)),None);
+  assert!(runtime.unloaded(p(0),1).is_empty(),"the old unloaded incarnation cannot destroy the reloaded cluster");
+  assert_eq!(runtime.source_registry.peer(id(5)),Some(id(3)));
+ }
+ #[test]fn pending_unload_requires_the_exact_resident_identities_and_a_missing_chunk(){
+  let frame=FrameNodes::from([(p(0),(id(1),3)),(p(1),(id(2),63))]);
+  assert!(pending_chunk_unload(&frame,|pos|Some((if pos==p(0){1}else{2},false))));
+  assert!(!pending_chunk_unload(&frame,|pos|Some((if pos==p(0){1}else{2},true))));
+  assert!(!pending_chunk_unload(&frame,|pos|Some((if pos==p(0){1}else{99},false))));
+  assert!(!pending_chunk_unload(&frame,|pos|(pos==p(0)).then_some((1,false))));
  }
 }

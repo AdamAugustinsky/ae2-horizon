@@ -681,13 +681,7 @@ impl Game<'_> {
         if self.screen == Screen::Inventory && self.title.is_none() {
             let mut slots = Vec::new();
             for i in self.slots() {
-                let stack = if i == 200 {
-                    self.craft_result()
-                } else if (360..374).contains(&i) {
-                    self.slot_view(i)
-                } else {
-                    self.slot_mut(i).clone()
-                };
+                let stack = self.slot_view(i);
                 slots.push(self.slot_value(i, &stack));
             }
             v["slots"] = json!(slots);
@@ -706,6 +700,18 @@ impl Game<'_> {
                     })
                 });
                 v["title"] = json!(spans.collect::<Vec<_>>());
+            }
+            #[cfg(feature = "ae2-lab")]
+            if self.ae2_local_provider_open() {
+                v["title"] = json!([{ "text": if self.ae2_local_provider_priority_open() { "Priority" } else { "ME Pattern Provider" } }]);
+            }
+            #[cfg(feature = "ae2-lab")]
+            if self.ae2_terminal_open() {
+                v["title"] = json!([{ "text": if self.ae2_local_crafting_terminal_open() {"AE2 Crafting Terminal"} else {"AE2 ME Terminal"} }]);
+            }
+            #[cfg(feature = "ae2-lab")]
+            if self.ae2_local_craft_screen()!=0 {
+                v["title"] = json!([{ "text": match self.ae2_local_craft_screen() {1=>"AE2 Craft Amount",3=>"AE2 Crafting Status",_=>"AE2 Craft Confirm"} }]);
             }
             // The recipe book's buttons (GUI pixels): the book button, then
             // the recipe buttons of the page, page arrows, filter and tabs.

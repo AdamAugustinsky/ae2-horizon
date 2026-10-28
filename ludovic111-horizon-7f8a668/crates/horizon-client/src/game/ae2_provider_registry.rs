@@ -104,8 +104,9 @@ fn decode_snapshot(snapshot: &Ae2ProviderSnapshot) -> Result<ProviderData, Strin
 /// comes from the real host recipe tables supplied by the caller.
 fn provider_definitions(
     snapshot: &Ae2ProviderSnapshot,
-    mut valid_crafting: impl FnMut(&[Option<ItemStack>], &ItemStack) -> bool,
-    mut valid_special: impl FnMut(&super::ae2_processing::SpecialPattern) -> bool,
+    mut crafting_output: impl FnMut(&ItemStack, &[Option<ItemStack>], &ItemStack) -> Option<ItemStack>,
+    mut special_output: impl FnMut(&ItemStack, &super::ae2_processing::SpecialPattern) -> Option<ItemStack>,
+    mut known_item: impl FnMut(&ItemStack) -> bool,
 ) -> Result<Vec<Definition<String, String>>, String> {
     fn item_key(item: &ItemStack) -> String {
         let mut one = item.clone(); one.count = 1;
@@ -119,9 +120,10 @@ fn provider_definitions(
     for mut item in decode_snapshot(snapshot)?.slots.into_iter().flatten() {
         item.count = 1;
         let primary = if let Some(special) = super::ae2_processing::ae2_decode_special_pattern(&item) {
-            if !valid_special(&special) { continue; }
-            item_key(&special.output)
-        } else if let Some((_, outputs)) = super::ae2_processing::ae2_decode_processing_pattern(&item) {
+            let Some(output)=special_output(&item,&special) else { continue; };
+            item_key(&output)
+        } else if let Some((inputs, outputs)) = super::ae2_processing::ae2_decode_processing_pattern(&item) {
+            if inputs.iter().chain(&outputs).flatten().any(|value|!known_item(value)) {continue;}
             let (_, fluids) = super::ae2_processing::ae2_decode_processing_fluids(&item).ok_or("invalid processing fluids")?;
             match super::ae2_processing::ae2_decode_processing_positions(&item)? {
                 Some((_, positioned_fluids)) => {
@@ -142,7 +144,7 @@ fn provider_definitions(
                 }
             }
         } else if let Some((grid, output)) = super::ae2_processing::decode_pattern(&item) {
-            if !valid_crafting(&grid, &output) { continue; }
+            let Some(output)=crafting_output(&item,&grid,&output) else { continue; };
             item_key(&output)
         } else {
             // The source ignores stacks that do not decode to a pattern.
@@ -838,9 +840,25 @@ impl Game<'_> {
         if let Err(error) = result { self.ae2_provider_events_fault(error); }
     }
     pub(super) fn ae2_provider_definitions(&self, snapshot: &Ae2ProviderSnapshot) -> Result<Vec<Definition<String, String>>, String> {
+        let known=|item:&ItemStack|item.item.as_ref()!="ae2:missing_content" && self.res.items().get(&item.item).is_some();
         provider_definitions(snapshot,
-            |grid, expected| self.res.recipes().find(grid, 3).is_some_and(|(_, actual)| actual == *expected),
-            |special| super::ae2_processing::special_recipe_result(self.res.stations(), &special.kind, &special.recipe, &special.grid) == Some(special.output.clone()))
+            |pattern, grid, encoded| {
+                if !known(encoded) || grid.iter().flatten().any(|item|!known(item)) {return None;}
+                let actual=if let Some(source)=super::ae2_source_patterns::crafting(pattern) {
+                    let source=source.ok()?;self.res.recipes().assemble_named(&source.recipe,grid,3)?
+                } else {
+                    let (_,actual)=self.res.recipes().find(grid,3)?;
+                    if actual!=*encoded {return None;}actual
+                };
+                known(&actual).then_some(actual)
+            },
+            |pattern, special| {
+                if !known(&special.output) || special.grid.iter().flatten().any(|item|!known(item)) {return None;}
+                let actual=super::ae2_processing::special_recipe_result(self.res.stations(),&special.kind,&special.recipe,&special.grid)?;
+                if super::ae2_source_patterns::special(pattern).is_none() && actual!=special.output {return None;}
+                known(&actual).then_some(actual)
+            },
+            known)
     }
     /// Capture a committed in-place `/data` load; its source read does not
     /// refresh the cached pattern list or mounted provider entry.
@@ -1490,6 +1508,21 @@ mod tests {
     }
 
     #[test]
+    fn provider_indexes_resolved_recipe_output_not_stale_encoded_display() {
+        let mut grid=vec![None;9];grid[0]=Some(ItemStack::new("minecraft:oak_log",1));
+        let encoded=ItemStack::new("minecraft:oak_planks",4);
+        let pattern=super::super::ae2_processing::ae2_encode_pattern_source(&grid,&encoded,"example:changed",false,false).unwrap();
+        let mut slots=vec![None;9];slots[0]=Some(pattern);
+        let snapshot=Ae2ProviderSnapshot::Block {slot_count:9,raw_slots:save::encode_items(&slots),raw_priority:None};
+        let expected=ItemStack::new("minecraft:diamond",1);
+        let definitions=provider_definitions(&snapshot,|pattern,_,_| {
+            assert_eq!(super::super::ae2_source_patterns::crafting(pattern).unwrap().unwrap().recipe,"example:changed");
+            Some(expected.clone())
+        },|_,special|Some(special.output.clone()),|_|true).unwrap();
+        assert_eq!(definitions.len(),1);
+        assert_eq!(definitions[0].primary_output,horizon_client::item_data::canon_stack(Some(&expected)));
+    }
+    #[test]
     fn provider_observer_decodes_definition_identity_and_primary_output() {
         let pattern = |input: &str| super::super::ae2_processing::ae2_encode_processing_pattern(
             &[Some(ItemStack::new(input, 1))], &[Some(ItemStack::new("minecraft:diamond", 1))]).unwrap();
@@ -1502,14 +1535,14 @@ mod tests {
         slots[0] = Some(first); slots[1] = Some(duplicate); slots[2] = Some(second);
         slots[3] = Some(ItemStack::new("minecraft:stone", 1)); slots[4] = Some(crafting);
         let snapshot = Ae2ProviderSnapshot::Block { slot_count: 9, raw_slots: save::encode_items(&slots), raw_priority: None };
-        let valid = provider_definitions(&snapshot, |_, _| true, |_| true).unwrap();
+        let valid = provider_definitions(&snapshot, |_,_,output| Some(output.clone()), |_,special| Some(special.output.clone()), |_| true).unwrap();
         assert_eq!(valid.len(), 4);
         assert_eq!(valid[0].key, valid[1].key);
         assert_ne!(valid[0].key, valid[2].key);
         assert_eq!(valid[0].primary_output, valid[2].primary_output);
         let mut output = ItemStack::new("minecraft:diamond", 1); output.count = 1;
         assert_eq!(valid[0].primary_output, horizon_client::item_data::canon_stack(Some(&output)));
-        assert_eq!(provider_definitions(&snapshot, |_, _| false, |_| true).unwrap().len(), 3);
+        assert_eq!(provider_definitions(&snapshot, |_,_,_| None, |_,special| Some(special.output.clone()), |_| true).unwrap().len(), 3);
     }
 
     #[test]
@@ -1522,7 +1555,7 @@ mod tests {
             &[Some(ItemStack::new("minecraft:iron_ingot",1))], &[Some(ItemStack::new("minecraft:diamond",1))]).unwrap());
         let snapshot=Ae2ProviderSnapshot::Block {slot_count:9,raw_slots:save::encode_items(&slots),raw_priority:None};
         assert_eq!(decode_snapshot(&snapshot).unwrap().slots,slots);
-        let definitions=provider_definitions(&snapshot,|_,_|true,|_|true).unwrap();
+        let definitions=provider_definitions(&snapshot,|_,_,output|Some(output.clone()),|_,special|Some(special.output.clone()),|_|true).unwrap();
         assert_eq!(definitions.len(),1);
         assert_eq!(definitions[0].primary_output,horizon_client::item_data::canon_stack(Some(&ItemStack::new("minecraft:diamond",1))));
     }
@@ -1537,7 +1570,7 @@ mod tests {
             &[Some(ItemStack::new("minecraft:diamond", 1))], &[], &[fluid]).unwrap();
         let mut slots = vec![None; 9]; slots[0] = Some(pattern);
         let snapshot = Ae2ProviderSnapshot::Block { slot_count: 9, raw_slots: save::encode_items(&slots), raw_priority: None };
-        assert_eq!(provider_definitions(&snapshot, |_, _| true, |_| true), Err("ambiguous legacy mixed processing primary output".into()));
+        assert_eq!(provider_definitions(&snapshot, |_,_,output| Some(output.clone()), |_,special| Some(special.output.clone()), |_| true), Err("ambiguous legacy mixed processing primary output".into()));
     }
 
     #[test]
@@ -1551,7 +1584,7 @@ mod tests {
         let pattern = super::super::ae2_processing::ae2_encode_processing_positioned(&inputs, &outputs, &fluid_inputs, &fluid_outputs).unwrap();
         let mut slots = vec![None; 9]; slots[0] = Some(pattern);
         let snapshot = Ae2ProviderSnapshot::Block { slot_count: 9, raw_slots: save::encode_items(&slots), raw_priority: None };
-        let definitions = provider_definitions(&snapshot, |_, _| true, |_| true).unwrap();
+        let definitions = provider_definitions(&snapshot, |_,_,output| Some(output.clone()), |_,special| Some(special.output.clone()), |_| true).unwrap();
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].primary_output, "fluid|minecraft:water|0102");
     }

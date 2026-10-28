@@ -5,7 +5,7 @@ use ae2_network_core::{CommittedChannels, Device, DeviceKind, Network, NodeIdent
 use horizon_client::{
     ae2_event_replay::EventReplay,
     ae2_world::{Machine, MachineKind},
-    block_entities::Ae2Mutation,
+    block_entities::{Ae2Mutation, Ae2MutationKind},
 };
 use horizon_world::{nbt::Tag, registry::BlockStateId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +34,7 @@ pub(super) struct LiveEvents {
     cpu_requests: Option<BTreeMap<u64, Result<BTreeSet<String>, String>>>,
     cpu_request_failure: Option<String>,
     pub(super) energy: super::ae2_energy_observer::EnergyObserver,
+    anchor: super::ae2_anchor_observer::AnchorObserver,
 }
 pub(super) struct OrderedProviderPass {
     service: u64,
@@ -54,26 +55,30 @@ impl Default for LiveEvents {
         });
         let energy=super::ae2_energy_observer::EnergyObserver{failure:membership_failure,..Default::default()};
         Self { replay, pending: Vec::new(), failure: None, poisoned: false, provider_failure, provider_shadow,
-            cpu_requests: None, cpu_request_failure: None, energy }
+            cpu_requests: None, cpu_request_failure: None, energy, anchor: Default::default() }
     }
 }
 fn trace_energy_and_provider(
     game:&Game<'_>, energy:&mut super::ae2_energy_observer::EnergyObserver,
+    anchor:&mut super::ae2_anchor_observer::AnchorObserver,
     provider:Option<&mut ProviderObserver<String,String>>, topology:&mut PhysicalTopology,
     checkpoint:ReplayCheckpoint<'_>,
 ) {
-    if let ReplayCheckpoint::BeforeMutation{dimension,event}=&checkpoint {energy.before(*dimension,event);}
+    // Source GridEnergyStorage reads the configured capacity on add/remove,
+    // not continuously while its existing membership remains unchanged.
+    energy.per_node_capacity=Some(horizon_client::ae2_common_config::gameplay().grid_energy_per_node);
+    if let ReplayCheckpoint::BeforeMutation{dimension,event}=&checkpoint {energy.before(*dimension,event);anchor.before(*dimension,event);}
     let after=match &checkpoint {ReplayCheckpoint::AfterMutation{dimension,event}=>Some((*dimension,*event)),_=>None};
     if let Some(provider)=provider {
         provider.observe_with_membership(topology,checkpoint,&mut |snapshot|game.ae2_provider_definitions(snapshot),
-            &mut super::ae2_provider_registry::emitter_definitions,&mut |change|energy.membership(change));
+            &mut super::ae2_provider_registry::emitter_definitions,&mut |change|{anchor.membership(change.clone());energy.membership(change)});
     } else {
         match topology.services.take_membership_changes() {
-            Ok(changes)=>for change in changes {energy.membership(Ok(change));},
-            Err(error)=>energy.membership(Err(error.into())),
+            Ok(changes)=>for change in changes {anchor.membership(Ok(change));energy.membership(Ok(change));},
+            Err(error)=>{anchor.membership(Err(error.into()));energy.membership(Err(error.into()));},
         }
     }
-    if let Some((dimension,event))=after {energy.after(dimension,event);}
+    if let Some((dimension,event))=after {energy.after(dimension,event);anchor.after(dimension,event);}
 }
 impl LiveEvents {
     fn commit_provider_shadow(&mut self, staged: Option<ProviderObserver<String, String>>, checkpoint: &str) {
@@ -374,6 +379,14 @@ impl Game<'_> {
         let live=self.ae2_live_events.borrow();
         !live.poisoned && live.failure.is_none() && live.replay.node_is_ready(id)
     }
+    pub(super) fn ae2_take_anchor_callbacks(&self)->Result<Vec<super::ae2_anchor_observer::AnchorCallback>,String> {
+        if !self.ae2_sync_events(){return Err("ordered anchor lifecycle unavailable".into())}
+        self.ae2_live_events.borrow_mut().anchor.take_callbacks()
+    }
+    pub(super) fn ae2_ordered_anchor_chunks(&self,id:NodeIdentity,dim:Dim)->Result<Option<BTreeSet<(i32,i32)>>,String> {
+        if !self.ae2_sync_events(){return Err("ordered anchor lifecycle unavailable".into())}
+        self.ae2_live_events.borrow().anchor.chunks(id,ordinal(dim))
+    }
     pub(super) fn ae2_phantom_is_ready(&self, id: NodeIdentity, pos: ae2_network_core::Pos) -> bool {
         if !self.ae2_sync_events() { return false; }
         let live = self.ae2_live_events.borrow();
@@ -490,11 +503,45 @@ impl Game<'_> {
         if live.pending.is_empty() {
             return live.failure.is_none();
         }
-        let batch = live.pending.clone();
+        // onChunkUnloaded calls disconnect(false) before its grid node is
+        // removed. The journal keeps the exact former host incarnation and
+        // actual bulk-removal order even after the chunks have been dropped.
+        // Stage both the quantum registry and its synthetic link callbacks so
+        // a failed topology replay cannot commit only half the transition.
+        let has_quantum_unload = live.pending.iter().any(|(_, event)| matches!(&event.kind,
+            Ae2MutationKind::EntityRemoved {
+                entity: horizon_client::containers::BlockEntity::Ae2(machine), bulk_unload: true, ..
+            } if matches!(machine.kind, MachineKind::QuantumRing | MachineKind::QuantumLink)));
+        let mut staged_quantum = has_quantum_unload.then(|| self.ae2_quantum_runtime.borrow().clone());
+        let mut batch = Vec::with_capacity(live.pending.len());
+        for (dim, event) in live.pending.clone() {
+            if let Ae2MutationKind::EntityRemoved {
+                incarnation, entity: horizon_client::containers::BlockEntity::Ae2(machine), bulk_unload: true,
+            } = &event.kind {
+                if matches!(machine.kind, MachineKind::QuantumRing | MachineKind::QuantumLink) {
+                    let Some(pos) = GridAddress::from_local(match dimension(dim) {
+                        Some(value) => value,
+                        None => { live.failure=Some("invalid quantum unload dimension".into()); return false; }
+                    }, event.position).map(GridAddress::network_pos) else {
+                        live.failure=Some("invalid quantum unload position".into()); return false;
+                    };
+                    for link in staged_quantum.as_mut().expect("quantum unload batch").unloaded(pos,*incarnation) {
+                        batch.push((dim, Ae2Mutation {
+                            sequence: event.sequence,
+                            server_tick: event.server_tick,
+                            position: event.position,
+                            kind: Ae2MutationKind::QuantumLink { a: link.a, b: link.b, added: link.added },
+                        }));
+                    }
+                }
+            }
+            batch.push((dim,event));
+        }
         let mut staged_runtime = self.ae2_me_runtime.borrow().clone();
         let mut staged_devices = self.ae2_device_scheduler.borrow().clone();
         let mut staged_provider = live.provider_shadow.clone();
         let mut staged_energy = live.energy.clone();
+        let mut staged_anchor = live.anchor.clone();
         if let (Some(observer), Some(reason)) = (staged_provider.as_mut(), live.provider_failure.as_ref()) {
             observer.invalidate(reason.clone());
         }
@@ -507,12 +554,14 @@ impl Game<'_> {
                 Ok(())
         };
         let result = live.replay.batch_observed_traced(batch, encode, device, is_ae2, observe,
-            |topology,checkpoint|trace_energy_and_provider(self,&mut staged_energy,staged_provider.as_mut(),topology,checkpoint));
+            |topology,checkpoint|trace_energy_and_provider(self,&mut staged_energy,&mut staged_anchor,staged_provider.as_mut(),topology,checkpoint));
         match result {
             Ok(()) => {
+                if let Some(quantum) = staged_quantum { *self.ae2_quantum_runtime.borrow_mut() = quantum; }
                 *self.ae2_me_runtime.borrow_mut() = staged_runtime;
                 *self.ae2_device_scheduler.borrow_mut() = staged_devices;
                 live.energy = staged_energy;
+                live.anchor = staged_anchor;
                 live.commit_provider_shadow(staged_provider, "batch");
                 live.pending.clear();
                 live.failure = None;
@@ -543,11 +592,12 @@ impl Game<'_> {
             let before = live.replay.clone();
             let mut staged_provider = live.provider_shadow.clone();
             let mut staged_energy = live.energy.clone();
+            let mut staged_anchor = live.anchor.clone();
             if let (Some(observer), Some(reason)) = (staged_provider.as_mut(), live.provider_failure.as_ref()) {
                 observer.invalidate(reason.clone());
             }
             let ready = live.replay.ready_chunk_traced(dim, chunk, |m, state| self.ae2_event_device(m, state),
-                |topology,checkpoint|trace_energy_and_provider(self,&mut staged_energy,staged_provider.as_mut(),topology,checkpoint));
+                |topology,checkpoint|trace_energy_and_provider(self,&mut staged_energy,&mut staged_anchor,staged_provider.as_mut(),topology,checkpoint));
             if let Err(error) = ready {
                 if live.failure.as_deref() != Some(&error) {
                     log::warn!("AE2 event readiness paused: {error}");
@@ -565,6 +615,7 @@ impl Game<'_> {
             *self.ae2_me_runtime.borrow_mut() = staged_runtime;
             *self.ae2_device_scheduler.borrow_mut() = staged_devices;
             live.energy = staged_energy;
+            live.anchor = staged_anchor;
             live.commit_provider_shadow(staged_provider, "ready");
             let ready:Vec<_>=self.world.block_entities.iter().filter_map(|(&pos,be)| {
                 if (pos.0>>4,pos.2>>4)!=chunk || !matches!(be,horizon_client::containers::BlockEntity::Ae2(m) if matches!(m.kind,MachineKind::QuantumRing|MachineKind::QuantumLink)) {return None}
@@ -602,6 +653,14 @@ impl Game<'_> {
                 }
                 None
             }
+        }
+    }
+    pub(super) fn ae2_event_connection_order(&self, network: &mut Network) {
+        if !self.ae2_sync_events() {return;}
+        let live=self.ae2_live_events.borrow();
+        if self.ae2_committed_channels.with_ordered(&live.replay.topology.services,network).is_err(){return;}
+        if let Err(error)=network.record_connection_order(&live.replay.topology.services) {
+            if std::env::var_os("HORIZON_AE2_EVENT_TRACE").is_some(){log::info!("AE2 ordered pathing unavailable: {error}");}
         }
     }
     pub(super) fn ae2_event_service_ids(&self, network: &Network) -> Option<BTreeMap<ae2_network_core::NodeIdentity,u64>> {

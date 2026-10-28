@@ -53,7 +53,7 @@ impl Game<'_> {
         if stack.count != 1 || !(portable_item(&stack) || portable_fluid(&stack)) {
             return Err("portable cell moved".into());
         }
-        read(&stack)?;
+        self.ae2_read_cell(&stack)?;
         ae2_interactions::portable_energy(&stack)?;
         Ok(stack)
     }
@@ -72,7 +72,7 @@ impl Game<'_> {
         Ok(())
     }
     fn portable_entries(&self, source: usize) -> Result<Vec<(ItemKey, u64)>, String> {
-        let cell = read(&self.portable_stack(source)?)?;
+        let cell = self.ae2_read_cell(&self.portable_stack(source)?)?;
         Ok(cell.entries().map(|(k, n)| (k.clone(), *n)).collect())
     }
     fn portable_display(
@@ -131,7 +131,8 @@ impl Game<'_> {
         factor: f64,
     ) -> Result<u64, String> {
         let (power, _) = ae2_interactions::portable_energy(stack)?;
-        Ok(amount.min((power * factor + 0.9).floor() as u64))
+        let usage = horizon_client::ae2_common_config::gameplay().usage_multiplier;
+        Ok(amount.min((power / usage * factor + 0.9).floor() as u64))
     }
     fn portable_debit(
         &self,
@@ -139,7 +140,8 @@ impl Game<'_> {
         amount: u64,
         factor: f64,
     ) -> Result<(), String> {
-        ae2_interactions::portable_extract_energy(stack, amount as f64 / factor, false)?;
+        let usage = horizon_client::ae2_common_config::gameplay().usage_multiplier;
+        ae2_interactions::portable_extract_energy(stack, amount as f64 / factor * usage, false)?;
         Ok(())
     }
     fn portable_click_inner(
@@ -222,7 +224,7 @@ impl Game<'_> {
         *drag = PortableDrag::default();
         let Some(slot) = slot else { return Ok(()) };
         let mut stack = self.portable_stack(source)?;
-        let mut cell = read(&stack)?;
+        let mut cell = self.ae2_read_cell(&stack)?;
         let fluid = portable_fluid(&stack);
         let entries: Vec<_> = cell.entries().map(|(k, n)| (k.clone(), *n)).collect();
         *page = (*page).min(entries.len().saturating_sub(1) / PAGE);
@@ -678,6 +680,7 @@ impl Game<'_> {
         ) else {
             return true;
         };
+        Self::lan_mark_ae2_base_screen(host,conn,window);
         host.play.entry(conn).or_default().ae2_portable = Some(GuestPortable {
             window,
             state: 0,

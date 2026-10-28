@@ -10,6 +10,10 @@ pub mod gui;
 mod special;
 #[cfg(feature="ae2-lab")]
 mod ae2_facade;
+#[cfg(feature="ae2-lab")]
+mod ae2_dynamic;
+#[cfg(feature="ae2-lab")]
+pub use ae2_dynamic::{WrappedKey, wrapped_key};
 
 use crate::{
     block_entity_render::{ModelPart, diffuse},

@@ -137,6 +137,7 @@ impl Service {
     }
 }
 impl Game<'_> {
+    pub(super) fn ae2_has_anchor_owners(&self)->bool {!self.ae2_anchors.owners.is_empty()}
     /// Visual synchronization reads only the physical setting and held owner
     /// tickets. It must not reconstruct the grid for every Anchor every frame.
     pub(super) fn ae2_anchor_overlay_snapshot(
@@ -211,13 +212,12 @@ impl Game<'_> {
             let Some(a) = physical.get(node).copied() else {
                 continue;
             };
-            let Some((dim, p)) = self.ae2_address_parts(a) else {
+            let Some((dim, _)) = self.ae2_address_parts(a) else {
                 continue;
             };
             let Some(BlockEntity::Ae2(m)) = self.ae2_block_entity(a) else {
                 continue;
             };
-            chunks.entry(dim).or_default().insert((p.0 >> 4, p.2 >> 4));
             if m.kind == MachineKind::SpatialAnchor {
                 let count = self
                     .ae2_anchors
@@ -229,6 +229,11 @@ impl Game<'_> {
                     .and_modify(|v| *v = (*v).max(count))
                     .or_insert(count);
             }
+        }
+        let anchor_id=*network.node_identities.get(&address.network_pos())?;
+        for dim in [Dim::Overworld,Dim::Nether,Dim::End,Dim::Spatial] {
+            let Some(occupied)=self.ae2_ordered_anchor_chunks(anchor_id,dim).ok()? else {continue};
+            if !occupied.is_empty(){chunks.insert(dim,occupied);}
         }
         let mut anchor_max_by_dimension = maxima.into_iter().collect::<Vec<_>>();
         anchor_max_by_dimension.sort_by_key(|v| v.0.id());
@@ -247,9 +252,10 @@ impl Game<'_> {
         })
     }
     pub(super) fn ae2_anchor_command(
-        &self,
+        &mut self,
         words: &[&str],
     ) -> std::result::Result<serde_json::Value, String> {
+        self.ae2_apply_anchor_callbacks()?;
         if words.len() != 4 || words[0] != "status" {
             return Err("anchor status x y z".into());
         }
@@ -293,6 +299,50 @@ impl Game<'_> {
             }
             self.ae2_sync_anchor_tickets();
         }
+        Ok(())
+    }
+    /// Apply the observed StatisticsService owner callbacks in their actual
+    /// membership order. The replay staged them before removing their physical
+    /// identities, and the mutable boundary owns ticket publication.
+    pub(super) fn ae2_apply_anchor_callbacks(&mut self) -> std::result::Result<(),String> {
+        let callbacks=self.ae2_take_anchor_callbacks()?;
+        if callbacks.is_empty(){return Ok(())}
+        let now=self.ae2_server_tick();
+        let mut changed=false;
+        for callback in callbacks {
+            let (id,address,chunk,kind)=match callback {
+                super::ae2_anchor_observer::AnchorCallback::Removed{owner,address}=>{
+                    if self.ae2_anchors.owners.get(&address).is_some_and(|entry|entry.incarnation==Some(owner.host)) {
+                        if let Some(mut owner)=self.ae2_anchors.owners.remove(&address) {
+                            let mut controller=Controller{held:owner.state.chunks().clone()};
+                            owner.state.remove(&mut controller);
+                            changed=true;
+                        }
+                    }
+                    continue;
+                }
+                super::ae2_anchor_observer::AnchorCallback::Chunk{owner,address,chunk,kind}=>(owner,address,chunk,kind),
+            };
+            let Some((dim,pos))=self.ae2_address_parts(address) else{continue};
+            let Some(world)=self.ae2_world_for(dim) else{continue};
+            if world.block_entities.incarnation(&pos)!=Some(id.host)
+                || !matches!(world.block_entities.get(&pos),Some(BlockEntity::Ae2(m)) if m.kind==MachineKind::SpatialAnchor) {continue}
+            let owner=self.ae2_anchors.owners.entry(address).or_insert_with(||Owner::new(now));
+            if owner.incarnation.is_some_and(|host|host!=id.host){continue}
+            owner.incarnation=Some(id.host);
+            let before=owner.state.chunks().clone();
+            let mut controller=Controller{held:before.clone()};
+            match kind {
+                ae2_links_core::anchor_grid::Kind::Added=>{owner.state.force(chunk,&mut controller);}
+                ae2_links_core::anchor_grid::Kind::Removed=>{
+                    owner.state.release(chunk,true,&mut controller);
+                    owner.awake=true;
+                    owner.next_poll=owner.next_poll.min(owner.last_poll.saturating_add(1));
+                }
+            }
+            changed|=&before!=owner.state.chunks();
+        }
+        if changed {self.ae2_anchors.dirty=true;self.ae2_sync_anchor_tickets();}
         Ok(())
     }
     fn ae2_sync_anchor_tickets(&mut self) {
@@ -367,6 +417,7 @@ impl Game<'_> {
         self.ae2_anchors.save(&self.world_root)
     }
     pub(super) fn ae2_tick_anchors(&mut self) {
+        if let Err(error)=self.ae2_apply_anchor_callbacks(){log::warn!("AE2 anchor events unavailable: {error}");return;}
         let now = self.ae2_server_tick();
         let owners = self
             .world
@@ -383,7 +434,6 @@ impl Game<'_> {
         let Ok(analysis) = network.analyze() else {
             return;
         };
-        let physical = self.ae2_anchor_node_owners(&network);
         for pos in owners {
             let Some(address) = self.ae2_local_address(pos) else {
                 continue;
@@ -397,18 +447,8 @@ impl Game<'_> {
                     .as_ref()
                     .is_none_or(|c| c.contains_identity(*id))
             });
-            let required = status.map(|status| {
-                analysis.components[status.component]
-                    .positions
-                    .iter()
-                    .filter_map(|p| {
-                        let a = *physical.get(p)?;
-                        let (dim, p) = self.ae2_address_parts(a)?;
-                        (dim == self.dim && self.ae2_block_entity(a).is_some())
-                            .then_some((p.0 >> 4, p.2 >> 4))
-                    })
-                    .collect::<BTreeSet<_>>()
-            });
+            let required = network.node_identities.get(&node).and_then(|id|
+                self.ae2_ordered_anchor_chunks(*id,self.dim).ok().flatten());
             let owner = self
                 .ae2_anchors
                 .owners

@@ -84,13 +84,21 @@ impl Game<'_> {
             .collect()
     }
     pub(super) fn ae2_p2p_tax(&mut self, port: &Port, operations: f64) {
+        let config = horizon_client::ae2_common_config::gameplay();
+        self.ae2_p2p_debit(port, operations * config.p2p_transport_tax * config.usage_multiplier);
+    }
+    pub(super) fn ae2_p2p_energy_tax(&mut self, port: &Port, transported_fe: f64) {
+        let config = horizon_client::ae2_common_config::gameplay();
+        self.ae2_p2p_debit(port, transported_fe * config.forge_energy * config.p2p_energy_tax * config.usage_multiplier);
+    }
+    fn ae2_p2p_debit(&mut self, port: &Port, amount: f64) {
         let Some(address) = GridAddress::from_network(port.pos) else {
             return;
         };
         // P2P tax is paid by its carrier grid, even when the initiating
         // storage operation is powered by a wireless terminal item.
         let wireless = self.ae2_wireless_power.take();
-        let _ = self.ae2_take_power_encoded(address, operations * 0.025, false);
+        let _ = self.ae2_take_power_encoded_raw(address, amount, false);
         self.ae2_wireless_power = wireless;
     }
     fn ae2_item_p2p_insert_inner(

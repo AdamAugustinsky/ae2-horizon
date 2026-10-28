@@ -1496,6 +1496,20 @@ impl Recipes {
     pub fn find(&self, grid: &[Option<ItemStack>], size: usize) -> Option<(&str, ItemStack)> {
         self.find_with(grid, size, &|_| None)
     }
+    /// Assemble a specific saved recipe even when another matching recipe is
+    /// earlier in the manager. AE2 patterns persist their recipe identity.
+    pub fn assemble_named(&self, id: &str, grid: &[Option<ItemStack>], size: usize) -> Option<ItemStack> {
+        let name = id.strip_prefix("minecraft:").unwrap_or(id);
+        if let Some((_, recipe)) = self.crafting.iter().find(|(n, _)| n == name) {
+            let input = Input::of(grid, size)?;
+            let context = Context { recipes: self, map_scale: &|_| None };
+            return Self::assemble_if_matches(&context, &input, recipe).flatten();
+        }
+        // Dynamic recipes are handled separately by find; accept only its
+        // exact identity, never a different matching recipe.
+        let (found, result) = self.find(grid, size)?;
+        (found.strip_prefix("minecraft:").unwrap_or(found) == name).then_some(result)
+    }
     /// `RecipeManager.getRecipeFor(CRAFTING, ...)` with a lookup for the scale
     /// of a filled map (map extending reads the map's saved data).
     pub fn find_with(
@@ -1532,6 +1546,7 @@ impl Recipes {
                                 "minecraft:custom_data",
                                 Some(horizon_world::nbt::Tag::Compound(data)),
                             );
+                            result.data_mut().set_other("ae2:facade_item",Some(horizon_world::nbt::Tag::String(center.item.as_ref().into())));
                             return Some((name.as_str(), result));
                         }
                     }
@@ -1791,6 +1806,7 @@ mod tests {
         fs::write(nested.join("shared.json"), br##"{"type":"minecraft:crafting_shaped","pattern":["A"],"key":{"A":"#c:gems/fluix"},"result":{"id":"ae2:drive","count":1}}"##).unwrap();
         fs::write(other.join("shared.json"), br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stone","minecraft:redstone"],"result":{"id":"ae2:other","count":1}}"#).unwrap();
         fs::write(other.join("custom.json"), br#"{"type":"ae2:inscriber"}"#).unwrap();
+        fs::write(nested.join("zzz_alternate.json"), br##"{"type":"minecraft:crafting_shaped","pattern":["A"],"key":{"A":"#c:gems/fluix"},"result":{"id":"ae2:other","count":2}}"##).unwrap();
         let items = Items::for_tests(HashMap::from([(
             "c:gems/fluix".into(),
             HashSet::from(["ae2:fluix_crystal".into()]),
@@ -1801,12 +1817,15 @@ mod tests {
         let (id, out) = recipes.find(&grid, 3).unwrap();
         assert_eq!(id, "ae2:network/blocks/shared");
         assert_eq!(&*out.item, "ae2:drive");
+        let selected=recipes.assemble_named("ae2:network/blocks/zzz_alternate",&grid,3).unwrap();
+        assert_eq!((&*selected.item,selected.count),("ae2:other",2));
+        assert!(recipes.assemble_named("ae2:network/blocks/no_such_recipe",&grid,3).is_none());
         grid[0] = Some(ItemStack::new("minecraft:stone", 1));
         grid[1] = Some(ItemStack::new("minecraft:redstone", 1));
         let (id, out) = recipes.find(&grid, 3).unwrap();
         assert_eq!(id, "ae2:tools/shared");
         assert_eq!(&*out.item, "ae2:other");
-        assert_eq!(recipes.crafting.len(), 2);
+        assert_eq!(recipes.crafting.len(), 3);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1867,6 +1886,7 @@ mod tests {
         let (id, result) = book.find(&grid, 3).unwrap();
         assert_eq!(id, "ae2:special/facade");
         assert_eq!(result.count, 4);
+        assert!(matches!(result.data().and_then(|d|d.other("ae2:facade_item")),Some(horizon_world::nbt::Tag::String(s)) if s.to_string_lossy()=="minecraft:stone"));
         assert!(
             matches!(result.data().and_then(|d|d.other("minecraft:custom_data")).and_then(|t|t.get("ae2:facade_item")),Some(horizon_world::nbt::Tag::String(s)) if s.to_string_lossy()=="minecraft:stone")
         );

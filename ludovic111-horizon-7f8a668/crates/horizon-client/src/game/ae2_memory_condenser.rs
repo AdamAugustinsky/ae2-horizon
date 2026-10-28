@@ -22,13 +22,31 @@ mod condenser_memory {
         body.insert("settings".into(),Tag::compound([(OUTPUT,Tag::String(output.as_str().into()))]));
         if let Some(name)=name{body.insert("name".into(),Tag::String(name.into()));}
         data.remove(&P2P.into());data.insert(KEY.into(),Tag::Compound(body));
-        card.data_mut().set_other("minecraft:custom_data",Some(Tag::Compound(data)));Ok(())
+        card.data_mut().set_other("minecraft:custom_data",Some(Tag::Compound(data)));
+        card.data_mut().set_other("ae2:exported_settings_source",Some(Tag::compound([("translate",Tag::String("block.ae2.condenser".into()))])));
+        card.data_mut().set_other("ae2:exported_settings",Some(Tag::compound([(OUTPUT,Tag::String(output.to_ascii_uppercase().as_str().into()))])));
+        card.data_mut().set_other("ae2:exported_custom_name",name.map(|value|Tag::String(value.into())));Ok(())
     }
     /// Generic settings are independent of source identity. Missing or unknown
     /// output values do not call the target's mode callback; same-kind import
     /// still imports the name, including clearing an absent name.
     pub(in crate::game) fn read_condenser(card:&ItemStack)->Result<Option<SavedCondenser>,String>{
         if card.item.as_ref()!="ae2:memory_card"||card.count!=1{return Err("invalid card".into())}
+        if let Some(data)=card.data(){
+            if ["ae2:exported_settings_source","ae2:exported_settings","ae2:exported_custom_name"].iter().any(|id|data.other(id).is_some()){
+                let matching=source_description_matches(data.other("ae2:exported_settings_source"),"block.ae2.condenser");
+                let output=match data.other("ae2:exported_settings"){
+                    None=>None,Some(Tag::Compound(settings))=>match settings.get(&OUTPUT.into()){
+                        None=>None,Some(Tag::String(value))=>{let value=value.to_string().map_err(|_|"invalid output setting")?;let lower=value.to_ascii_lowercase();(value==lower.to_ascii_uppercase()&&MODES.contains(&lower.as_str())).then_some(lower)},_=>return Err("invalid output setting".into()),
+                    },_=>return Err("invalid settings".into()),
+                };
+                let name=if matching{match data.other("ae2:exported_custom_name"){
+                    None=>None,Some(Tag::String(value))=>Some(value.to_string().map_err(|_|"invalid name")?),
+                    Some(value @ Tag::Compound(_))=>match value.get("text"){Some(Tag::String(value))=>Some(value.to_string().map_err(|_|"invalid name")?),_=>return Err("unsupported structured condenser name".into())},_=>return Err("invalid name".into()),
+                }}else{None};
+                return Ok(Some(SavedCondenser{matching,output,name}));
+            }
+        }
         let Some(data)=card.data().and_then(|d|d.other("minecraft:custom_data")) else{return Ok(None)};
         let Tag::Compound(_)=data else{return Err("invalid card custom data".into())};
         let Some(body)=data.get(KEY) else{return Ok(None)};
@@ -80,6 +98,16 @@ mod condenser_memory {
             let unrelated=read_condenser(&make("ae2:inscriber",Some(Tag::compound([("auto_export",Tag::String("YES".into()))])))).unwrap().unwrap();assert!(!unrelated.matching);assert_eq!(unrelated.output,None);
             let invalid=read_condenser(&make(SOURCE,Some(Tag::compound([(OUTPUT,Tag::String("invalid".into()))])))).unwrap().unwrap();assert_eq!(invalid.output,None);
             let generic=read_condenser(&make("ae2:inscriber",Some(Tag::compound([(OUTPUT,Tag::String("matter_balls".into()))])))).unwrap().unwrap();assert!(!generic.matching);assert_eq!(generic.output.as_deref(),Some("matter_balls"));
+        }
+        #[test]
+        fn source_only_condenser_card_imports_mode_but_not_foreign_name(){
+            let mut source=Machine::new(MachineKind::Condenser);source.config.insert(OUTPUT.into(),Tag::String("matter_balls".into()));
+            let mut card=ItemStack::new("ae2:memory_card",1);save_condenser(&mut card,&source,Some("Condenser")).unwrap();card.data_mut().set_other("minecraft:custom_data",None);
+            let saved=read_condenser(&card).unwrap().unwrap();assert!(saved.matching);assert_eq!(saved.output.as_deref(),Some("matter_balls"));assert_eq!(saved.name.as_deref(),Some("Condenser"));
+            card.data_mut().set_other("ae2:exported_settings_source",Some(Tag::compound([("translate",Tag::String("block.ae2.inscriber".into()))])));
+            let generic=read_condenser(&card).unwrap().unwrap();assert!(!generic.matching);assert_eq!(generic.name,None);assert_eq!(generic.output.as_deref(),Some("matter_balls"));
+            card.data_mut().set_other("ae2:exported_settings",Some(Tag::compound([(OUTPUT,Tag::String("matter_balls".into()))])));
+            assert_eq!(read_condenser(&card).unwrap().unwrap().output,None);
         }
         #[test]
         fn condenser_mode_callback_clamps_capacity_and_preserves_blocked_output(){

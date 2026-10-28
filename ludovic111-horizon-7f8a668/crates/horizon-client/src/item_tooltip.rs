@@ -226,9 +226,11 @@ pub fn name_line(stack: &ItemStack, translate: &dyn Fn(&str) -> Option<String>) 
 #[cfg(feature="ae2-lab")]
 pub fn ae2_facade_texture(stack:&ItemStack)->Option<String> {
     if stack.item.as_ref()!="ae2:facade" {return None;}
-    let horizon_world::nbt::Tag::String(id)=stack.data()?.other("minecraft:custom_data")?.get("ae2:facade_item")? else {return None;};
+    let data=stack.data()?;
+    let horizon_world::nbt::Tag::String(id)=data.other("ae2:facade_item")
+        .or_else(||data.other("minecraft:custom_data").and_then(|tag|tag.get("ae2:facade_item")))? else {return None;};
     let id=id.to_string_lossy();
-    (id!="ae2:facade" && id.contains(':')).then_some(id)
+    id.contains(':').then_some(id)
 }
 
 /// ItemStack.getRarity: the ominous banner override, then the enchantment upgrade.
@@ -539,6 +541,21 @@ pub fn lore_texts(stack: &ItemStack) -> Vec<crate::text::Text> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature="ae2-lab")]
+    #[test]
+    fn facade_source_material_wins_over_legacy_and_invalid_source_fails_closed() {
+        let mut facade=ItemStack::new("ae2:facade",1);
+        facade.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2:facade_item",Tag::String("minecraft:stone".into()))])));
+        assert_eq!(ae2_facade_texture(&facade).as_deref(),Some("minecraft:stone"));
+        facade.data_mut().set_other("ae2:facade_item",Some(Tag::String("minecraft:oak_log".into())));
+        assert_eq!(ae2_facade_texture(&facade).as_deref(),Some("minecraft:oak_log"));
+        facade.data_mut().set_other("ae2:facade_item",Some(Tag::String("ae2:facade".into())));
+        assert_eq!(ae2_facade_texture(&facade).as_deref(),Some("ae2:facade"));
+        assert!(name_line(&facade, &|_| None).contains("Facade"));
+        facade.data_mut().set_other("ae2:facade_item",Some(Tag::Int(5)));
+        assert_eq!(ae2_facade_texture(&facade),None);
+    }
 
     #[test]
     fn lore_keeps_component_colours_under_dark_purple_italic() {

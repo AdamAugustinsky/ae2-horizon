@@ -547,16 +547,15 @@ impl Game<'_> {
             let index = session.page * 36 + slot;
             if index < state.slots() {
                 let held = host.hub.guests[gi].carried.as_ref();
-                state.config[index] = if p.button == 1 {
-                    held.and_then(|s| super::ae2_fluids::bucket_fluid(&s.item))
-                        .map(super::ae2_fluids::fluid_key)
-                        .as_ref()
-                        .map(Key::from)
-                } else {
-                    held.and_then(|s| super::ae2_lab::key(s).ok())
-                        .as_ref()
-                        .map(Key::from)
+                let wrapped=held.map(|item|super::ae2_encoding::wrapped_ghost(item,&|id,fluid|fluid||self.res.items().get(id).is_some())).transpose();
+                let selected=match wrapped {
+                    Ok(Some(Some(super::ae2_encoding::WrappedGhost::Fluid(fluid))))=>Some(Key::from(&fluid.key)),
+                    Ok(Some(Some(super::ae2_encoding::WrappedGhost::Item(item))))=>super::ae2_lab::key(&item).ok().as_ref().map(Key::from),
+                    Err(_)=>{host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_send_ae2_bus(host,conn);return true;},
+                    _ if p.button==1=>held.and_then(|s|super::ae2_fluids::bucket_fluid(&s.item)).map(super::ae2_fluids::fluid_key).as_ref().map(Key::from),
+                    _=>held.and_then(|s|super::ae2_lab::key(s).ok()).as_ref().map(Key::from),
                 };
+                state.config[index]=selected;
                 changed = true;
             }
         } else if (36..41).contains(&slot) {
@@ -870,9 +869,14 @@ impl Game<'_> {
             if let Ok(value)=entry.parse::<i64>() {if value>=0 && value!=state.threshold {state.threshold=value;changed=true;}}
             if slot!=Some(12) {session.emitter_edit=Some(entry);}
         } else if matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(0) {
-            let next=host.hub.guests[gi].carried.as_ref().and_then(|held| {
-                super::ae2_lab::key(held).ok()?;let mut one=held.clone();one.count=1;Some(EmitterFilter::Item(one))
-            });
+            let held=host.hub.guests[gi].carried.as_ref();
+            let wrapped=held.map(|item|super::ae2_encoding::wrapped_ghost(item,&|id,fluid|fluid||self.res.items().get(id).is_some())).transpose();
+            let next=match wrapped {
+                Ok(Some(Some(super::ae2_encoding::WrappedGhost::Fluid(fluid))))=>Some(EmitterFilter::Fluid(fluid.key)),
+                Ok(Some(Some(super::ae2_encoding::WrappedGhost::Item(mut item))))=>{item.count=1;Some(EmitterFilter::Item(item))},
+                Err(_)=>state.filter.clone(),
+                _=>held.and_then(|held|{super::ae2_lab::key(held).ok()?;let mut one=held.clone();one.count=1;Some(EmitterFilter::Item(one))}),
+            };
             changed=state.filter!=next;refresh=changed;state.filter=next;
         } else if matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(1) {
             if let Some(key)=host.hub.guests[gi].carried.as_ref().and_then(|item|super::ae2_fluids::bucket_fluid(&item.item)).map(super::ae2_fluids::fluid_key) {

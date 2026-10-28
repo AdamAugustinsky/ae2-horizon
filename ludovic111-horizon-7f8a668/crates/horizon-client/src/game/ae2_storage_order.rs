@@ -47,7 +47,7 @@ impl Game<'_> {
     }
     pub(super) fn ae2_cell_preferred(&self,mount:&CellMount,key:&ItemKey,fluid:bool)->Result<bool,String>{
         let stack=self.ae2_mounted_cell_stack(mount)?;
-        if let Ok(keys)=super::ae2_storage_devices::creative_cell_keys(&stack){
+        if let Ok(keys)=self.ae2_creative_cell_keys(&stack){
             let key=if fluid{super::ae2_storage_devices::CreativeCellKey::Fluid(key.clone())}else{super::ae2_storage_devices::CreativeCellKey::Item(key.clone())};
             return Ok(keys.contains(&key));
         }
@@ -56,7 +56,7 @@ impl Game<'_> {
         // only a delegating wrapper around BasicCellInventory, whose default
         // preference is false. Keep that source distinction.
         if mount.kind!=MachineKind::Drive{return Ok(false)}
-        let cell=if fluid{ae2_fluids::read_fluid_cell(&stack)}else{ae2_lab::read_cell(&stack)};
+        let cell=if fluid{self.ae2_read_fluid_cell(&stack)}else{self.ae2_read_item_cell(&stack)};
         Ok(cell.is_ok_and(|cell|cell.entries().any(|(stored,count)|stored==key&&*count>0)))
     }
     pub(super) fn ae2_item_bus_preferred(&mut self,mount:&super::ae2_buses::StorageMount,key:&ItemKey)->Result<bool,String>{
@@ -75,11 +75,11 @@ impl Game<'_> {
         use ae2_cell_core::{Action,Channel};
         if amount==0{return Ok((0,None))}
         let stack=self.ae2_mounted_cell_stack(mount)?;
-        if let Ok(keys)=super::ae2_storage_devices::creative_cell_keys(&stack){
+        if let Ok(keys)=self.ae2_creative_cell_keys(&stack){
             let wanted=if fluid{super::ae2_storage_devices::CreativeCellKey::Fluid(key.clone())}else{super::ae2_storage_devices::CreativeCellKey::Item(key.clone())};
             return Ok((if keys.contains(&wanted){amount}else{0},None))
         }
-        let cell=if fluid{ae2_fluids::read_fluid_cell(&stack)}else{ae2_lab::read_cell(&stack)};
+        let cell=if fluid{self.ae2_read_fluid_cell(&stack)}else{self.ae2_read_item_cell(&stack)};
         let Ok(mut cell)=cell else{return Ok((0,None))};
         if cell.config().channel!=if fluid{Channel::Fluid}else{Channel::Item}{return Ok((0,None))}
         let action=if simulate{Action::Simulate}else{Action::Modulate};

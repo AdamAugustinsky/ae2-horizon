@@ -5,12 +5,12 @@ use ae2_network_core::NodeIdentity;
 use super::ae2_tick_tracker::{Tracker,Modulation};
 
 #[derive(Clone)]
-struct Entry { tracker:Tracker, service:Option<u64>, last_seen:u64, planned:Option<bool>, token:Option<Vec<u8>>, min:u64, max:u64, sleeping:bool }
+struct Entry { tracker:Tracker, service:Option<u64>, last_seen:u64, planned:Option<bool>, token:Option<Vec<u8>>, min:u64, max:u64, sleeping:bool, continuous:Option<bool>, generation_ticks:u64 }
 #[derive(Clone,Default)]
 pub(super) struct DeviceScheduler { entries:BTreeMap<NodeIdentity,Entry> }
 impl DeviceScheduler {
     pub fn due(&mut self,id:NodeIdentity,service:Option<u64>,now:u64,min:u64,max:u64,sleeping:bool,alert:bool)->bool {
-        let e=self.entries.entry(id).or_insert_with(||Entry{tracker:Tracker::new(now,min,max,sleeping),service,last_seen:now,planned:None,token:None,min,max,sleeping});
+        let e=self.entries.entry(id).or_insert_with(||Entry{tracker:Tracker::new(now,min,max,sleeping),service,last_seen:now,planned:None,token:None,min,max,sleeping,continuous:None,generation_ticks:0});
         if e.service.zip(service).is_some_and(|(a,b)|a!=b) {e.tracker=Tracker::new(now,min,max,sleeping);}
         // Existing Java TickingRequests keep their original bounds. Remember
         // the latest configured bounds only for the next grid recreation.
@@ -19,6 +19,18 @@ impl DeviceScheduler {
         e.tracker.due(now)
     }
     pub fn completed(&mut self,id:NodeIdentity,now:u64,modulation:Modulation){if let Some(e)=self.entries.get_mut(&id){e.tracker.completed(now,modulation);if modulation==Modulation::Sleep {e.sleeping=true;}}}
+    /// AnnihilationPlanePart chooses generation mode on addToWorld and keeps
+    /// its transient elapsed remainder on that physical part instance.
+    pub fn continuous_mode(&mut self,id:NodeIdentity,initial:bool)->bool {
+        *self.entries.get_mut(&id).expect("tracker was registered").continuous.get_or_insert(initial)
+    }
+    pub fn continuous_generate(&mut self,id:NodeIdentity,now:u64,interval:u64)->u64 {
+        let entry=self.entries.get_mut(&id).expect("tracker was registered");
+        entry.generation_ticks=entry.generation_ticks.saturating_add(now.saturating_sub(entry.tracker.last()));
+        let amount=entry.generation_ticks/interval;
+        entry.generation_ticks%=interval;
+        amount
+    }
     /// GridNode.setGrid transfers a tickable to a fresh tracker immediately,
     /// even when replay is deferred until a later server tick.
     pub fn observe_services(&mut self,services:&ae2_network_core::service_events::OrderedServices,now:u64) {
@@ -95,5 +107,22 @@ mod tests {
         assert!(!scheduler.due(id,Some(2),30,2,6,false,false));
         assert!(!scheduler.due(id,Some(2),33,2,6,false,false));
         assert!(scheduler.due(id,Some(2),34,2,6,false,false));
+    }
+    #[test]
+    fn sky_dust_elapsed_accumulates_and_mode_belongs_to_the_part_instance() {
+        let mut scheduler=DeviceScheduler::default();let id=node(21);
+        assert!(!scheduler.due(id,Some(1),0,5,60,false,false));
+        assert!(scheduler.continuous_mode(id,true));
+        assert!(scheduler.continuous_mode(id,false));
+        for tick in [32,92,152] {
+            assert!(scheduler.due(id,Some(1),tick,5,60,false,false));
+            assert_eq!(scheduler.continuous_generate(id,tick,200),0);
+            scheduler.completed(id,tick,Modulation::Idle);
+        }
+        assert!(scheduler.due(id,Some(1),212,5,60,false,false));
+        assert_eq!(scheduler.continuous_generate(id,212,200),1);
+        scheduler.completed(id,212,Modulation::Idle);
+        let next=node(22);scheduler.due(next,Some(1),212,5,60,false,false);
+        assert!(!scheduler.continuous_mode(next,false));
     }
 }

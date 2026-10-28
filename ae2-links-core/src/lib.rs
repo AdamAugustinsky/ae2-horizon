@@ -2,6 +2,7 @@
 //! commit db17504a86128fdf3dae31f5fb7a112a646e0b93. Copyright AE2 contributors.
 //! LGPL-3.0-or-later. Physical world transactions are implemented by the host.
 pub mod anchor;
+pub mod anchor_grid;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

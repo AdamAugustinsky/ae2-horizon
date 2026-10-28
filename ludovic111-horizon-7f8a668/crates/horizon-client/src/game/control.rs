@@ -12,7 +12,9 @@ use winit::{event::MouseButton, event_loop::ActiveEventLoop, keyboard::KeyCode};
 const HELP: &[&str] = &[
     "status                         game, player, streaming and renderer state",
     "simulation                     authoritative projectiles in the owner's level",
+    "ae2-job-ui                    this client's bounded crafting events, pins and notices",
     "server-hold on|off             hold simulation and player packets at a control-fixture barrier",
+    "server-step TICKS              run 1..1000 normal server iterations inside a held fixture barrier",
     "stall MILLISECONDS             stall the window thread (0..5000), leaving transport alive",
     "key KEY down|up|tap|repeat     press, release or auto-repeat a key (w a s d space shift ctrl e q esc f3 1-9 arrows ...)",
     "ui-key KEY                    AE2 lab: press a focused field navigation/confirm key without OS input",
@@ -67,6 +69,25 @@ pub struct Flight {
 }
 
 impl Game<'_> {
+    /// Execute the normal host path synchronously, retaining the fixture barrier
+    /// even on a simulation error. Vanilla tick freezing is independent: grid
+    /// callbacks can advance while block/entity ticks remain frozen.
+    fn agent_step_held_server(&mut self, ticks: u32) -> std::result::Result<Value, String> {
+        if !self.agent.hold_server { return Err("server-step requires server-hold on".into()); }
+        self.agent.hold_server = false;
+        let result: Result<()> = (|| {
+            for _ in 0..ticks {
+                if self.serving.is_some() { self.tick_server(false)?; } else { self.tick()?; }
+            }
+            Ok(())
+        })();
+        self.agent.hold_server = true;
+        result.map_err(|error| error.to_string())?;
+        let mut reply = json!({ "steps": ticks, "held": true, "game_time": self.world.game_time });
+        #[cfg(feature = "ae2-lab")]
+        { reply["ae2_server_tick"] = json!(self.ae2_server_tick()); }
+        Ok(reply)
+    }
     /// Move the camera along the running flight; reply when it ends.
     pub(super) fn advance_flight(&mut self) {
         let tick_ms = self
@@ -243,6 +264,8 @@ impl Game<'_> {
                 Ok(Some(json!({ "ok": true, "sides": r.section_sides() })))
             }
             "sculk" => Ok(Some(self.sculk_command(&words)?)),
+            #[cfg(feature = "ae2-lab")]
+            "ae2-job-ui" => Ok(Some(self.ae2_job_ui.snapshot())),
             "status" => Ok(Some(self.control_status())),
             "stall" => {
                 let millis: u64 = arg(1)?.parse()?;
@@ -284,6 +307,17 @@ impl Game<'_> {
                     self.agent.hold_server = held;
                 }
                 ok()
+            }
+            "server-step" => {
+                self.require_world()?;
+                let ticks: u32 = arg(1)?.parse()?;
+                if !(1..=1000).contains(&ticks) { return Err("server-step needs 1..1000 ticks".into()); }
+                let result = if let Some(server) = &self.integrated {
+                    server.call(move |g| g.agent_step_held_server(ticks)).ok_or("the integrated server stopped")?
+                } else if self.remote.is_some() {
+                    return Err("server-step requires the world's host".into());
+                } else { self.agent_step_held_server(ticks) };
+                Ok(Some(result.map_err(|message| -> Box<dyn std::error::Error> { message.into() })?))
             }
             "pad" => Ok(Some(self.pad_command(&words)?)),
             #[cfg(feature = "ae2-lab")]

@@ -1,9 +1,9 @@
 # Proprietary game data and downloaded/generated AE2 content are local only.
 .local/
 **/.local/
-/ae2-reference/
+/ae2-reference
 /content/
-**/target/
+**/target
 **/node_modules/
 feasibility/guidebook-stage/assets/
 feasibility/guidebook-stage/validation.json

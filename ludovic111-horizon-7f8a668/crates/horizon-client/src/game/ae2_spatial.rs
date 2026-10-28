@@ -90,6 +90,32 @@ fn capacity(s: &ItemStack) -> Option<i32> {
         _ => None,
     }
 }
+/// SpatialStorageCellItem.getAllocatedPlotId reads the component's ID; the
+/// plot manager is authoritative for whether it exists and its actual size.
+fn spatial_plot_id(cell: &ItemStack) -> Option<i32> {
+    let data = cell.data()?;
+    let id = match data.other("ae2:spatial_plot_info") {
+        Some(component) => component.get("id"),
+        // Native worlds created before this component existed remain usable.
+        None => data.other("minecraft:custom_data").and_then(|tag| tag.get("ae2_spatial_plot")),
+    }?;
+    // Codec.INT uses Number.intValue(), including narrower or wider numeric
+    // tags accepted by NbtOps and wrapping a long's low 32 bits.
+    match id {
+        Tag::Byte(id) => Some(i32::from(*id)),
+        Tag::Short(id) => Some(i32::from(*id)),
+        Tag::Int(id) => Some(*id),
+        Tag::Long(id) => Some(*id as i32),
+        Tag::Float(id) => Some(f32::from_bits(*id) as i32),
+        Tag::Double(id) => Some(f64::from_bits(*id) as i32),
+        _ => None,
+    }
+}
+fn set_spatial_plot(cell: &mut ItemStack, id: i32, size: [i32; 3]) {
+    cell.data_mut().set_other("ae2:spatial_plot_info", Some(Tag::compound([
+        ("id", Tag::Int(id)), ("size", Tag::IntArray(size.to_vec())),
+    ])));
+}
 impl Game<'_> {
     pub(super) fn ae2_spatial_graph(&self, network: &mut Network) {
         let pylons=network.nodes.keys().filter_map(|p| {
@@ -457,17 +483,7 @@ impl Game<'_> {
         let source_dim = self.dim;
         let source = (region.min.0 + 1, region.min.1 + 1, region.min.2 + 1);
         let mut plots = self.ae2_read_plots()?;
-        let saved_id = cell
-            .data()
-            .and_then(|d| d.other("minecraft:custom_data"))
-            .and_then(|d| d.get("ae2_spatial_plot"))
-            .and_then(|d| {
-                if let Tag::Int(id) = d {
-                    Some(*id)
-                } else {
-                    None
-                }
-            });
+        let saved_id = spatial_plot_id(&cell);
         let mut plot = if let Some(p) = saved_id
             .and_then(|id| plots.plots.iter().find(|p| p.id == id))
             .cloned()
@@ -491,11 +507,6 @@ impl Game<'_> {
             }
         };
         let dst = world(ae2_links_core::plot_origin(plot.id).map_err(str::to_owned)?);
-        let mut data = match cell.data().and_then(|d| d.other("minecraft:custom_data")) {
-            Some(Tag::Compound(m)) => m.clone(),
-            None => Default::default(),
-            _ => return Err("invalid spatial cell data".into()),
-        };
         // Load and inspect both complete regions before touching inventory,
         // power or blocks. Loaded destination chunks retain their entities.
         let entity_dimensions=self.ae2_spatial_type_dimensions()?;
@@ -554,9 +565,10 @@ impl Game<'_> {
             })
             .unwrap_or(false);
         let extracted = self.ae2_take_power(pos, region.power as f64, false);
+        let charged_ae = extracted * horizon_client::ae2_common_config::gameplay().usage_multiplier;
         if extracted < region.power as f64 * 0.999 {
             if extracted > 0.0 && !creative_source {
-                let _ = self.ae2_add_power(pos, extracted);
+                let _ = self.ae2_add_power(pos, charged_ae);
             }
             return Err("spatial energy changed before transition".into());
         }
@@ -566,7 +578,7 @@ impl Game<'_> {
             Ok(p) => p,
             Err(e) => {
                 if !creative_source {
-                    let _ = self.ae2_add_power(pos, extracted);
+                    let _ = self.ae2_add_power(pos, charged_ae);
                 }
                 return Err(e);
             }
@@ -588,7 +600,7 @@ impl Game<'_> {
         if let Err(e) = self.enter_level(None, Dim::Spatial) {
             self.ae2_restore_spatial_entities(src_entities, source);
             if !creative_source {
-                let _ = self.ae2_add_power(pos, extracted);
+                let _ = self.ae2_add_power(pos, charged_ae);
             }
             return Err(e.to_string());
         }
@@ -605,7 +617,7 @@ impl Game<'_> {
                 if self.enter_level(None, source_dim).is_ok() {
                     self.ae2_restore_spatial_entities(src_entities, source);
                     if !creative_source {
-                        let _ = self.ae2_add_power(pos, extracted);
+                        let _ = self.ae2_add_power(pos, charged_ae);
                     }
                 }
                 return Err(error);
@@ -636,7 +648,7 @@ impl Game<'_> {
                 let _ = self.ae2_spatial_write(source, region.size, source, &src, &none, false);
                 self.ae2_restore_spatial_entities(src_entities, source);
                 if !creative_source {
-                    let _ = self.ae2_add_power(pos, extracted);
+                    let _ = self.ae2_add_power(pos, charged_ae);
                 }
             }
             return Err(error);
@@ -659,13 +671,7 @@ impl Game<'_> {
             }
         }
         self.ae2_spatial_anchors_moved(&anchor_moves);
-        data.insert("ae2_spatial_plot".into(), Tag::Int(plot.id));
-        data.insert(
-            "ae2_spatial_size".into(),
-            Tag::IntArray(region.size.to_vec()),
-        );
-        cell.data_mut()
-            .set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+        set_spatial_plot(&mut cell, plot.id, plot.size);
         // The triggering port itself can be in the captured volume.
         let offset = [pos.0 - source.0, pos.1 - source.1, pos.2 - source.2];
         let moved_port =
@@ -767,6 +773,28 @@ impl Game<'_> {
 
 #[cfg(test)] mod frame_tests {
     use super::*;
+    #[test] fn source_plot_component_preserves_legacy_data_and_survives_nbt() {
+        let mut cell = ItemStack::new("ae2:spatial_storage_cell_2", 1);
+        let legacy = Tag::compound([("ae2_spatial_plot", Tag::Int(7)), ("marker", Tag::Int(42))]);
+        cell.data_mut().set_other("minecraft:custom_data", Some(legacy.clone()));
+        assert_eq!(spatial_plot_id(&cell), Some(7));
+        set_spatial_plot(&mut cell, 3, [2, 2, 2]);
+        assert_eq!(spatial_plot_id(&cell), Some(3), "the source component takes precedence over the old wrapper");
+        assert_eq!(cell.data().unwrap().other("minecraft:custom_data"), Some(&legacy));
+        let saved = horizon_client::save::item_to_nbt(&cell);
+        let bytes = horizon_world::nbt::write_network(&saved, Default::default()).unwrap();
+        let (decoded, _) = horizon_world::nbt::read_network(&bytes, Default::default()).unwrap();
+        let restored = horizon_client::save::item_from_nbt(&decoded).unwrap();
+        assert_eq!(restored, cell);
+        assert_eq!(spatial_plot_id(&restored), Some(3));
+        assert_eq!(restored.data().unwrap().other("ae2:spatial_plot_info"), Some(&Tag::compound([
+            ("id", Tag::Int(3)), ("size", Tag::IntArray(vec![2, 2, 2])),
+        ])));
+        cell.data_mut().set_other("ae2:spatial_plot_info", Some(Tag::compound([("id", Tag::Long(4_294_967_299))])));
+        assert_eq!(spatial_plot_id(&cell), Some(3), "Number.intValue wraps a long's low bits");
+        cell.data_mut().set_other("ae2:spatial_plot_info", Some(Tag::compound([("id", Tag::String("invalid".into()))])));
+        assert_eq!(spatial_plot_id(&cell), None, "an invalid actual component does not fall back to stale data");
+    }
     #[test] fn ordered_frame_visits_match_unmodified_java_helper() {
         let oracle: Value = serde_json::from_str(include_str!("ae2_spatial_frame_oracle.json")).unwrap();
         let expected: Vec<WorldPos> = oracle["ordered_visits"].as_array().unwrap().iter()

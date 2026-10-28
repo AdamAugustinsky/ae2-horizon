@@ -304,8 +304,9 @@ impl Cell {
     }
     /// Return accepted amount. With void enabled this may exceed actual stored amount.
     pub fn insert(&mut self, key: &ItemKey, amount: u64, action: Action) -> u64 {
+        let fluid = self.config.channel == Channel::Fluid;
         self.insert_with_fuzzy_match(key, amount, action, |a, b, mode| {
-            mode == FuzzyMode::IgnoreAll && a.item_id == b.item_id
+            (fluid || mode == FuzzyMode::IgnoreAll) && a.item_id == b.item_id
         })
     }
     /// Host resolves registry-backed durability for non-default fuzzy partitions.
@@ -564,6 +565,29 @@ mod extended_tests {
         let per_type = ((1024u64 - 63 * 8) * 8).div_ceil(63);
         assert_eq!(cell.insert(&variant, u64::MAX, Action::Modulate), per_type);
         assert_eq!(cell.insert(&key(2), 1, Action::Modulate), 0);
+    }
+    #[test]
+    fn fluid_fuzzy_modes_match_primary_key_and_keep_blacklist_semantics() {
+        let water=ItemKey {item_id:"minecraft:water".into(),components:vec![1]};
+        let variant=ItemKey {item_id:"minecraft:water".into(),components:vec![2]};
+        let lava=ItemKey {item_id:"minecraft:lava".into(),components:vec![]};
+        for mode in [FuzzyMode::IgnoreAll,FuzzyMode::Percent99,FuzzyMode::Percent75,FuzzyMode::Percent50,FuzzyMode::Percent25] {
+            for (filter_mode,water_expected,lava_expected) in [
+                (FilterMode::Whitelist,1000,0),(FilterMode::Blacklist,0,1000),
+            ] {
+                let mut config=CellConfig::fluid(Tier::K1);
+                config.fuzzy=true;
+                config.fuzzy_mode=mode;
+                config.filter=Some(Filter {mode:filter_mode,keys:[water.clone()].into_iter().collect()});
+                let mut cell=Cell::new(config);
+                assert_eq!(cell.insert(&variant,1000,Action::Simulate),water_expected);
+                assert_eq!(cell.insert(&lava,1000,Action::Simulate),lava_expected);
+                assert_eq!(cell.total_items(),0);
+                assert_eq!(cell.insert(&variant,1000,Action::Modulate),water_expected);
+                assert_eq!(cell.insert(&lava,1000,Action::Modulate),lava_expected);
+                assert_eq!(cell.total_items(),1000);
+            }
+        }
     }
     #[test]
     fn fuzzy_partition_delegates_registry_durability_and_simulation_is_read_only() {

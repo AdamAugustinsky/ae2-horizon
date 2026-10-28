@@ -99,6 +99,7 @@ fn export_link_cancelled(data: &Compound, slot: usize) -> bool {
     }
 }
 pub(super) fn mark_export_card_removed(data: &mut Compound) {
+    super::ae2_autocrafting::advance_crafting_card_generation(data);
     let mask = export_craft_links(data)
         .map(|links| {
             links.iter().enumerate().fold(0u64, |mask, (slot, link)| {
@@ -362,6 +363,24 @@ struct CraftState {
     requests: Vec<QueuedCraft>,
 }
 impl CraftState {
+    // ExportBusPart.attemptCrafting charges the preflighted operation budget
+    // even when MultiCraftingTracker rejects a duplicate in-flight request.
+    fn record_preflight(
+        &mut self,
+        owner: ExportBusCraftOwner,
+        slot: usize,
+        key: ae2_cell_core::ItemKey,
+        fluid: bool,
+        amount: u64,
+    ) -> u64 {
+        if amount > 0
+            && self.links.get(slot).is_some_and(Option::is_none)
+            && !self.requests.iter().any(|(_, queued, _, _, _)| *queued == slot)
+        {
+            self.requests.push((owner, slot, key, fluid, amount));
+        }
+        amount
+    }
     fn request(
         &mut self,
         game: &mut Game<'_>,
@@ -371,12 +390,7 @@ impl CraftState {
         fluid: bool,
     ) -> u64 {
         let Some(owner) = self.owner else { return 0 };
-        if self.links.get(slot).is_none_or(Option::is_some)
-            || self
-                .requests
-                .iter()
-                .any(|(_, queued, _, _, _)| *queued == slot)
-        {
+        if self.links.get(slot).is_none() {
             return 0;
         }
         let Some((target, _)) = game.export_craft_target(owner) else {
@@ -392,10 +406,7 @@ impl CraftState {
         }
         let key = ae2_cell_core::ItemKey::from(key);
         let amount = game.export_craft_room(owner, &key, fluid, limit);
-        if amount > 0 {
-            self.requests.push((owner, slot, key, fluid, amount));
-        }
-        amount
+        self.record_preflight(owner, slot, key, fluid, amount)
     }
 }
 struct Host<'a, 'g> {
@@ -934,6 +945,16 @@ impl Game<'_> {
         owner: ExportBusCraftOwner,
     ) -> Result<Vec<Option<super::ae2_global::GridAddress>>, String> {
         export_craft_links(&self.export_part(owner).ok_or("export bus missing")?)
+    }
+    /// A future cannot be transferred to a changed bus, card, or filter slot.
+    pub(super) fn ae2_export_pending_craft_generation(
+        &self, owner: ExportBusCraftOwner, slot: usize, key: &ae2_cell_core::ItemKey,
+    ) -> Option<i64> {
+        let data = self.export_part(owner)?;
+        if slot >= 63 || !export_has_crafting_card(&data) || export_craft_links(&data).ok()?.get(slot)?.is_some() { return None; }
+        let state = bus_state(&data).ok()?;
+        if slot >= state.slots() || !state.config.get(slot).and_then(Option::as_ref).is_some_and(|configured| *configured == Key::from(key)) { return None; }
+        super::ae2_autocrafting::crafting_card_generation(&data)
     }
     pub(super) fn ae2_export_set_craft_link(
         &mut self,
@@ -1760,6 +1781,26 @@ impl Game<'_> {
                     let Some(side)=super::ae2_grid::face_index(&face) else {continue};
                     let Some(identity)=network.part_identities.get(&(address.network_pos(),side)).copied() else {continue};
                     let service=services.as_ref().and_then(|s|s.get(&identity).copied());
+                    let (min,max)=horizon_client::ae2_tick_config::rates(horizon_client::ae2_tick_config::Kind::AnnihilationPlane);
+                    if face == "up" && pos.1 >= self.dim.max_y() {
+                        let (due, continuous) = {
+                            let mut scheduler=self.ae2_device_scheduler.borrow_mut();
+                            let due=scheduler.due(identity,service,now,min,max,!online,false);
+                            let continuous=scheduler.continuous_mode(identity,horizon_client::ae2_common_config::gameplay().annihilation_sky_dust);
+                            (due,continuous)
+                        };
+                        if continuous {
+                            if due {
+                                let amount=self.ae2_device_scheduler.borrow_mut().continuous_generate(identity,now,200);
+                                if amount>0 {
+                                    let stack=ItemStack::new("ae2:sky_dust",amount.min(u32::MAX as u64) as u32);
+                                    let _=self.ae2_grid_insert(pos,&stack,amount);
+                                }
+                                self.ae2_device_scheduler.borrow_mut().completed(identity,now,super::ae2_tick_tracker::Modulation::Idle);
+                            }
+                            continue;
+                        }
+                    }
                     let Some(front)=target(pos,&face) else {continue};
                     let block=self.world.block(front.0,front.1,front.2);
                     let facts=self.res.facts().get(block);
@@ -1767,7 +1808,6 @@ impl Game<'_> {
                         && !self.world.block_entities.contains_key(&front)
                         && !self.res.items().block_in_tag("ae2:blacklisted/annihilation_plane",&facts.name);
                     let token=format!("{}:{online}:{eligible}",block.0);
-                    let (min,max)=horizon_client::ae2_tick_config::rates(horizon_client::ae2_tick_config::Kind::AnnihilationPlane);
                     data.remove(&"plane_next_tick".into());
                     let due=self.ae2_device_scheduler.borrow_mut().due_with_token(identity,service,now,min,max,!online || !eligible,token.as_bytes());
                     if due {
@@ -1992,6 +2032,20 @@ impl Game<'_> {
 mod tests {
     use super::*;
     #[test]
+    fn craft_preflight_spends_budget_without_duplicating_in_flight_requests() {
+        let address = encoded((0, 64, 0)).unwrap();
+        let owner = ExportBusCraftOwner { host: address, face: 0 };
+        let key = ae2_cell_core::ItemKey { item_id: "minecraft:diamond".into(), components: vec![] };
+        let mut craft = CraftState { owner: Some(owner), links: vec![None, Some(address)], ..Default::default() };
+        assert_eq!(craft.record_preflight(owner, 0, key.clone(), false, 8), 8);
+        assert_eq!(craft.requests.len(), 1);
+        // A queued or linked request is not duplicated, but AE2 still consumes
+        // the amount accepted by the adjacent target's simulation.
+        assert_eq!(craft.record_preflight(owner, 0, key.clone(), false, 8), 8);
+        assert_eq!(craft.record_preflight(owner, 1, key, false, 8), 8);
+        assert_eq!(craft.requests.len(), 1);
+    }
+    #[test]
     fn storage_bus_listing_and_extraction_follow_source_switches() {
         use ae2_machines_core::Access;
         let address=super::super::ae2_global::GridAddress::from_network(ae2_network_core::Pos{x:0,y:64,z:0}).unwrap();
@@ -2058,7 +2112,9 @@ mod tests {
         links[20] = Some(cpu);
         store_export_craft_links(&mut data, &links);
         assert_eq!(export_craft_links(&data).unwrap(), links);
+        let original_generation = super::super::ae2_autocrafting::crafting_card_generation(&data);
         mark_export_card_removed(&mut data);
+        assert_ne!(super::super::ae2_autocrafting::crafting_card_generation(&data), original_generation);
         assert!(export_link_cancelled(&data, 20));
         assert!(!export_link_cancelled(&data, 19));
         let Some(Tag::List(entries)) = data.get_mut(&BUS_CRAFT_LINKS.into()) else {

@@ -9,6 +9,7 @@ pub mod provider_registry;
 pub mod provider_lifecycle;
 pub mod emittable_lifecycle;
 pub mod cpu_formation;
+pub mod calculation;
 
 pub type Inventory = BTreeMap<String, u64>;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,7 +19,7 @@ pub struct Step { pub pattern: String, pub inputs: Inventory, pub output: String
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan { pub reserved: Inventory, pub steps: Vec<Step>, pub target: String, pub count: u64 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error { InvalidPattern, DuplicateOutput(String), Missing(String, u64), Cycle(String), Overflow, InventoryChanged(String), Busy, NotWaiting, NoSteps, WrongOutput, AlreadyFinished, SearchLimit, InsufficientCpuBytes { required:u64, available:u64 } }
+pub enum Error { InvalidPattern, DuplicateOutput(String), Missing(String, u64), Cycle(String), Overflow, InventoryChanged(String), Busy, NotWaiting, NoSteps, WrongOutput, AlreadyFinished, SearchLimit, SimulatedPlan, Cancelled, WorkerPanicked, InsufficientCpuBytes { required:u64, available:u64 } }
 
 fn add(map: &mut Inventory, key: &str, n: u64) -> Result<(), Error> {
     let value = map.get(key).copied().unwrap_or(0).checked_add(n).ok_or(Error::Overflow)?;
@@ -42,7 +43,11 @@ impl Registry {
     /// Plans without mutating storage. A submission must recheck the reservation.
     pub fn plan(&self, inventory: &Inventory, target: &str, count: u64) -> Result<Plan, Error> {
         if target.is_empty() || count == 0 { return Err(Error::InvalidPattern); }
-        let mut p = Planner { registry: self, original: inventory.clone(), generated: Inventory::new(), reserved: Inventory::new(), steps: vec![], visiting: BTreeSet::new() };
+        // CraftingCalculation.runCraftAttempt ignores the output in the
+        // network: the request is for newly crafted items, not existing stock.
+        let mut original=inventory.clone();
+        original.remove(target);
+        let mut p = Planner { registry: self, original, generated: Inventory::new(), reserved: Inventory::new(), steps: vec![], visiting: BTreeSet::new() };
         p.require(target, count)?;
         Ok(Plan { reserved: p.reserved, steps: p.steps, target: target.into(), count })
     }
@@ -165,19 +170,38 @@ mod tests {
     }
     #[test]
     fn preexisting_target_and_overflow() {
-        let r=Registry::default(); let mut storage=inv(&[("x",5)]);
-        let mut j=Job::submit(r.plan(&storage,"x",3).unwrap(),&mut storage).unwrap();
-        j.finish(&mut storage).unwrap(); assert_eq!(storage,inv(&[("x",5)]));
         let mut r=Registry::default(); r.register(pattern("p","x",1,&[("y",2)])).unwrap();
+        let mut storage=inv(&[("x",5),("y",6)]);
+        let plan=r.plan(&storage,"x",3).unwrap();
+        assert_eq!(plan.reserved,inv(&[("y",6)]));
+        let mut j=Job::submit(plan,&mut storage).unwrap();
+        j.dispatch().unwrap(); j.complete_step("x",3).unwrap(); j.finish(&mut storage).unwrap();
+        assert_eq!(storage,inv(&[("x",8)]));
         assert_eq!(r.plan(&Inventory::new(),"x",u64::MAX),Err(Error::Overflow));
     }
 }
 
 /// Extended experimental planner and multi-operation CPU. Original API remains available.
 pub mod extended {
+    mod source_plan;
     use super::{add, take, Error, Inventory};
     use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// AE2's native item and fluid key types have different storage-byte scales.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ResourceKind { Item, Fluid }
+    type NodePath = usize;
+
+    /// Source input identity and its physical remainder for each permitted key.
+    /// `encoded` is the original pattern key used to condense equal slots;
+    /// `primary` is the first source template after any fluid conversion.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SourceInput {
+        pub encoded:String,
+        pub primary:String,
+        pub remaining:BTreeMap<String,String>,
+    }
 
     /// One input slot: any one option can satisfy the whole slot per run.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +214,7 @@ pub mod extended {
     pub struct Plan {
         pub target: String, pub amount: u64, pub reserved: Inventory,
         #[serde(default)] pub emitted: Inventory,
+        #[serde(default)] pub simulated: bool,
         pub steps: Vec<Step>, pub estimated_bytes: u64,
     }
     #[derive(Clone, Default)]
@@ -198,8 +223,23 @@ pub mod extended {
         ids: BTreeSet<String>,
         primary_outputs: BTreeMap<String, String>,
         emittable: BTreeSet<String>,
+        resource_classifier: Option<fn(&str)->ResourceKind>,
+        source_inputs: BTreeMap<String,Vec<SourceInput>>,
+        source_outputs: BTreeMap<String,BTreeSet<String>>,
     }
     impl Registry {
+        pub fn plan(&self,inventory:&Inventory,target:&str,amount:u64)->Result<Plan,Error> {
+            self.source_plan_controlled(inventory,target,amount,&mut ||Ok(()))
+        }
+        pub fn report(&self,inventory:&Inventory,target:&str,amount:u64)->Result<(Plan,Inventory),Error> {
+            self.source_report_controlled(inventory,target,amount,&mut ||Ok(()))
+        }
+        pub fn report_controlled(&self,inventory:&Inventory,target:&str,amount:u64,checkpoint:&mut dyn FnMut()->Result<(),Error>)->Result<(Plan,Inventory),Error> {
+            self.source_report_controlled(inventory,target,amount,checkpoint)
+        }
+        pub fn report_less_controlled(&self,inventory:&Inventory,target:&str,amount:u64,checkpoint:&mut dyn FnMut()->Result<(),Error>)->Result<(Plan,Inventory),Error> {
+            self.source_report_less_controlled(inventory,target,amount,checkpoint)
+        }
         pub fn register(&mut self, p: Pattern) -> Result<(), Error> {
             if p.id.is_empty() || self.ids.contains(&p.id) || p.inputs.is_empty() || p.outputs.is_empty()
                 || p.outputs.iter().any(|(k,v)| k.is_empty() || *v == 0)
@@ -216,6 +256,78 @@ pub mod extended {
             self.primary_outputs.insert(id, primary);
             Ok(())
         }
+        /// The host identifies resource types from its canonical key codec.
+        /// Without a classifier, standalone legacy callers use item units.
+        pub fn set_resource_classifier(&mut self,classify:fn(&str)->ResourceKind) {
+            self.resource_classifier=Some(classify);
+        }
+        /// Whether a previously calculated plan still names the same provider
+        /// definitions, substitution choices, emitted keys and byte scales.
+        /// Physical stock and CPU availability are rechecked separately.
+        pub fn same_definitions(&self,other:&Self)->bool {
+            let same_kind=|key:&str| {
+                self.resource_classifier.map_or(ResourceKind::Item,|f|f(key))
+                    ==other.resource_classifier.map_or(ResourceKind::Item,|f|f(key))
+            };
+            self.patterns==other.patterns && self.primary_outputs==other.primary_outputs
+                && self.emittable==other.emittable && self.source_inputs==other.source_inputs
+                && self.source_outputs==other.source_outputs
+                && self.patterns.iter().all(|p|p.outputs.keys().all(|key|same_kind(key))
+                    && p.inputs.iter().all(|i|i.choices.keys().all(|key|same_kind(key))))
+                && self.source_inputs.values().flatten().all(|input|
+                    input.remaining.iter().all(|(key,remainder)|same_kind(key) && same_kind(remainder)))
+                && self.emittable.iter().all(|key|same_kind(key))
+        }
+        fn stack_millibytes(&self,key:&str,amount:u64)->u128 {
+            let kind=self.resource_classifier.map_or(ResourceKind::Item,|classify|classify(key));
+            u128::from(amount)*match kind {ResourceKind::Item=>1000,ResourceKind::Fluid=>1}
+        }
+        /// Attach source input identities without changing persisted jobs or
+        /// their physical slot-level dispatch descriptions.
+        pub fn set_source_inputs(&mut self,id:&str,inputs:Vec<SourceInput>)->Result<(),Error> {
+            let pattern=self.patterns.iter().find(|p|p.id==id).ok_or(Error::InvalidPattern)?;
+            if inputs.len()!=pattern.inputs.len() || inputs.iter().zip(&pattern.inputs).any(|(source,input)|
+                source.encoded.is_empty() || source.primary.is_empty() || !input.choices.contains_key(&source.primary)
+                    || source.remaining.iter().any(|(choice,remainder)|!input.choices.contains_key(choice)||remainder.is_empty())) {
+                return Err(Error::InvalidPattern);
+            }
+            self.source_inputs.insert(id.to_owned(),inputs);Ok(())
+        }
+        /// Source pattern outputs exclude crafting-container remainders,
+        /// which the host tracks separately as physical returned items.
+        pub fn set_source_outputs(&mut self,id:&str,keys:impl IntoIterator<Item=String>)->Result<(),Error> {
+            let pattern=self.patterns.iter().find(|p|p.id==id).ok_or(Error::InvalidPattern)?;
+            let keys:BTreeSet<_>=keys.into_iter().collect();
+            if keys.is_empty() || keys.iter().any(|key|!pattern.outputs.contains_key(key)) {return Err(Error::InvalidPattern);}
+            self.source_outputs.insert(id.to_owned(),keys);Ok(())
+        }
+        fn source_nonrecursive(&self,pattern:&Pattern,key:&str,visiting:&BTreeSet<String>)->bool {
+            let ancestor=|candidate:&str|candidate!=key && visiting.contains(candidate);
+            let output_matches=match self.source_outputs.get(&pattern.id) {
+                Some(keys)=>keys.iter().any(|output|ancestor(output)),
+                None=>pattern.outputs.keys().any(|output|ancestor(output)),
+            };
+            let input_matches=match self.source_inputs.get(&pattern.id) {
+                Some(inputs)=>inputs.iter().enumerate().any(|(slot,input)|self.source_group(&pattern.id,slot)==slot && ancestor(&input.primary)),
+                None=>pattern.inputs.iter().any(|input|input.choices.keys().next().is_some_and(|input|ancestor(input))),
+            };
+            !output_matches && !input_matches
+        }
+        fn source_group(&self,pattern_id:&str,slot:usize)->usize {
+            let Some(inputs)=self.source_inputs.get(pattern_id) else{return slot;};
+            let Some(input)=inputs.get(slot) else{return slot;};
+            inputs.iter().position(|other|other.encoded==input.encoded).unwrap_or(slot)
+        }
+        fn has_container_items(&self,pattern:&Pattern)->bool {
+            self.source_inputs.get(&pattern.id).is_some_and(|inputs|inputs.iter().enumerate().any(|(slot,input)|self.source_group(&pattern.id,slot)==slot && input.remaining.contains_key(&input.primary)))
+        }
+        fn limits_quantity(&self,pattern:&Pattern)->bool {
+            let source_output=|key:&str|self.source_outputs.get(&pattern.id).map_or_else(||pattern.outputs.contains_key(key),|outputs|outputs.contains(key));
+            self.has_container_items(pattern) || match self.source_inputs.get(&pattern.id) {
+                Some(inputs)=>inputs.iter().enumerate().any(|(slot,input)|self.source_group(&pattern.id,slot)==slot && source_output(&input.primary)),
+                None=>pattern.inputs.iter().any(|input|input.choices.keys().any(|key|source_output(key))),
+            }
+        }
         /// Snapshot keys from this crafting service's actual provider membership.
         /// Planning records shortages; it never creates or reserves physical items.
         pub fn set_emittable(&mut self, keys: impl IntoIterator<Item=String>) -> Result<(), Error> {
@@ -223,138 +335,7 @@ pub mod extended {
             if keys.contains("") { return Err(Error::InvalidPattern); }
             self.emittable=keys; Ok(())
         }
-        /// Tries patterns and alternatives in registration/key order; all mutations are local.
-        /// Backtracks across pattern and ingredient alternatives, bounded to
-        /// 4096 candidate states and 4096 split-substitution pushes.
-        pub fn plan(&self, inventory: &Inventory, target: &str, amount: u64) -> Result<Plan, Error> {
-            let mut budget=16_384usize;
-            self.plan_with_budget(inventory,target,amount,&mut budget)
-        }
-        fn plan_with_budget(&self,inventory:&Inventory,target:&str,amount:u64,budget:&mut usize)->Result<Plan,Error> {
-            if target.is_empty() || amount == 0 { return Err(Error::InvalidPattern); }
-            let state=State { original: inventory.clone(), generated: Inventory::new(), reserved: Inventory::new(), emitted:Inventory::new(), steps: vec![], visiting: BTreeSet::new(), nodes: 0, operations: 0 };
-            let mut candidates=self.require_variants(state,target,amount,budget)?;
-            if candidates.is_empty(){return Err(Error::Missing(target.into(),amount));}
-            let mut state=candidates.remove(0);
-            let bytes=state.nodes.checked_mul(8).and_then(|x|x.checked_add(state.operations)).ok_or(Error::Overflow)?;
-            Ok(Plan { target: target.into(), amount, reserved: std::mem::take(&mut state.reserved), emitted:state.emitted, steps: state.steps, estimated_bytes: bytes })
-        }
-        /// A read-only missing-material report. Hypothetical inputs exist
-        /// only in this local planning copy; submitting still requires a real
-        /// plan against the live inventory.
-        pub fn report(&self,inventory:&Inventory,target:&str,amount:u64)->Result<(Plan,Inventory),Error> {
-            let mut simulated=inventory.clone();
-            // A single shared search budget bounds all hypothetical retries.
-            let mut budget=262_144usize;
-            for _ in 0..256 {
-                match self.plan_with_budget(&simulated,target,amount,&mut budget) {
-                    Ok(plan)=>{
-                        if plan.steps.is_empty() && plan.emitted.is_empty(){return Err(Error::NoSteps);}
-                        let mut missing=Inventory::new();
-                        for (key,count) in &plan.reserved {
-                            let shortage=count.saturating_sub(inventory.get(key).copied().unwrap_or(0));
-                            if shortage>0 {missing.insert(key.clone(),shortage);}
-                        }
-                        return Ok((plan,missing));
-                    }
-                    Err(Error::Missing(key,count)) if key!=target && count>0 =>add(&mut simulated,&key,count)?,
-                    Err(error)=>return Err(error),
-                }
-            }
-            Err(Error::SearchLimit)
-        }
-        // Retain multiple locally valid choices until sibling ingredients have
-        // also been solved. This permits later conflicts to revisit a pattern
-        // selected for an earlier ingredient. A finite budget bounds hostile
-        // recipes; large batches with a single choice stay aggregated.
-        fn require_variants(&self, mut st: State, key: &str, amount: u64, budget: &mut usize) -> Result<Vec<State>, Error> {
-            const LIMIT: usize = 4096;
-            if *budget == 0 { return Err(Error::SearchLimit); }
-            if st.visiting.len() >= 128 { return Err(Error::SearchLimit); }
-            *budget -= 1;
-            st.nodes=st.nodes.checked_add(1).ok_or(Error::Overflow)?;
-            let from_generated=st.generated.get(key).copied().unwrap_or(0).min(amount);
-            take(&mut st.generated,key,from_generated);
-            let mut need=amount-from_generated;
-            let from_original=st.original.get(key).copied().unwrap_or(0).min(need);
-            take(&mut st.original,key,from_original); add(&mut st.reserved,key,from_original)?; need-=from_original;
-            if need==0 { return Ok(vec![st]); }
-            if self.emittable.contains(key) {add(&mut st.emitted,key,need)?;return Ok(vec![st]);}
-            if !st.visiting.insert(key.to_owned()) { return Err(Error::Cycle(key.into())); }
-            let mut failure=Error::Missing(key.into(),need);
-            let mut answers=Vec::new();
-            for p in self.patterns.iter().filter(|p| p.outputs.contains_key(key)
-                && self.primary_outputs.get(&p.id).is_none_or(|primary| primary == key)) {
-                let count=p.outputs[key]; let runs=need/count + u64::from(need%count != 0);
-                let aggregate = self.require_slot_variants(st.clone(), &p.inputs, runs, Inventory::new(), budget);
-                let mut variants: Vec<(State, Vec<(Inventory,u64)>)> = match &aggregate {
-                    Ok(v) => v.iter().cloned().map(|(state,inputs)|(state,vec![(inputs,runs)])).collect(),
-                    Err(e) => { failure=e.clone(); Vec::new() }
-                };
-                // Include mixed substitutions even when one homogeneous batch
-                // succeeds: a later sibling may need some of that resource.
-                // Avoid expanding large homogeneous batches into thousands of steps.
-                let mixed = p.inputs.iter().any(|i| i.choices.len()>1);
-                if runs > 1 && runs <= LIMIT as u64 && (aggregate.is_err() || (mixed && runs <= 16)) {
-                    let mut group=vec![(st.clone(),Vec::new())];
-                    for _ in 0..runs {
-                        let mut next=Vec::new();
-                        for (state, selections) in group {
-                            match self.require_slot_variants(state, &p.inputs, 1, Inventory::new(), budget) {
-                                Ok(options) => for (candidate,inputs) in options {
-                                    let mut selected=selections.clone(); selected.push((inputs,1));
-                                    next.push((candidate,selected)); if next.len()>=LIMIT { break; }
-                                },
-                                Err(e)=>failure=e,
-                            }
-                            if next.len()>=LIMIT { break; }
-                        }
-                        group=next;
-                        if group.is_empty() { break; }
-                    }
-                    variants.extend(group.into_iter().filter(|(_, selections)| selections.len()==runs as usize));
-                }
-                for (mut trial,selections) in variants {
-                    for (inputs,count_runs) in selections {
-                        let mut outputs=Inventory::new();
-                        for (output,n) in &p.outputs { let produced=n.checked_mul(count_runs).ok_or(Error::Overflow)?; add(&mut outputs,output,produced)?; add(&mut trial.generated,output,produced)?; }
-                        trial.steps.push(Step { pattern:p.id.clone(),inputs,outputs,runs:count_runs });
-                    }
-                    take(&mut trial.generated,key,need);
-                    trial.operations=trial.operations.checked_add(runs).ok_or(Error::Overflow)?;
-                    trial.visiting.remove(key);
-                    answers.push(trial);
-                    if answers.len()>=LIMIT { return Ok(answers); }
-                }
-            }
-            if answers.is_empty() { Err(failure) } else { Ok(answers) }
-        }
-        fn require_slot_variants(&self, state:State, slots:&[Ingredient], runs:u64, inputs:Inventory, budget: &mut usize) -> Result<Vec<(State,Inventory)>,Error> {
-            const LIMIT: usize = 4096;
-            if *budget == 0 { return Err(Error::SearchLimit); }
-            *budget -= 1;
-            let Some((slot,rest))=slots.split_first() else { return Ok(vec![(state,inputs)]); };
-            let mut failure=Error::InvalidPattern;
-            let mut answers=Vec::new();
-            for (candidate,per_run) in &slot.choices {
-                let amount=per_run.checked_mul(runs).ok_or(Error::Overflow)?;
-                match self.require_variants(state.clone(),candidate,amount,budget) {
-                    Ok(variants) => for next in variants {
-                        let mut selected=inputs.clone(); add(&mut selected,candidate,amount)?;
-                        match self.require_slot_variants(next,rest,runs,selected,budget) {
-                            Ok(results)=>{ for answer in results { answers.push(answer); if answers.len()>=LIMIT { return Ok(answers); } } },
-                            Err(e)=>failure=e,
-                        }
-                    },
-                    Err(e)=>failure=e,
-                }
-            }
-            if answers.is_empty() { Err(failure) } else { Ok(answers) }
-        }
-
     }
-    #[derive(Clone)]
-    struct State { original: Inventory, generated: Inventory, reserved: Inventory, emitted:Inventory, steps: Vec<Step>, visiting: BTreeSet<String>, nodes: u64, operations: u64 }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Flight { pub step: Step, pub remaining: Inventory }
@@ -382,12 +363,13 @@ pub mod extended {
             for flight in next.flights.values_mut() {step(&mut flight.step,&map)?;flight.remaining=inventory(&flight.remaining,&map)?;}
             *self=next;Ok(())
         }
-        pub fn submit(&mut self, plan:Plan, network:&mut Inventory) -> Result<(),Error> {
+        pub fn submit(&mut self, mut plan:Plan, network:&mut Inventory) -> Result<(),Error> {
             if self.plan.is_some() { return Err(Error::Busy); }
+            if plan.simulated {return Err(Error::SimulatedPlan);}
             if plan.estimated_bytes > self.capacity_bytes { return Err(Error::InsufficientCpuBytes { required:plan.estimated_bytes, available:self.capacity_bytes }); }
             for (k,v) in &plan.reserved { if network.get(k).copied().unwrap_or(0)<*v { return Err(Error::InventoryChanged(k.clone())); } }
             for (k,v) in &plan.reserved { take(network,k,*v); }
-            self.escrow=plan.reserved.clone(); self.pending=plan.steps.clone(); self.emitted_waiting=plan.emitted.clone(); self.plan=Some(plan); self.cancelled=false; self.delivered_target=0; Ok(())
+            self.escrow=plan.reserved.clone(); self.pending=std::mem::take(&mut plan.steps); self.emitted_waiting=plan.emitted.clone(); self.plan=Some(plan); self.cancelled=false; self.delivered_target=0; Ok(())
         }
         /// Rotate the AE2 three-tick operation budget once per server tick.
         pub fn tick(&mut self) { self.used_ops[2]=self.used_ops[1]; self.used_ops[1]=self.used_ops[0]; self.used_ops[0]=0; }
@@ -496,6 +478,13 @@ pub mod extended {
             let remaining=plan.amount.saturating_sub(made);
             (remaining>0).then_some((plan.target.as_str(),remaining))
         }
+        /// Stable job output and outstanding quantity for owner lifecycle
+        /// messages, including after cancellation has been requested.
+        pub fn requested_output(&self)->Option<(&str,u64,u64)> {
+            let plan=self.plan.as_ref()?;
+            let made=self.escrow.get(&plan.target).copied().unwrap_or(0).saturating_add(self.delivered_target);
+            Some((plan.target.as_str(),plan.amount,plan.amount.saturating_sub(made)))
+        }
         pub fn is_cancelled(&self)->bool { self.cancelled }
         pub fn is_active(&self)->bool { self.plan.is_some() }
     }
@@ -518,6 +507,166 @@ mod extended_tests {
         assert_eq!(plan.steps.iter().map(|s|s.pattern.as_str()).collect::<Vec<_>>(),vec!["source","combine"]);
         let mut legacy=Registry::default();legacy.register(pattern).unwrap();
         assert!(legacy.plan(&inv(&[("ore",1)]),"slag",1).is_ok());
+    }
+    #[test]
+    fn request_crafts_new_output_while_existing_output_remains_in_storage() {
+        let mut r=Registry::default();
+        r.register(Pattern{id:"p".into(),inputs:vec![ing(&[("ore",1)])],outputs:inv(&[("part",1)])}).unwrap();
+        let mut network=inv(&[("part",5),("ore",2)]);
+        let (preview,missing)=r.report(&network,"part",2).unwrap();
+        assert!(missing.is_empty());
+        assert_eq!(preview.reserved,inv(&[("ore",2)]));
+        let mut cpu=Cpu::new(1000,1);
+        cpu.submit(r.plan(&network,"part",2).unwrap(),&mut network).unwrap();
+        assert_eq!(network,inv(&[("part",5)]));
+        let (a,_)=cpu.dispatch().unwrap();let (b,_)=cpu.dispatch().unwrap();
+        cpu.receive(a,"part",1).unwrap();cpu.receive(b,"part",1).unwrap();
+        cpu.finish(&mut network).unwrap();
+        assert_eq!(network,inv(&[("part",7)]));
+    }
+    #[test]
+    fn cpu_capacity_counts_source_tree_requested_items_and_operations() {
+        let mut r=Registry::default();
+        r.register(Pattern{id:"smelt".into(),inputs:vec![ing(&[("ore",1)])],outputs:inv(&[("ingot",1)])}).unwrap();
+        let mut network=inv(&[("ore",64)]);
+        let plan=r.plan(&network,"ingot",64).unwrap();
+        // Source: two tree nodes * 8 + 64 requested output + 64 input + 64 pushes.
+        assert_eq!(plan.estimated_bytes,208);
+        let mut too_small=Cpu::new(207,0);
+        assert_eq!(too_small.submit(plan.clone(),&mut network),Err(Error::InsufficientCpuBytes{required:208,available:207}));
+        assert_eq!(network,inv(&[("ore",64)]));
+        Cpu::new(208,0).submit(plan,&mut network).unwrap();
+        assert!(network.is_empty());
+    }
+    #[test]
+    fn cpu_capacity_sums_fractional_fluid_bytes_before_rounding() {
+        let mut r=Registry::default();
+        r.set_resource_classifier(|key|if key.starts_with("fluid|"){ResourceKind::Fluid}else{ResourceKind::Item});
+        r.register(Pattern{id:"mixed".into(),inputs:vec![ing(&[("iron",2)]),ing(&[("fluid|water|",750)])],outputs:inv(&[("fluid|oil|",200)])}).unwrap();
+        let mut network=inv(&[("iron",2),("fluid|water|",750)]);
+        let plan=r.plan(&network,"fluid|oil|",200).unwrap();
+        // Three nodes * 8 + one push + two items + .75 + .2 fluid bytes = 27.95.
+        assert_eq!(plan.estimated_bytes,28);
+        assert_eq!(Cpu::new(27,0).submit(plan.clone(),&mut network),Err(Error::InsufficientCpuBytes{required:28,available:27}));
+        assert_eq!(network,inv(&[("iron",2),("fluid|water|",750)]));
+        Cpu::new(28,0).submit(plan,&mut network).unwrap();
+        assert!(network.is_empty());
+    }
+    #[test]
+    fn source_tree_counts_candidate_nodes_once_across_pattern_pushes() {
+        let mut r=Registry::default();
+        for (id,input) in [("iron_path","iron"),("gold_path","gold")] {
+            r.register(Pattern{id:id.into(),inputs:vec![ing(&[(input,1)])],outputs:inv(&[("part",1)])}).unwrap();
+        }
+        let plan=r.plan(&inv(&[("iron",1),("gold",1)]),"part",2).unwrap();
+        // One root + both candidate inputs, not one node per search attempt.
+        assert_eq!(plan.estimated_bytes,3*8+2+2+2);
+        let mut nested=Registry::default();
+        nested.register(Pattern{id:"component".into(),inputs:vec![ing(&[("raw",1)])],outputs:inv(&[("middle",1)])}).unwrap();
+        nested.register(Pattern{id:"assembly".into(),inputs:vec![ing(&[("middle",1)])],outputs:inv(&[("final",1)])}).unwrap();
+        assert_eq!(nested.plan(&inv(&[("raw",1)]),"final",1).unwrap().estimated_bytes,3*8+3+2);
+    }
+    #[test]
+    fn source_tree_does_not_expand_a_later_path_after_first_path_succeeds() {
+        let mut r=Registry::default();
+        for (id,input,output) in [("make_a","raw_a","a"),("make_b","raw_b","b"),("first","a","target"),("second","b","target")] {
+            r.register(Pattern{id:id.into(),inputs:vec![ing(&[(input,1)])],outputs:inv(&[(output,1)])}).unwrap();
+        }
+        let plan=r.plan(&inv(&[("raw_a",1),("raw_b",1)]),"target",1).unwrap();
+        assert_eq!(plan.reserved,inv(&[("raw_a",1)]));
+        // Source builds root and both candidate input nodes, then expands only
+        // the first candidate's raw input before returning successfully.
+        assert_eq!(plan.estimated_bytes,4*8+3+2);
+    }
+    #[test]
+    fn source_excludes_a_nested_pattern_that_also_outputs_an_ancestor() {
+        let mut r=Registry::default();
+        r.register_primary(Pattern{id:"recursive".into(),inputs:vec![ing(&[("raw",1)])],outputs:inv(&[("a",1),("target",1)])},"a".into()).unwrap();
+        r.register_primary(Pattern{id:"safe".into(),inputs:vec![ing(&[("raw",1)])],outputs:inv(&[("a",1)])},"a".into()).unwrap();
+        r.register_primary(Pattern{id:"final".into(),inputs:vec![ing(&[("a",1)])],outputs:inv(&[("target",1)])},"target".into()).unwrap();
+        let plan=r.plan(&inv(&[("raw",1)]),"target",1).unwrap();
+        assert_eq!(plan.steps.iter().map(|s|s.pattern.as_str()).collect::<Vec<_>>(),vec!["safe","final"]);
+        assert_eq!(plan.estimated_bytes,3*8+3+2);
+    }
+    #[test]
+    fn source_recursion_filter_does_not_treat_container_returns_as_pattern_outputs() {
+        let mut r=Registry::default();
+        r.register_primary(Pattern{id:"make_a".into(),inputs:vec![ing(&[("raw",1)])],outputs:inv(&[("a",1),("target",1)])},"a".into()).unwrap();
+        r.set_source_outputs("make_a",["a".into()]).unwrap();
+        r.set_source_inputs("make_a",vec![SourceInput{encoded:"raw".into(),primary:"raw".into(),remaining:std::collections::BTreeMap::from([("raw".into(),"target".into())])}]).unwrap();
+        r.register_primary(Pattern{id:"final".into(),inputs:vec![ing(&[("a",1)])],outputs:inv(&[("target",1)])},"target".into()).unwrap();
+        let plan=r.plan(&inv(&[("raw",1)]),"target",1).unwrap();
+        assert_eq!(plan.steps.iter().map(|s|s.pattern.as_str()).collect::<Vec<_>>(),vec!["make_a","final"]);
+        assert_eq!(plan.estimated_bytes,3*8+3+1+2);
+    }
+    #[test]
+    fn source_tree_keeps_expanded_nodes_from_an_earlier_failed_path() {
+        let mut r=Registry::default();
+        for (id,input,output) in [("make_a","raw_a","a"),("make_b","raw_b","b"),("make_c","raw_c","c")] {
+            r.register(Pattern{id:id.into(),inputs:vec![ing(&[(input,1)])],outputs:inv(&[(output,1)])}).unwrap();
+        }
+        r.register(Pattern{id:"first".into(),inputs:vec![ing(&[("a",1)]),ing(&[("b",1)])],outputs:inv(&[("target",1)])}).unwrap();
+        r.register(Pattern{id:"second".into(),inputs:vec![ing(&[("c",1)])],outputs:inv(&[("target",1)])}).unwrap();
+        let plan=r.plan(&inv(&[("raw_a",1),("raw_c",1)]),"target",1).unwrap();
+        assert_eq!(plan.reserved,inv(&[("raw_c",1)]));
+        // Root, three candidate inputs and the three lazily expanded raw nodes.
+        assert_eq!(plan.estimated_bytes,7*8+3+2);
+    }
+    #[test]
+    fn repeated_source_inputs_share_a_tree_node_without_merging_physical_slots() {
+        let mut r=Registry::default();
+        r.register(Pattern{id:"p".into(),inputs:vec![ing(&[("ore",1)]),ing(&[("ore",1)])],outputs:inv(&[("plate",1)])}).unwrap();
+        r.set_source_inputs("p",vec![SourceInput{encoded:"ore".into(),primary:"ore".into(),remaining:Default::default()};2]).unwrap();
+        let plan=r.plan(&inv(&[("ore",2)]),"plate",1).unwrap();
+        // AEPatternHelper condenses the two identical slots: two nodes, three
+        // requested items and one pattern operation.
+        assert_eq!(plan.estimated_bytes,20);
+        assert_eq!(plan.reserved,inv(&[("ore",2)]));
+        assert_eq!(plan.steps[0].inputs,inv(&[("ore",2)]));
+    }
+    #[test]
+    fn physical_recipe_remainders_are_charged_per_actual_push() {
+        let mut r=Registry::default();
+        r.register_primary(Pattern{id:"fill".into(),inputs:vec![ing(&[("filled_bucket",1)])],outputs:inv(&[("product",1),("bucket",1)])},"product".into()).unwrap();
+        r.set_source_inputs("fill",vec![SourceInput{encoded:"filled_bucket".into(),primary:"filled_bucket".into(),remaining:std::collections::BTreeMap::from([("filled_bucket".into(),"bucket".into())])}]).unwrap();
+        let mut network=inv(&[("filled_bucket",2)]);
+        let plan=r.plan(&network,"product",2).unwrap();
+        // Two tree nodes, two outputs, two inputs, two remainder items, two pushes.
+        assert_eq!(plan.estimated_bytes,24);
+        assert_eq!(plan.steps.iter().map(|step|step.runs).sum::<u64>(),2);
+        let mut cpu=Cpu::new(24,0);cpu.submit(plan,&mut network).unwrap();
+        for n in 0..2 {
+            if n>0 {for _ in 0..3 {cpu.tick();}}
+            let (id,_)=cpu.dispatch().unwrap();cpu.receive(id,"product",1).unwrap();cpu.receive(id,"bucket",1).unwrap();
+        }
+        cpu.finish(&mut network).unwrap();
+        assert_eq!(network,inv(&[("product",2),("bucket",2)]));
+    }
+    #[test]
+    fn repeated_cake_inputs_and_bucket_returns_use_source_bytes() {
+        let grid=["milk","milk","milk","sugar","egg","sugar","wheat","wheat","wheat"];
+        let mut r=Registry::default();
+        r.register_primary(Pattern{id:"cake".into(),inputs:grid.iter().map(|key|ing(&[(key,1)])).collect(),outputs:inv(&[("cake",1),("bucket",3)])},"cake".into()).unwrap();
+        r.set_source_outputs("cake",["cake".into()]).unwrap();
+        r.set_source_inputs("cake",grid.iter().map(|key|SourceInput{encoded:(*key).into(),primary:(*key).into(),remaining:if *key=="milk" {std::collections::BTreeMap::from([("milk".into(),"bucket".into())])} else {Default::default()}}).collect()).unwrap();
+        let plan=r.plan(&inv(&[("milk",6),("sugar",4),("egg",2),("wheat",6)]),"cake",2).unwrap();
+        assert_eq!(plan.estimated_bytes,68);
+        assert_eq!(plan.steps.iter().map(|step|step.runs).sum::<u64>(),2);
+        assert_eq!(plan.reserved,inv(&[("milk",6),("sugar",4),("egg",2),("wheat",6)]));
+    }
+    #[test]
+    fn repeated_pushes_reuse_a_physically_returned_input() {
+        let mut r=Registry::default();
+        r.register_primary(Pattern{id:"reusable".into(),inputs:vec![ing(&[("container",1)])],outputs:inv(&[("product",1),("container",1)])},"product".into()).unwrap();
+        let mut network=inv(&[("container",1)]);
+        let plan=r.plan(&network,"product",2).unwrap();
+        assert_eq!(plan.reserved,inv(&[("container",1)]));
+        assert_eq!(plan.steps.len(),2);
+        let mut cpu=Cpu::new(1000,0);cpu.submit(plan,&mut network).unwrap();
+        let (first,_)=cpu.dispatch().unwrap();cpu.receive(first,"product",1).unwrap();cpu.receive(first,"container",1).unwrap();
+        for _ in 0..3 {cpu.tick();}
+        let (second,_)=cpu.dispatch().unwrap();cpu.receive(second,"product",1).unwrap();cpu.receive(second,"container",1).unwrap();
+        cpu.finish(&mut network).unwrap();assert_eq!(network,inv(&[("product",2),("container",1)]));
     }
     #[test]
     fn cpu_task_inspection_is_non_consuming_and_exact_dispatch_honors_budget() {
@@ -582,12 +731,30 @@ mod extended_tests {
         let (plan,missing)=r.report(&network,"circuit",1).unwrap();
         assert_eq!(network,inv(&[("iron",1)]));
         assert_eq!(missing,inv(&[("iron",1),("redstone",3)]));
-        assert_eq!(plan.reserved,inv(&[("iron",2),("redstone",3)]));
+        assert_eq!(plan.reserved,inv(&[("iron",1)]));
+        assert!(plan.simulated);
+        let mut physical=network.clone();
+        assert_eq!(Cpu::new(1024,0).submit(plan,&mut physical),Err(Error::SimulatedPlan));
+        assert_eq!(physical,network);
         assert!(r.plan(&network,"circuit",1).is_err());
-        assert!(r.report(&network,"unregistered",1).is_err());
+        let (unregistered,missing)=r.report(&network,"unregistered",1).unwrap();
+        assert!(unregistered.reserved.is_empty());assert_eq!(missing,inv(&[("unregistered",1)]));
     }
     #[test]
-    fn report_prefers_real_alternative_and_does_not_invent_cycles() {
+    fn report_uses_source_simulated_first_pattern_after_real_attempt_fails() {
+        let mut r=Registry::default();
+        for (id,input) in [("iron_path","iron"),("gold_path","gold")] {
+            r.register_primary(Pattern{id:id.into(),inputs:vec![ing(&[(input,1)])],outputs:inv(&[("part",1)])},"part".into()).unwrap();
+        }
+        let network=inv(&[("iron",1),("gold",1)]);
+        let (plan,missing)=r.report(&network,"part",3).unwrap();
+        assert_eq!(missing,inv(&[("iron",2)]));
+        assert_eq!(plan.reserved,inv(&[("iron",1)]));
+        assert_eq!(network,inv(&[("iron",1),("gold",1)]));
+        assert!(r.plan(&network,"part",3).is_err());
+    }
+    #[test]
+    fn report_prefers_real_alternative_and_reports_pruned_cycle_shortage() {
         let mut r=Registry::default();
         r.register(Pattern{id:"target".into(),inputs:vec![ing(&[("a",1),("b",1)])],outputs:inv(&[("target",1)])}).unwrap();
         let network=inv(&[("b",1)]);
@@ -597,7 +764,9 @@ mod extended_tests {
         let mut cyclic=Registry::default();
         cyclic.register(Pattern{id:"one".into(),inputs:vec![ing(&[("two",1)])],outputs:inv(&[("one",1)])}).unwrap();
         cyclic.register(Pattern{id:"two".into(),inputs:vec![ing(&[("one",1)])],outputs:inv(&[("two",1)])}).unwrap();
-        assert!(matches!(cyclic.report(&Inventory::new(),"one",1),Err(Error::Cycle(_))));
+        let (_,missing)=cyclic.report(&Inventory::new(),"one",1).unwrap();
+        assert_eq!(missing,inv(&[("two",1)]));
+        assert!(cyclic.plan(&Inventory::new(),"one",1).is_err());
     }
     #[test]
     fn target_delivery_debits_real_escrow_across_reload() {
@@ -659,25 +828,98 @@ mod extended_tests {
 
 #[cfg(test)]
 mod choice_backtracking_test {
-    use super::{extended::*, Inventory};
+    use super::{extended::*, Error, Inventory};
     fn inv(p:&[(&str,u64)])->Inventory { p.iter().map(|(k,v)|(k.to_string(),*v)).collect() }
     #[test]
-    fn reserves_rare_item_for_mandatory_slot() {
+    fn combines_multiple_patterns_when_neither_can_make_the_full_request() {
         let mut r=Registry::default();
-        r.register(Pattern{id:"result".into(),inputs:vec![Ingredient{choices:inv(&[("a",1),("b",1)])},Ingredient{choices:inv(&[("a",1)])}],outputs:inv(&[("out",1)])}).unwrap();
-        let p=r.plan(&inv(&[("a",1),("b",1)]),"out",1).unwrap();
-        assert_eq!(p.steps[0].inputs,inv(&[("a",1),("b",1)]));
+        for (id,input) in [("iron_path","iron"),("gold_path","gold")] {
+            r.register(Pattern{id:id.into(),inputs:vec![Ingredient{choices:inv(&[(input,1)])}],outputs:inv(&[("part",1)])}).unwrap();
+        }
+        let mut network=inv(&[("iron",1),("gold",1)]);
+        let plan=r.plan(&network,"part",2).unwrap();
+        assert_eq!(plan.reserved,network);
+        assert_eq!(plan.steps.iter().map(|step|step.pattern.as_str()).collect::<Vec<_>>(),vec!["iron_path","gold_path"]);
+        let mut cpu=Cpu::new(1000,1);
+        cpu.submit(plan,&mut network).unwrap();
+        let (first,_)=cpu.dispatch().unwrap();
+        let (second,_)=cpu.dispatch().unwrap();
+        cpu.receive(first,"part",1).unwrap();
+        cpu.receive(second,"part",1).unwrap();
+        cpu.finish(&mut network).unwrap();
+        assert_eq!(network,inv(&[("part",2)]));
     }
     #[test]
-    fn revisits_earlier_pattern_when_later_ingredient_needs_shared_stock() {
+    fn earlier_pattern_is_used_before_a_later_full_batch() {
+        let mut r=Registry::default();
+        for (id,input) in [("iron_path","iron"),("gold_path","gold")] {
+            r.register(Pattern{id:id.into(),inputs:vec![Ingredient{choices:inv(&[(input,1)])}],outputs:inv(&[("part",1)])}).unwrap();
+        }
+        let plan=r.plan(&inv(&[("iron",1),("gold",2)]),"part",2).unwrap();
+        assert_eq!(plan.reserved,inv(&[("iron",1),("gold",1)]));
+        assert_eq!(plan.steps.iter().map(|step|step.pattern.as_str()).collect::<Vec<_>>(),vec!["iron_path","gold_path"]);
+    }
+    #[test]
+    fn incomplete_mixed_request_still_reports_missing_ingredients() {
+        let mut r=Registry::default();
+        for (id,input) in [("iron_path","iron"),("gold_path","gold")] {
+            r.register(Pattern{id:id.into(),inputs:vec![Ingredient{choices:inv(&[(input,1)])}],outputs:inv(&[("part",1)])}).unwrap();
+        }
+        let (_,missing)=r.report(&inv(&[("gold",1)]),"part",3).unwrap();
+        assert!(!missing.is_empty());
+        assert_eq!(missing.get("part"),None);
+    }
+    #[test]
+    fn mixed_pattern_amounts_follow_source_greedy_order_before_later_ingredient() {
+        let mut r=Registry::default();
+        for (id,input) in [("iron_path","iron"),("gold_path","gold")] {
+            r.register(Pattern{id:id.into(),inputs:vec![Ingredient{choices:inv(&[(input,1)])}],outputs:inv(&[("part",1)])}).unwrap();
+        }
+        r.register(Pattern{id:"assembly".into(),inputs:vec![Ingredient{choices:inv(&[("part",2)])},Ingredient{choices:inv(&[("iron",1)])}],outputs:inv(&[("assembly",1)])}).unwrap();
+        let stock=inv(&[("iron",2),("gold",1)]);
+        assert_eq!(r.plan(&stock,"assembly",1),Err(Error::Missing("iron".into(),1)));
+        let (simulated,missing)=r.report(&stock,"assembly",1).unwrap();
+        assert!(simulated.simulated);assert_eq!(missing,inv(&[("iron",1)]));
+        assert!(r.plan(&inv(&[("iron",3),("gold",1)]),"assembly",1).is_ok());
+    }
+    #[test]
+    fn combines_pattern_paths_with_per_run_input_substitutions() {
+        let mut r=Registry::default();
+        r.register(Pattern{id:"wood_path".into(),inputs:vec![Ingredient{choices:inv(&[("oak",1),("birch",1)])}],outputs:inv(&[("part",1)])}).unwrap();
+        r.register(Pattern{id:"gold_path".into(),inputs:vec![Ingredient{choices:inv(&[("gold",1)])}],outputs:inv(&[("part",1)])}).unwrap();
+        let plan=r.plan(&inv(&[("oak",1),("birch",1),("gold",1)]),"part",3).unwrap();
+        assert_eq!(plan.reserved,inv(&[("oak",1),("birch",1),("gold",1)]));
+        assert_eq!(plan.steps.iter().map(|s|s.runs).sum::<u64>(),3);
+    }
+    #[test]
+    fn source_choice_is_not_backtracked_for_a_mandatory_sibling() {
+        let mut r=Registry::default();
+        r.register(Pattern{id:"result".into(),inputs:vec![Ingredient{choices:inv(&[("a",1),("b",1)])},Ingredient{choices:inv(&[("a",1)])}],outputs:inv(&[("out",1)])}).unwrap();
+        let stock=inv(&[("a",1),("b",1)]);
+        assert_eq!(r.plan(&stock,"out",1),Err(Error::Missing("a".into(),1)));
+        let (simulated,missing)=r.report(&stock,"out",1).unwrap();
+        assert!(simulated.simulated);assert_eq!(missing,inv(&[("a",1)]));
+        assert!(r.plan(&inv(&[("a",2),("b",1)]),"out",1).is_ok());
+    }
+    #[test]
+    fn source_does_not_revisit_pattern_after_later_sibling_shortage() {
         let mut r=Registry::default();
         for (id,input) in [("a_from_rare","rare"),("a_from_common","common")] {
             r.register(Pattern{id:id.into(),inputs:vec![Ingredient{choices:inv(&[(input,1)])}],outputs:inv(&[("a",1)])}).unwrap();
         }
         r.register(Pattern{id:"target".into(),inputs:vec![Ingredient{choices:inv(&[("a",1)])},Ingredient{choices:inv(&[("rare",1)])}],outputs:inv(&[("out",1)])}).unwrap();
-        let plan=r.plan(&inv(&[("rare",1),("common",1)]),"out",1).unwrap();
-        assert!(plan.steps.iter().any(|s|s.pattern=="a_from_common"));
-        assert_eq!(plan.reserved,inv(&[("rare",1),("common",1)]));
+        let stock=inv(&[("rare",1),("common",1)]);
+        assert_eq!(r.plan(&stock,"out",1),Err(Error::Missing("rare".into(),1)));
+        let (simulated,missing)=r.report(&stock,"out",1).unwrap();
+        assert!(simulated.simulated);assert_eq!(missing,inv(&[("rare",1)]));
+        let mut reversed=Registry::default();
+        for (id,input) in [("a_from_common","common"),("a_from_rare","rare")] {
+            reversed.register(Pattern{id:id.into(),inputs:vec![Ingredient{choices:inv(&[(input,1)])}],outputs:inv(&[("a",1)])}).unwrap();
+        }
+        reversed.register(Pattern{id:"target".into(),inputs:vec![Ingredient{choices:inv(&[("a",1)])},Ingredient{choices:inv(&[("rare",1)])}],outputs:inv(&[("out",1)])}).unwrap();
+        let plan=reversed.plan(&stock,"out",1).unwrap();
+        assert!(plan.steps.iter().any(|step|step.pattern=="a_from_common"));
+        assert_eq!(plan.reserved,stock);
     }
     #[test]
     fn cyclic_pattern_does_not_hide_noncyclic_alternative() {
@@ -688,13 +930,15 @@ mod choice_backtracking_test {
         assert_eq!(plan.steps[0].pattern,"valid");
     }
     #[test]
-    fn mixed_batch_leaves_shared_input_for_later_recipe() {
+    fn source_mixed_batch_does_not_reassign_inputs_for_a_later_sibling() {
         let mut r=Registry::default();
         r.register(Pattern{id:"make_a".into(),inputs:vec![Ingredient{choices:inv(&[("a_rare",1),("b_common",1)])}],outputs:inv(&[("a",1)])}).unwrap();
         r.register(Pattern{id:"target".into(),inputs:vec![Ingredient{choices:inv(&[("a",2)])},Ingredient{choices:inv(&[("a_rare",1)])}],outputs:inv(&[("out",1)])}).unwrap();
-        let plan=r.plan(&inv(&[("a_rare",2),("b_common",1)]),"out",1).unwrap();
-        assert_eq!(plan.reserved,inv(&[("a_rare",2),("b_common",1)]));
-        assert_eq!(plan.steps.iter().filter(|s|s.pattern=="make_a").count(),2);
+        let stock=inv(&[("a_rare",2),("b_common",1)]);
+        assert_eq!(r.plan(&stock,"out",1),Err(Error::Missing("a_rare".into(),1)));
+        let (simulated,missing)=r.report(&stock,"out",1).unwrap();
+        assert!(simulated.simulated);assert_eq!(missing,inv(&[("a_rare",1)]));
+        assert!(r.plan(&inv(&[("a_rare",3),("b_common",1)]),"out",1).is_ok());
     }
     #[test]
     fn large_homogeneous_batch_stays_aggregated() {

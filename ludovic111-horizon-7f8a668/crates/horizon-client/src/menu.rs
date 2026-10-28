@@ -1133,7 +1133,7 @@ impl Menu {
     fn quartz_knife_result(&mut self,env:&Env) {
         let valid=self.containers[MAIN][0].as_ref().is_some_and(|s|env.items.item_tags.get("ae2:metal_ingots").is_some_and(|t|t.contains(s.item.as_ref())));
         let name=self.anvil.name.as_deref().filter(|v|!v.trim().is_empty());
-        self.containers[RESULT][0]=if valid {name.map(|name|{let mut out=ItemStack::new("ae2:name_press",1);out.data_mut().set_other("minecraft:custom_data",Some(horizon_world::nbt::Tag::compound([("ae2:name_press_name",horizon_world::nbt::Tag::String(name.into()))])));out})} else {None};
+        self.containers[RESULT][0]=if valid {name.map(|name|{let mut out=ItemStack::new("ae2:name_press",1);out.data_mut().set_other("ae2:name_press_name",Some(horizon_world::nbt::Tag::String(name.into())));out})} else {None};
         self.data[0]=if self.containers[RESULT][0].is_some(){1}else{0};
     }
     /// `SmithingMenu.createResult`.
@@ -2769,12 +2769,49 @@ impl Menu {
             self.slot_changed(env, s);
             return;
         }
-        if !self.bundle_click(env, s, primary) {
-            self.pickup_inner(env, s, primary);
+        if self.bundle_click(env,s,primary) {
+            self.slot_changed(env,s);
+            return;
         }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_wrapped_stack_click(env,s,primary) {
+            self.slot_changed(env,s);
+            return;
+        }
+        self.pickup_inner(env,s,primary);
         self.slot_changed(env, s);
     }
 
+    /// WrappedGenericStack.overrideOtherStackedOnMe: an encoded stack is not
+    /// picked up normally. The built-in bucket capability can take one bucket
+    /// of a component-free water or lava key without duplicating the wrapper.
+    #[cfg(feature = "ae2-lab")]
+    fn ae2_wrapped_stack_click(&mut self, env: &Env, s:usize, primary:bool)->bool {
+        let Some(wrapper)=self.slot(s).cloned().filter(|item|item.item.as_ref()=="ae2:wrapped_generic_stack") else{return false;};
+        let decoded=crate::ae2_generic_stack::unwrap_item_stack_checked(&wrapper,&|id,fluid|fluid || env.items.get(id).is_some());
+        let value=match decoded {
+            Ok(Some(value))=>value,
+            Ok(None)|Err(_)=>{self.set_by_player(env,s,None);return true;},
+        };
+        if !primary || !value.fluid {return true;}
+        let Some(carried)=self.carried.clone().filter(|item|item.item.as_ref()=="minecraft:bucket" && item.same_item_same_components(&ItemStack::new("minecraft:bucket",1))) else{return true;};
+        if !value.key.components.is_empty() {return true;}
+        let Some(result)=crate::ae2_cell_codec::fluid_bucket(&value.key.item_id) else{return true;};
+        if value.amount<=0 {self.set_by_player(env,s,None);return true;}
+        if value.amount<1000 {return true;}
+        let remaining=value.amount-1000;
+        let replacement=if remaining==0 {None}else{
+            let next=crate::ae2_generic_stack::GenericStack{amount:remaining,..value};
+            let Ok(stack)=crate::ae2_generic_stack::wrap(&next) else{return true;};Some(stack)
+        };
+        self.set_by_player(env,s,replacement);
+        let mut filled=ItemStack::new(result,1);
+        if carried.count==1 {self.carried=Some(filled);} else {
+            let mut empty=carried;empty.count-=1;self.carried=Some(empty);
+            self.place_back(env,&mut filled);
+        }
+        true
+    }
     fn pickup_inner(&mut self, env: &Env, s: usize, primary: bool) {
         let clicked = self.slot(s).cloned();
         match clicked {
@@ -3226,6 +3263,28 @@ pub(crate) mod tests {
 
     #[cfg(feature = "ae2-lab")]
     #[test]
+    fn wrapped_stack_refuses_pickup_and_pours_only_real_fluid_into_buckets() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/resources/26.3");if !root.join("items.json").exists(){return;}
+        let items=Items::catalog(&root).unwrap();let recipes=Recipes::load(&root,&items).unwrap();let brewing=Brewing::load(&root,&items);let banners=Banners::load(&root);let station_recipes=crate::stations::StationRecipes::load(&root,&items);let enchantments=crate::enchant::Enchantments::default();let names=crate::creative::Names::default();
+        let env=Env{items:&items,recipes:&recipes,brewing:&brewing,banners:&banners,station_recipes:&station_recipes,enchantments:&enchantments,names:&names,trade:None,maps:None};
+        let value=crate::ae2_generic_stack::GenericStack{key:crate::ae2_cell_codec::fluid_key("minecraft:water"),fluid:true,amount:1500};
+        let wrapper=crate::ae2_generic_stack::wrap(&value).unwrap();let mut menu=Menu::new(Kind::Chest(1));
+        menu.set_slot(&env,0,Some(wrapper.clone()));menu.click(&env,0,0,Input::Pickup).unwrap();
+        assert!(menu.carried.is_none());assert_eq!(menu.slot(0),Some(&wrapper));
+        menu.carried=Some(ItemStack::new("minecraft:bucket",1));menu.click(&env,0,1,Input::Pickup).unwrap();
+        assert_eq!(menu.carried.as_ref().unwrap().item.as_ref(),"minecraft:bucket");assert_eq!(menu.slot(0),Some(&wrapper));
+        menu.click(&env,0,0,Input::Pickup).unwrap();
+        assert_eq!(menu.carried.as_ref().unwrap().item.as_ref(),"minecraft:water_bucket");
+        assert_eq!(crate::ae2_generic_stack::unwrap_item_stack(menu.slot(0).unwrap()).unwrap().unwrap().amount,500);
+        let exact=crate::ae2_generic_stack::GenericStack{amount:1000,..value};menu.set_slot(&env,0,Some(crate::ae2_generic_stack::wrap(&exact).unwrap()));
+        menu.carried=Some(ItemStack::new("minecraft:bucket",2));menu.click(&env,0,0,Input::Pickup).unwrap();
+        assert!(menu.slot(0).is_none());assert_eq!(menu.carried.as_ref().unwrap().count,1);
+        assert!(menu.containers[PLAYER].iter().flatten().any(|item|item.item.as_ref()=="minecraft:water_bucket"));
+        menu.set_slot(&env,0,Some(ItemStack::new("ae2:wrapped_generic_stack",1)));menu.carried=None;menu.click(&env,0,0,Input::Pickup).unwrap();
+        assert!(menu.slot(0).is_none(),"degenerate wrapper is removed");
+    }
+    #[cfg(feature = "ae2-lab")]
+    #[test]
     fn quartz_knife_menu_consumes_one_ingot_and_locks_the_physical_knife() {
         let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/resources/26.3");if !root.join("items.json").exists(){return;}
         let mut items=Items::catalog(&root).unwrap();items.item_tags.insert("ae2:metal_ingots".into(),std::collections::HashSet::from(["minecraft:iron_ingot".into()]));
@@ -3234,7 +3293,7 @@ pub(crate) mod tests {
         let mut menu=Menu::new(Kind::Anvil);menu.quartz_knife_slot=Some(0);menu.set_player_item(0,Some(ItemStack::new("ae2:certus_quartz_cutting_knife",1)));
         menu.set_slot(&env,0,stack("iron_ingot",1));assert!(menu.slot(2).is_none());assert!(menu.rename(&env,"Hello"));
         assert_eq!(menu.slot(2).unwrap().item.as_ref(),"ae2:name_press");
-        assert_eq!(menu.slot(2).unwrap().data().unwrap().other("minecraft:custom_data").unwrap().get("ae2:name_press_name"),Some(&horizon_world::nbt::Tag::String("Hello".into())));
+        assert_eq!(menu.slot(2).unwrap().data().unwrap().other("ae2:name_press_name"),Some(&horizon_world::nbt::Tag::String("Hello".into())));
         menu.click(&env,30,0,Input::Pickup).unwrap();assert!(menu.carried.is_none());assert!(menu.player_item(0).is_some());
         menu.click(&env,2,0,Input::Pickup).unwrap();assert_eq!(menu.carried.as_ref().unwrap().item.as_ref(),"ae2:name_press");assert!(menu.slot(0).is_none());assert!(menu.quartz_knife_used);assert_eq!(menu.level_change,0);
     }

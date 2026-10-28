@@ -28,7 +28,7 @@ These areas contain implemented behavior and targeted tests; none is a blanket c
 
 ## Status
 
-**Experimental.** The Stage 83 checkpoint has passed a coordinated host test gate and several bounded native-world checks, including an integrated finite-power storage and recursive-crafting scenario with a restart. Full AE2 parity, Java-world compatibility and ATM10 compatibility have not been established. Use a new, disposable world while exploring.
+**Experimental; full AE2 parity remains unfinished.** The source comparison now covers persistent AE2 components, cells and patterns, asynchronous crafting, physical machine settings, wireless terminals, links and selected local menus. Coordinated host gates and hidden native-world regressions exercise named behaviors and restart custody. See [validation evidence](docs/VALIDATION.md), [project status](docs/STATUS.md) and the parity ledgers for exact scope. Java-world and ATM10 compatibility have not been established. Use a new, disposable world while exploring.
 
 The default server-thread gameplay path has the strongest coverage. The alternate in-frame path has a known Pattern Provider menu/session issue. Details and the scope of the checks are in [docs/STATUS.md](docs/STATUS.md).
 
@@ -74,6 +74,14 @@ To run the five core test suites, and optionally the AE2 client and host checks 
 bun run scripts/test.ts
 bun run scripts/test.ts --client
 ```
+
+Native world regressions use hidden windows, isolated profiles and virtual input. They serialize rendering under a shared lease, cap each client at 30 FPS, and assert that its window is invisible, unfocused and does not capture the system pointer:
+
+```sh
+bun run scripts/test-world.ts provider-session crafting-alternatives
+```
+
+The runner accepts `--content DIRECTORY`, `--in-frame` for supported alternate-runtime cases, and `--build METADATA.json` to select a binary by SHA-256. Logs, transcripts and disposable saves remain in ignored `.local/world-tests/`. The ordinary `play.ts` command above is for an explicitly requested visible session.
 
 The included Horizon tree lives in `ludovic111-horizon-7f8a668/`. Five sibling `ae2-*-core` crates hold shared AE2 logic. [SOURCE_MANIFEST.json](SOURCE_MANIFEST.json) records the pinned upstreams and checkpointed source hashes. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and verification guidance.
 

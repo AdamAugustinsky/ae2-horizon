@@ -22,6 +22,7 @@ fn selected(stack: &ItemStack) -> Option<u8> {
 }
 fn set_selected(stack: &mut ItemStack, color: Option<u8>) -> Result<(), String> {
     let mut data = custom(stack)?;
+    let source=color.filter(|n|*n<17).map(|n|Tag::String(power::COLORS[n as usize].into()));
     if let Some(color) = color.filter(|n| *n < 17) {
         data.insert(
             SELECTED.into(),
@@ -33,6 +34,7 @@ fn set_selected(stack: &mut ItemStack, color: Option<u8>) -> Result<(), String> 
     stack
         .data_mut()
         .set_other("minecraft:custom_data", Some(Tag::Compound(data)));
+    stack.data_mut().set_other(SELECTED, source);
     Ok(())
 }
 fn recolored(id: &str, color: u8) -> Option<String> {
@@ -398,6 +400,17 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_selected_color_overrides_legacy_and_writes_source_component() {
+        let mut item=ItemStack::new("ae2:color_applicator",1);
+        item.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([(SELECTED,Tag::String("blue".into()))])));
+        item.data_mut().set_other(SELECTED,Some(Tag::String("red".into())));
+        assert_eq!(selected(&item),Some(8));
+        set_selected(&mut item,Some(12)).unwrap();
+        assert_eq!(item.data().unwrap().other(SELECTED),Some(&Tag::String("blue".into())));
+        set_selected(&mut item,None).unwrap();
+        assert_eq!(selected(&item),None);
+    }
     #[test]
     fn source_block_recolor_families() {
         assert_eq!(

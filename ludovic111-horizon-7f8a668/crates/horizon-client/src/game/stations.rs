@@ -1770,6 +1770,22 @@ impl Game<'_> {
                 &self.translate("gui.ae2.StoredEnergy", "Stored Energy"), current, maximum,
             ), rgba(170,170,170,255)));
         }
+        #[cfg(feature = "ae2-lab")]
+        if let Some(preview)=super::ae2_client_config::cell_preview(stack,super::ae2_client_config::settings()) {
+            for upgrade in preview.upgrades {
+                let name=upgrade.custom_name().map(str::to_owned).unwrap_or_else(||self.pack.names.display_item(&upgrade.item));
+                lines.push((horizon_client::text::Text::literal(format!("Upgrade: {name}")),rgba(170,170,170,255)));
+            }
+            for (key,count) in preview.entries {
+                let name=if preview.fluid {self.pack.names.display_item(&key.item_id)} else {
+                    horizon_client::ae2_cell_codec::prototype(&key).ok().and_then(|item|item.custom_name().map(str::to_owned))
+                        .unwrap_or_else(||self.pack.names.display_item(&key.item_id))
+                };
+                let amount=if preview.fluid {format!("{count} mB")}else{count.to_string()};
+                lines.push((horizon_client::text::Text::literal(format!("{name}: {amount}")),rgba(170,170,170,255)));
+            }
+            if preview.has_more {lines.push((horizon_client::text::Text::literal("…"),rgba(170,170,170,255)));}
+        }
         let translate = |k: &str| self.pack.names.display_get(k);
         let push = |lines: &mut Vec<(horizon_client::text::Text, u32)>, s: String, c: u32| {
             lines.push((horizon_client::text::Text::legacy(&s), c));

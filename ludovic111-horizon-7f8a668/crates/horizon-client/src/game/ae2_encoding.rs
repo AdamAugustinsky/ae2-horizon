@@ -4,6 +4,93 @@ use super::ae2_processing::PatternFluid;
 use horizon_client::{ae2_world::Machine,items::ItemStack,save};
 use horizon_world::nbt::Tag;
 
+/// Convert a real source wrapper into a ghost value without moving the
+/// physical carrier; preserve both its key components and stored amount.
+#[derive(Clone,Debug,PartialEq)]
+pub(super) enum WrappedGhost {Item(ItemStack), Fluid(PatternFluid)}
+pub(super) fn wrapped_ghost(stack:&ItemStack,known:&dyn Fn(&str,bool)->bool)->Result<Option<WrappedGhost>,String> {
+    let Some(value)=horizon_client::ae2_generic_stack::unwrap_item_stack_checked(stack,known)? else{return Ok(None);};
+    if value.fluid {return Ok(Some(WrappedGhost::Fluid(PatternFluid{key:value.key,amount:value.amount.max(0) as u64})));}
+    let mut item=horizon_client::ae2_cell_codec::prototype(&value.key)?;
+    item.count=value.amount.clamp(1,i64::from(i32::MAX)) as u32;
+    Ok(Some(WrappedGhost::Item(item)))
+}
+
+/// Decode the carried stack once. The boolean records whether its configured
+/// quantity came from a wrapped stack rather than its physical carrier count.
+pub(super) fn cursor_ghost(stack:Option<&ItemStack>,known:&dyn Fn(&str,bool)->bool)->Result<Option<(WrappedGhost,bool)>,String> {
+    let Some(stack)=stack else{return Ok(None)};
+    Ok(Some(match wrapped_ghost(stack,known)? {
+        Some(value)=>(value,true),
+        None=>(WrappedGhost::Item(stack.clone()),false),
+    }))
+}
+/// The native fluid selector is a separate UI route; valid source wrappers
+/// always retain their own key and amount instead of the selected fluid.
+pub(super) fn select_ghost(cursor:&Result<Option<(WrappedGhost,bool)>,String>,fluid_mode:bool,selected:Option<PatternFluid>,right:bool)->Option<Option<(WrappedGhost,bool)>> {
+    match cursor {
+        Err(_)=>None,
+        Ok(None) if right=>Some(None),
+        Ok(Some((value,true)))=>Some(Some((value.clone(),true))),
+        Ok(_) if fluid_mode=>selected.map(|value|Some((WrappedGhost::Fluid(value),true))),
+        Ok(value)=>Some(value.clone()),
+    }
+}
+
+/// AEBaseMenu.handleFakeSlotAction and FakeSlot.increase/decrease for a
+/// CONFIG_STACKS inventory. A wrapper's physical count remains one while its
+/// contained amount is preserved; ordinary right-click insertion uses one.
+pub(super) fn click_ghost(
+    item:&mut Option<ItemStack>, fluid:&mut Option<PatternFluid>,
+    held:Option<(WrappedGhost,bool)>, right:bool, item_max:u32, item_capacity:u32, fluid_capacity:u64,
+) {
+    let held_is_wrapper=held.as_ref().is_some_and(|(_,wrapped)|*wrapped);
+    let held=held.map(|(value,_)|value);
+    let current=item.take().map(WrappedGhost::Item).or_else(||fluid.take().map(WrappedGhost::Fluid));
+    let same=|a:&WrappedGhost,b:&WrappedGhost|match (a,b) {
+        (WrappedGhost::Item(a),WrappedGhost::Item(b))=>a.same_item_same_components(b),
+        (WrappedGhost::Fluid(a),WrappedGhost::Fluid(b))=>a.key==b.key,
+        _=>false,
+    };
+    let next=if !right {
+        match (current,held) {
+            (Some(mut current),Some(held)) if same(&current,&held)=>{
+                match (&mut current,held) {
+                    (WrappedGhost::Item(a),WrappedGhost::Item(b))=>a.count=a.count.saturating_add(b.count).min(item_capacity),
+                    (WrappedGhost::Fluid(a),WrappedGhost::Fluid(b))=>a.amount=a.amount.saturating_add(b.amount).min(fluid_capacity),
+                    _=>unreachable!(),
+                }
+                Some(current)
+            },
+            (Some(_),Some(WrappedGhost::Fluid(value))) if value.amount==0=>None,
+            (_,held)=>held,
+        }
+    } else {
+        match (current,held) {
+            (None,Some(WrappedGhost::Item(mut value))) if !held_is_wrapper=>{value.count=1;Some(WrappedGhost::Item(value))},
+            (None,value)=>value,
+            (Some(mut current),Some(held)) if same(&current,&held)=>{
+                let remains=match (&mut current,held) {
+                    (WrappedGhost::Item(a),WrappedGhost::Item(b))=>{a.count=a.count.saturating_sub(b.count);a.count>0},
+                    (WrappedGhost::Fluid(a),WrappedGhost::Fluid(b))=>{a.amount=a.amount.saturating_sub(b.amount);a.amount>0},
+                    _=>unreachable!(),
+                };
+                remains.then_some(current)
+            },
+            (Some(current),Some(_))=>Some(current),
+            (Some(WrappedGhost::Item(mut current)),None) if current.count<=item_max.max(1)=>{
+                current.count-=1;(current.count>0).then_some(WrappedGhost::Item(current))
+            },
+            (Some(_),None)=>None,
+        }
+    };
+    match next {
+        Some(WrappedGhost::Item(mut value))=>{value.count=value.count.min(item_capacity.max(1));*item=Some(value);},
+        Some(WrappedGhost::Fluid(mut value))=>{value.amount=value.amount.min(fluid_capacity.max(1)).max(1);*fluid=Some(value);},
+        None=>{}
+    }
+}
+
 #[derive(Clone,Debug,PartialEq)]
 pub(super) struct EncodingState {
     pub inputs:Vec<Option<ItemStack>>,pub outputs:Vec<Option<ItemStack>>,
@@ -14,6 +101,13 @@ impl Default for EncodingState {
     fn default()->Self {Self{inputs:vec![None;81],outputs:vec![None;27],fluid_inputs:vec![None;81],fluid_outputs:vec![None;27],substitutes:false,fluid_substitutes:true,processing:false,special_mode:0,stone_recipe:None}}
 }
 impl EncodingState {
+    /// PatternEncodingLogic.fixCraftingRecipes runs after input/mode changes.
+    pub fn normalize_crafting_inputs(&mut self) {
+        if !self.processing {
+            self.fluid_inputs.fill(None);
+            for item in self.inputs.iter_mut().flatten() {item.count=1;}
+        }
+    }
     pub fn load(machine:&Machine)->Result<Self,String> {
         let Some(tag)=machine.config.get(&"ae2_encoding_state".into()) else{return Ok(Self::default())};
         if !matches!(tag,Tag::Compound(_)){return Err("invalid encoding state".into());}
@@ -52,7 +146,10 @@ impl EncodingState {
         }
         if let Some((grid,_))=super::ae2_processing::decode_pattern(pattern) {
             state.inputs[..9].clone_from_slice(&grid);
-            if let Some(data)=pattern.data().and_then(|d|d.other("minecraft:custom_data")).and_then(|v|v.get("ae2_lab_pattern")) {
+            if super::ae2_source_patterns::crafting(pattern).is_some() {
+                let (substitutes,fluid_substitutes)=super::ae2_processing::ae2_crafting_pattern_options(pattern)?;
+                state.substitutes=substitutes;state.fluid_substitutes=fluid_substitutes;
+            } else if let Some(data)=pattern.data().and_then(|d|d.other("minecraft:custom_data")).and_then(|v|v.get("ae2_lab_pattern")) {
                 state.substitutes=matches!(data.get("substitutes"),Some(Tag::Byte(1)));
                 state.fluid_substitutes=!matches!(data.get("fluid_substitutes"),Some(Tag::Byte(0)));
             }
@@ -114,6 +211,62 @@ impl super::Game<'_> {
 mod tests {
     use super::*;
     use horizon_client::ae2_world::MachineKind;
+    #[test]
+    fn source_crafting_pattern_reopen_preserves_both_substitution_flags() {
+        let mut grid=vec![None;9];grid[0]=Some(ItemStack::new("minecraft:oak_planks",1));
+        let output=ItemStack::new("minecraft:oak_button",1);
+        let mut pattern=super::super::ae2_processing::ae2_encode_pattern_source(&grid,&output,"minecraft:oak_button",true,false).unwrap();
+        pattern.data_mut().set_other("minecraft:custom_data",None);
+        let restored=EncodingState::from_pattern(&pattern).unwrap();
+        assert!(restored.substitutes);assert!(!restored.fluid_substitutes);
+        assert_eq!(&restored.inputs[..9],grid.as_slice());
+    }
+    #[test]
+    fn wrapped_ghosts_preserve_inner_identity_amount_and_components() {
+        let component=Tag::compound([("minecraft:custom_data",Tag::compound([("variant",Tag::String("warm".into()))]))]);
+        let bytes=horizon_world::nbt::write_network(&component,horizon_world::nbt::Limits::default()).unwrap();
+        let value=horizon_client::ae2_generic_stack::GenericStack{key:ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components:bytes},fluid:true,amount:1750};
+        let physical=horizon_client::ae2_generic_stack::wrap(&value).unwrap();
+        assert_eq!(wrapped_ghost(&physical,&|_,_|true).unwrap(),Some(WrappedGhost::Fluid(PatternFluid{key:value.key,amount:1750})));
+        assert_eq!(physical.count,1);
+        let mut physical_item=ItemStack::new("minecraft:oak_log",1);physical_item.data_mut().custom_name=Some("marked".into());
+        let key=horizon_client::ae2_cell_codec::key(&physical_item).unwrap();
+        let wrapped=horizon_client::ae2_generic_stack::wrap(&horizon_client::ae2_generic_stack::GenericStack{key,fluid:false,amount:5}).unwrap();
+        physical_item.count=5;assert_eq!(wrapped_ghost(&wrapped,&|_,_|true).unwrap(),Some(WrappedGhost::Item(physical_item.clone())));
+        let mut state=EncodingState::default();state.inputs[0]=Some(physical_item);
+        state.fluid_inputs[1]=Some(PatternFluid{key:ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components:vec![]},amount:1750});
+        state.normalize_crafting_inputs();assert_eq!(state.inputs[0].as_ref().unwrap().count,1);assert!(state.fluid_inputs[1].is_none());
+    }
+    #[test]
+    fn fake_slot_clicks_add_subtract_and_preserve_mismatched_keys() {
+        let mut item=None;let mut fluid=None;
+        let oak=ItemStack::new("minecraft:oak_planks",3);
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Item(oak.clone()),false)),true,64,i32::MAX as u32,i64::MAX as u64);
+        assert_eq!(item.as_ref().unwrap().count,1,"right click of an empty slot inserts one");
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Item(oak.clone()),false)),false,64,i32::MAX as u32,i64::MAX as u64);
+        assert_eq!(item.as_ref().unwrap().count,4,"left click adds the held amount");
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Item(ItemStack::new("minecraft:stone",1)),false)),true,64,i32::MAX as u32,i64::MAX as u64);
+        assert_eq!(item.as_ref().unwrap().count,4,"right click with a different key does not clear it");
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Item(oak),false)),true,64,i32::MAX as u32,i64::MAX as u64);
+        assert_eq!(item.as_ref().unwrap().count,1,"right click subtracts the held amount");
+        click_ghost(&mut item,&mut fluid,None,true,64,i32::MAX as u32,i64::MAX as u64);
+        assert!(item.is_none());
+        let water=PatternFluid{key:ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components:vec![]},amount:1250};
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Fluid(water.clone()),true)),true,64,i32::MAX as u32,i64::MAX as u64);
+        assert_eq!(fluid.as_ref().unwrap().amount,1250,"a wrapper retains its embedded amount");
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Fluid(water),true)),false,64,i32::MAX as u32,i64::MAX as u64);
+        assert_eq!(fluid.as_ref().unwrap().amount,2500);
+        click_ghost(&mut item,&mut fluid,None,true,64,i32::MAX as u32,i64::MAX as u64);
+        assert!(fluid.is_none(),"right click on a displayed wrapper shrinks its one carrier");
+        let zero=PatternFluid{key:ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components:vec![]},amount:0};
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Fluid(zero.clone()),true)),false,64,i32::MAX as u32,i64::MAX as u64);
+        assert_eq!(fluid.as_ref().unwrap().amount,1,"zero on an empty slot configures one unit");
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Fluid(zero.clone()),true)),false,64,i32::MAX as u32,i64::MAX as u64);
+        assert_eq!(fluid.as_ref().unwrap().amount,1,"inserting zero of the same key has no effect");
+        item=Some(ItemStack::new("minecraft:stone",1));fluid=None;
+        click_ghost(&mut item,&mut fluid,Some((WrappedGhost::Fluid(zero),true)),false,64,i32::MAX as u32,i64::MAX as u64);
+        assert!(item.is_none() && fluid.is_none(),"zero of a different key clears an occupied slot");
+    }
     #[test]
     fn positioned_mixed_pattern_restores_original_ghost_slots() {
         let mut state=EncodingState::default();state.processing=true;

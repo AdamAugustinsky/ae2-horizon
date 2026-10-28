@@ -161,12 +161,12 @@ impl Containers<'_> {
             });
         }
         let entity = self.world.block_entities.get(&pos)?;
-        // The Workbench's cell is an internal segmented inventory, not an
-        // exposed item handler. Hoppers and droppers must not bypass its
-        // menu handoff and mutate that slot as a generic container.
+        // The Workbench's cell and Quantum Ring's internal singularity slot
+        // are not exposed on any side. Automation must not bypass them using
+        // the generic container view.
         #[cfg(feature = "ae2-lab")]
         if matches!(entity, BlockEntity::Ae2(machine)
-            if machine.kind == horizon_client::ae2_world::MachineKind::CellWorkbench)
+            if matches!(machine.kind, horizon_client::ae2_world::MachineKind::CellWorkbench | horizon_client::ae2_world::MachineKind::QuantumRing))
         {
             return None;
         }
@@ -251,6 +251,12 @@ impl Containers<'_> {
     }
     /// `Container.canPlaceItem` (+ `canPlaceItemThroughFace` for furnaces).
     fn can_place(&self, view: &View, slot: usize, stack: &ItemStack) -> bool {
+        #[cfg(feature = "ae2-lab")]
+        if let Some((pos, index)) = view.locate(slot) {
+            if matches!(self.world.block_entities.get(&pos), Some(BlockEntity::Ae2(machine)) if machine.kind == horizon_client::ae2_world::MachineKind::QuantumLink) {
+                return index == 0 && crate::game::ae2_quantum::frequency(stack).is_some();
+            }
+        }
         if view.kind == Kind::Crafter {
             return match self.world.block_entities.get(&view.parts[0].0) {
                 Some(BlockEntity::Crafter(c)) => {
@@ -436,6 +442,10 @@ impl Game<'_> {
             return;
         }
         for &(pos, _) in &view.parts {
+            #[cfg(feature = "ae2-lab")]
+            if matches!(self.world.block_entities.get(&pos), Some(BlockEntity::Ae2(machine)) if machine.kind == horizon_client::ae2_world::MachineKind::QuantumLink) {
+                self.ae2_quantum_inventory_changed(pos);
+            }
             self.container_changed(pos);
         }
     }
@@ -468,7 +478,14 @@ impl Game<'_> {
             return Some(stack);
         }
         let was_empty = c.is_empty(view);
-        let max = c.max_stack(&stack);
+        let max = {
+            #[cfg(feature = "ae2-lab")]
+            if view.locate(slot).is_some_and(|(pos, _)| matches!(c.world.block_entities.get(&pos), Some(BlockEntity::Ae2(machine)) if machine.kind == horizon_client::ae2_world::MachineKind::QuantumLink)) {
+                1
+            } else { c.max_stack(&stack) }
+            #[cfg(not(feature = "ae2-lab"))]
+            { c.max_stack(&stack) }
+        };
         let mut success = false;
         let target = self.slot_mut_at(view, slot)?;
         match target {
@@ -624,7 +641,7 @@ impl Game<'_> {
                     continue;
                 };
                 let one = ItemStack { count: 1, ..stack };
-                let provider = matches!(self.ae2_block_entity(address), Some(BlockEntity::Ae2(m)) if matches!(m.kind,horizon_client::ae2_world::MachineKind::PatternProvider|horizon_client::ae2_world::MachineKind::Condenser|horizon_client::ae2_world::MachineKind::Charger|horizon_client::ae2_world::MachineKind::VibrationChamber|horizon_client::ae2_world::MachineKind::Inscriber|horizon_client::ae2_world::MachineKind::MolecularAssembler))
+                let provider = matches!(self.ae2_block_entity(address), Some(BlockEntity::Ae2(m)) if matches!(m.kind,horizon_client::ae2_world::MachineKind::PatternProvider|horizon_client::ae2_world::MachineKind::Condenser|horizon_client::ae2_world::MachineKind::Charger|horizon_client::ae2_world::MachineKind::VibrationChamber|horizon_client::ae2_world::MachineKind::Inscriber|horizon_client::ae2_world::MachineKind::MolecularAssembler|horizon_client::ae2_world::MachineKind::QuantumLink))
                     || self
                         .ae2_provider_part_at(address, facing.opposite())
                         .is_some()
@@ -703,7 +720,7 @@ impl Game<'_> {
             } else {
                 None
             };
-            let condenser=matches!(self.ae2_block_entity(address),Some(BlockEntity::Ae2(m)) if matches!(m.kind,horizon_client::ae2_world::MachineKind::Condenser|horizon_client::ae2_world::MachineKind::Charger|horizon_client::ae2_world::MachineKind::VibrationChamber|horizon_client::ae2_world::MachineKind::Inscriber|horizon_client::ae2_world::MachineKind::MolecularAssembler));
+            let condenser=matches!(self.ae2_block_entity(address),Some(BlockEntity::Ae2(m)) if matches!(m.kind,horizon_client::ae2_world::MachineKind::Condenser|horizon_client::ae2_world::MachineKind::Charger|horizon_client::ae2_world::MachineKind::VibrationChamber|horizon_client::ae2_world::MachineKind::Inscriber|horizon_client::ae2_world::MachineKind::MolecularAssembler|horizon_client::ae2_world::MachineKind::QuantumLink));
             let condenser_choices=condenser.then(||self.ae2_native_item_candidates(address,Direction::Down));
             if let Some(choices) = p2p.or(interface).or(condenser_choices) {
                 for candidate in choices {

@@ -24,6 +24,32 @@ pub fn from_network(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> ItemStack
     if let Some(data) = data {
         *out.data_mut() = *data;
     }
+    #[cfg(feature = "ae2-lab")]
+    {
+        let key = "horizon:wire_ae2_components";
+        if let Some(Tag::Compound(mut envelope)) = out.data().and_then(|data| data.other("minecraft:custom_data")).cloned() {
+            if let Some(Tag::Compound(mut wrapped)) = envelope.get(&key.into()).cloned() {
+                let known_fields = wrapped.keys().all(|field| matches!(field.to_string_lossy().as_str(), "version" | "had_custom_data" | "components" | "previous"));
+                let components = wrapped.remove(&"components".into());
+                let had_custom_data = wrapped.remove(&"had_custom_data".into());
+                if known_fields && wrapped.remove(&"version".into()) == Some(Tag::Byte(1)) && matches!(&had_custom_data, Some(Tag::Byte(0 | 1))) {
+                    if let Some(Tag::Compound(components)) = components.filter(|value| {
+                        matches!(value, Tag::Compound(map) if map.keys().all(|id| crate::ae2_components::PERSISTENT_IDS.contains(&id.to_string_lossy().as_str())))
+                    }) {
+                        envelope.remove(&key.into());
+                        if let Some(previous) = wrapped.remove(&"previous".into()) {
+                            envelope.insert(key.into(), previous);
+                        }
+                        let data = out.data_mut();
+                        data.set_other("minecraft:custom_data", (had_custom_data == Some(Tag::Byte(1)) || !envelope.is_empty()).then_some(Tag::Compound(envelope)));
+                        for (id, value) in components {
+                            data.set_other(&id.to_string_lossy(), Some(value));
+                        }
+                    }
+                }
+            }
+        }
+    }
     out.tidy();
     out
 }
@@ -131,19 +157,10 @@ fn components_tag(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> Option<Tag>
                     .enumerate()
                     .filter_map(|(slot, item)| {
                         item.as_ref().map(|item| {
-                            let mut item_entries = vec![
-                                (
-                                    "id",
-                                    Tag::String(item_name(builtin, item.item).as_ref().into()),
-                                ),
-                                ("count", Tag::Int(item.count)),
-                            ];
-                            if let Some(c) = components_tag(item, builtin, synced) {
-                                item_entries.push(("components", c));
-                            }
+                            let native = from_network(item, builtin, synced);
                             Tag::compound([
                                 ("slot", Tag::Int(slot as i32)),
-                                ("item", Tag::compound(item_entries)),
+                                ("item", crate::save::item_to_nbt(&native)),
                             ])
                         })
                     })
@@ -152,19 +169,7 @@ fn components_tag(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> Option<Tag>
             Component::Stacks(stacks) => Tag::List(
                 stacks
                     .iter()
-                    .map(|t| {
-                        let mut entries = vec![
-                            (
-                                "id",
-                                Tag::String(item_name(builtin, t.item).as_ref().into()),
-                            ),
-                            ("count", Tag::Int(t.count)),
-                        ];
-                        if let Some(c) = components_tag(t, builtin, synced) {
-                            entries.push(("components", c));
-                        }
-                        Tag::compound(entries)
-                    })
+                    .map(|item| crate::save::item_to_nbt(&from_network(item, builtin, synced)))
                     .collect(),
             ),
             Component::CustomModelData {
@@ -261,6 +266,174 @@ fn profile_tag(p: &Profile) -> Tag {
 mod tests {
     use super::*;
     use horizon_protocol::registry::Ids;
+
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn name_press_and_structured_names_survive_the_integrated_wire() {
+        use horizon_protocol::{buf::{Codec, Reader, Writer}, item::Slot};
+        let mut components=vec![String::new();7];
+        components[component::CUSTOM_DATA as usize]="minecraft:custom_data".into();
+        components[component::CUSTOM_NAME as usize]="minecraft:custom_name".into();
+        let builtin=Builtin {registries:[
+            ("minecraft:item".into(),Ids::from_names(vec!["ae2:name_press".into(),"minecraft:diamond".into()])),
+            ("minecraft:data_component_type".into(),Ids::from_names(components)),
+        ].into()};
+        let round=|item:&ItemStack| {
+            let wire=crate::lan::guest::stack_to_network(
+                |name|builtin.get("minecraft:item").unwrap().id(name).unwrap(),|_,_|None,&Some(item.clone()));
+            let mut writer=Writer::new();Slot::write(&wire,&mut writer);
+            let mut reader=Reader::new(&writer.data);let decoded=Slot::read(&mut reader).unwrap().unwrap();
+            assert_eq!(reader.remaining(),0);
+            from_network(&decoded,&builtin,&Dynamic::default())
+        };
+        let styled=Tag::compound([("text",Tag::String("Red".into())),("color",Tag::String("red".into()))]);
+        let original_data=Tag::compound([("proof",Tag::Int(42)),("horizon:wire_name_press_name",Tag::String("existing".into()))]);
+        let mut press=ItemStack::new("ae2:name_press",1);
+        press.data_mut().set_other("ae2:name_press_name",Some(styled.clone()));
+        press.data_mut().set_other("minecraft:custom_data",Some(original_data));
+        assert_eq!(round(&press),press,"the transient envelope preserves real and existing components");
+        let mut named=ItemStack::new("minecraft:diamond",1);
+        named.set_custom_name_component(Some(styled.clone()));
+        let after=round(&named);
+        assert_eq!(after.custom_name_component(),Some(&styled));
+        assert!(after.same_item_same_components(&named));
+    }
+
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn entangled_frequency_survives_wire_and_preserves_colliding_custom_data() {
+        use horizon_protocol::{buf::{Codec, Reader, Writer}, item::Slot};
+        let mut components = vec![String::new(); 7];
+        components[component::CUSTOM_DATA as usize] = "minecraft:custom_data".into();
+        let builtin = Builtin { registries: [
+            ("minecraft:item".into(), Ids::from_names(vec!["minecraft:diamond".into(), "ae2:quantum_entangled_singularity".into()])),
+            ("minecraft:data_component_type".into(), Ids::from_names(components)),
+        ].into() };
+        let round = |item: &ItemStack| {
+            let wire = crate::lan::guest::stack_to_network(
+                |name| builtin.get("minecraft:item").unwrap().id(name).unwrap(), |_, _| None, &Some(item.clone()));
+            let mut writer = Writer::new(); Slot::write(&wire, &mut writer);
+            let mut reader = Reader::new(&writer.data); let decoded = Slot::read(&mut reader).unwrap().unwrap();
+            assert_eq!(reader.remaining(), 0);
+            from_network(&decoded, &builtin, &Dynamic::default())
+        };
+        let key = "horizon:wire_ae2_components";
+        let existing = Tag::compound([
+            ("version", Tag::Byte(1)),
+            ("components", Tag::compound([("ae2:entangled_singularity_id", Tag::Long(123))])),
+        ]);
+        let mut arbitrary = ItemStack::new("minecraft:diamond", 1);
+        arbitrary.data_mut().set_other("minecraft:custom_data", Some(Tag::compound([(key, existing)])));
+        assert_eq!(round(&arbitrary), arbitrary, "an unrelated pre-existing marker is escaped even without a frequency");
+        arbitrary.data_mut().set_other("ae2:entangled_singularity_id", Some(Tag::Long(-42)));
+        assert_eq!(round(&arbitrary), arbitrary, "a frequency on any source-valid item and colliding data both survive");
+        let mut pair = ItemStack::new("ae2:quantum_entangled_singularity", 2);
+        pair.data_mut().set_other("ae2:entangled_singularity_id", Some(Tag::Long(0)));
+        assert_eq!(round(&pair), pair, "zero remains a present component");
+        pair.data_mut().set_other("minecraft:custom_data", Some(Tag::compound([] as [(&str, Tag); 0])));
+        assert_eq!(round(&pair), pair, "an explicitly empty custom-data component remains present");
+    }
+
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn every_source_component_roundtrips_and_unknown_envelopes_stay_data() {
+        use horizon_protocol::{buf::{Codec, Reader, Writer}, item::Slot};
+        let item = || Tag::compound([("id", Tag::String("minecraft:stone".into())), ("count", Tag::Int(1))]);
+        let string = |s: &str| Tag::String(s.into());
+        let list = || Tag::List(Vec::new());
+        let generic = || Tag::compound([("#t", string("ae2:i")), ("id", string("minecraft:stone")), ("#", Tag::Long(1))]);
+        let samples = vec![
+            ("ae2:exported_settings_source", string("Example")),
+            ("ae2:exported_custom_name", string("Named")),
+            ("ae2:exported_upgrades", list()),
+            ("ae2:exported_settings", Tag::compound([("redstone_mode", string("HIGH"))])),
+            ("ae2:exported_priority", Tag::Int(4)),
+            ("ae2:exported_p2p_type", string("minecraft:stone")),
+            ("ae2:exported_p2p_frequency", Tag::Short(42)),
+            ("ae2:memory_card_colors", Tag::List((0..8).map(|_| string("fluix")).collect())),
+            ("ae2:exported_config_inv", list()),
+            ("ae2:exported_level_emitter_value", Tag::Long(31)),
+            ("ae2:exported_patterns", list()),
+            ("ae2:exported_push_direction", string("all")),
+            ("ae2:name_press_name", string("Plate")),
+            ("ae2:upgrades", list()),
+            ("ae2:entangled_singularity_id", Tag::Long(42)),
+            ("ae2:stored_energy", Tag::Double(123.5f64.to_bits())),
+            ("ae2:energy_capacity", Tag::Double(500.0f64.to_bits())),
+            ("ae2:encoded_crafting_pattern", Tag::compound([
+                ("inputs", list()), ("result", item()), ("recipeId", string("minecraft:stone")),
+                ("canSubstitute", Tag::Byte(0)), ("canSubstituteFluids", Tag::Byte(0)),
+            ])),
+            ("ae2:encoded_processing_pattern", Tag::compound([("sparseInputs", list()), ("sparseOutputs", list())])),
+            ("ae2:encoded_stonecutting_pattern", Tag::compound([
+                ("input", item()), ("output", item()), ("recipeId", string("minecraft:stone")), ("canSubstitute", Tag::Byte(0)),
+            ])),
+            ("ae2:encoded_smithing_table_pattern", Tag::compound([
+                ("template", item()), ("base", item()), ("addition", item()), ("resultItem", item()),
+                ("recipeId", string("minecraft:stone")), ("canSubstitute", Tag::Byte(0)),
+            ])),
+            ("ae2:enabled_key_types", Tag::List(vec![string("ae2:i")])),
+            ("ae2:wireless_link_target", Tag::compound([("dimension", string("minecraft:overworld")), ("pos", Tag::IntArray(vec![1, 64, 2]))])),
+            ("ae2:selected_color", string("fluix")),
+            ("ae2:storage_cell_fuzzy_mode", string("IGNORE_ALL")),
+            ("ae2:storage_cell_inv", list()),
+            ("ae2:storage_cell_config_inv", list()),
+            ("ae2:facade_item", string("minecraft:stone")),
+            ("ae2:facade_cycle_property", string("axis")),
+            ("ae2:wrapped_stack", generic()),
+            ("ae2:crafting_inv", list()),
+            ("ae2:spatial_plot_info", Tag::compound([("id", Tag::Int(3)), ("size", Tag::IntArray(vec![2, 2, 2]))])),
+            ("ae2:missing_content_itemstack_data", Tag::compound([] as [(&str, Tag); 0])),
+            ("ae2:missing_content_aekey_data", Tag::compound([] as [(&str, Tag); 0])),
+            ("ae2:missing_content_error", string("missing")),
+        ];
+        let expected: std::collections::BTreeSet<_> = crate::ae2_components::PERSISTENT_IDS.iter().copied().collect();
+        assert_eq!(samples.iter().map(|(id, _)| *id).collect::<std::collections::BTreeSet<_>>(), expected);
+        assert_eq!(samples.len(), 35);
+        for (id, value) in &samples {
+            crate::ae2_components::validate(id, value).unwrap_or_else(|error| panic!("invalid source-shaped sample for {id}: {error}"));
+        }
+        let mut components = vec![String::new(); 78];
+        components[component::CUSTOM_DATA as usize] = "minecraft:custom_data".into();
+        components[component::CONTAINER as usize] = "minecraft:container".into();
+        components[component::BUNDLE_CONTENTS as usize] = "minecraft:bundle_contents".into();
+        let builtin = Builtin { registries: [
+            ("minecraft:item".into(), Ids::from_names(vec!["minecraft:diamond".into(), "minecraft:shulker_box".into(), "minecraft:bundle".into()])),
+            ("minecraft:data_component_type".into(), Ids::from_names(components)),
+        ].into() };
+        let mut original = ItemStack::new("minecraft:diamond", 1);
+        for (id, value) in samples { original.data_mut().set_other(id, Some(value)); }
+        original.data_mut().set_other("minecraft:custom_data", Some(Tag::compound([("marker", Tag::Int(9))])));
+        let wire = crate::lan::guest::stack_to_network(|name| builtin.get("minecraft:item").unwrap().id(name).unwrap(), |_, _| None, &Some(original.clone()));
+        let mut writer = Writer::new(); Slot::write(&wire, &mut writer);
+        let mut reader = Reader::new(&writer.data); let decoded = Slot::read(&mut reader).unwrap().unwrap();
+        assert_eq!(reader.remaining(), 0);
+        assert_eq!(from_network(&decoded, &builtin, &Dynamic::default()), original);
+        let mut container = ItemStack::new("minecraft:shulker_box", 1);
+        container.data_mut().container.push((4, original.clone()));
+        let wire = crate::lan::guest::stack_to_network(|name| builtin.get("minecraft:item").unwrap().id(name).unwrap(), |_, _| None, &Some(container.clone()));
+        let mut writer = Writer::new(); Slot::write(&wire, &mut writer);
+        let mut reader = Reader::new(&writer.data); let decoded = Slot::read(&mut reader).unwrap().unwrap();
+        assert_eq!(reader.remaining(), 0);
+        assert_eq!(from_network(&decoded, &builtin, &Dynamic::default()), container, "nested item components must also be promoted");
+        let mut bundle = ItemStack::new("minecraft:bundle", 1);
+        bundle.data_mut().bundle_contents.push(original.clone());
+        let wire = crate::lan::guest::stack_to_network(|name| builtin.get("minecraft:item").unwrap().id(name).unwrap(), |_, _| None, &Some(bundle.clone()));
+        let mut writer = Writer::new(); Slot::write(&wire, &mut writer);
+        let mut reader = Reader::new(&writer.data); let decoded = Slot::read(&mut reader).unwrap().unwrap();
+        assert_eq!(reader.remaining(), 0);
+        assert_eq!(from_network(&decoded, &builtin, &Dynamic::default()), bundle, "nested bundle items must also be promoted");
+
+        let forged = Tag::compound([("horizon:wire_ae2_components", Tag::compound([
+            ("version", Tag::Byte(1)), ("had_custom_data", Tag::Byte(0)),
+            ("components", Tag::compound([("ae2:not_registered", Tag::Int(8))])),
+        ]))]);
+        let mut packet = Stack::new(0, 1);
+        packet.added.push((component::CUSTOM_DATA, Component::Nbt(forged.clone())));
+        let untouched = from_network(&packet, &builtin, &Dynamic::default());
+        assert_eq!(untouched.data().unwrap().other("minecraft:custom_data"), Some(&forged));
+        assert!(untouched.data().unwrap().other("ae2:not_registered").is_none());
+    }
 
     #[test]
     fn item_container_keeps_sparse_slots_and_nested_components_on_wire() {

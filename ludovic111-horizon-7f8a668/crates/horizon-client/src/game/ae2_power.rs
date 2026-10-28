@@ -9,8 +9,9 @@ use horizon_world::nbt::Tag;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub(super) struct FeStorage {
-    pub stored: u32,
-    pub capacity: u32,
+    // IEnergyStorage returns signed Java ints, including wrapped P2P sums.
+    pub stored: i32,
+    pub capacity: i32,
     pub can_receive: bool,
     pub can_extract: bool,
 }
@@ -23,11 +24,18 @@ const SIDES: [(Direction, [i32; 3]); 6] = [
     (Direction::North, [0, 0, -1]),
 ];
 fn as_fe(ae: f64) -> u32 {
-    if ae.is_finite() {
-        (ae.max(0.0) * 2.0).floor().min(f64::from(i32::MAX)) as u32
-    } else {
-        0
-    }
+    as_fe_with_ratio(ae, horizon_client::ae2_common_config::gameplay().forge_energy)
+}
+fn as_fe_with_ratio(ae: f64, ratio: f64) -> u32 {
+    // Java's narrowing double-to-int conversion saturates at Integer.MAX_VALUE
+    // (including positive infinity) and truncates the fractional FE.
+    (ae.max(0.0) / ratio).floor().min(f64::from(i32::MAX)) as u32
+}
+/// ForgeEnergyAdapter returns `(int)(maxReceive - overflowFE)`, after the
+/// sink has accepted its full (possibly fractional-FE) amount in AE.
+fn received_fe(offered: u32, offered_ae: f64, accepted_ae: f64, ratio: f64) -> u32 {
+    let overflow = (offered_ae - accepted_ae).max(0.0) / ratio;
+    (f64::from(offered) - overflow).max(0.0).min(f64::from(offered)) as u32
 }
 fn generation_rate(tag: Option<&Tag>) -> u32 {
     match tag {
@@ -113,8 +121,8 @@ impl Game<'_> {
         };
         if m.kind == MachineKind::DebugEnergyGenerator {
             return Some(FeStorage {
-                stored: i32::MAX as u32,
-                capacity: i32::MAX as u32,
+                stored: i32::MAX,
+                capacity: i32::MAX,
                 can_extract: true,
                 can_receive: false,
             });
@@ -122,12 +130,12 @@ impl Game<'_> {
         if self.ae2_energy_acceptor_face(address, face) {
             return Some(FeStorage {
                 stored: if m.kind == MachineKind::Controller {
-                    as_fe(m.energy)
+                    as_fe(m.energy) as i32
                 } else {
                     0
                 },
                 capacity: if m.kind == MachineKind::Controller {
-                    16000
+                    as_fe(8000.0) as i32
                 } else {
                     0
                 },
@@ -135,7 +143,7 @@ impl Game<'_> {
                 can_extract: false,
             });
         }
-        let capacity = ae2_processing::ae2_private_power_capacity(m.kind)?;
+        let capacity = ae2_processing::ae2_private_power_capacity(m)?;
         let state = self
             .ae2_grid_block(address)
             .and_then(|s| self.pack.assets.registry.state(s))?;
@@ -143,8 +151,8 @@ impl Game<'_> {
             return None;
         }
         Some(FeStorage {
-            stored: as_fe(m.energy.min(capacity)),
-            capacity: as_fe(capacity),
+            stored: as_fe(m.energy.min(capacity)) as i32,
+            capacity: as_fe(capacity) as i32,
             can_receive: true,
             can_extract: false,
         })
@@ -181,58 +189,29 @@ impl Game<'_> {
         {
             return 0;
         }
+        let fe_ratio = horizon_client::ae2_common_config::gameplay().forge_energy;
+        let offered_ae = (f64::from(amount) * fe_ratio).min(f64::MAX);
         if self.ae2_energy_acceptor_face(address, face) {
             let part_face=matches!(self.ae2_block_entity(address),Some(BlockEntity::Ae2(machine)) if machine.kind==MachineKind::CableBus).then_some(match face {
                 Direction::East=>0,Direction::West=>1,Direction::Up=>2,Direction::Down=>3,Direction::South=>4,Direction::North=>5,
             });
-            if let Ok(preview)=self.ae2_energy_transaction(address,part_face,f64::from(amount)*0.5,true,true) {
-                let accepted=as_fe(preview).min(amount);
-                if !simulate && accepted>0 {
-                    match self.ae2_energy_inject_exact(address,part_face,f64::from(accepted)*0.5) {
-                        Ok(actual) if as_fe(actual)==accepted=>{},
-                        _=>return 0,
-                    }
-                }
-                return accepted;
+            if let Ok(accepted_ae)=self.ae2_energy_transaction(address,part_face,offered_ae,simulate,true) {
+                return received_fe(amount,offered_ae,accepted_ae,fe_ratio);
             }
             let mut network = self.ae2_network();
-            let Ok(preview) = network.insert_energy(address.network_pos(), f64::from(amount) * 0.5)
+            let Ok(accepted_ae) = network.insert_energy(address.network_pos(), offered_ae)
             else {
                 return 0;
             };
-            // Commit whole FE units only; a partial final FE may not be
-            // credited internally after reporting zero to its real source.
-            let accepted = as_fe(preview).min(amount);
-            if !simulate && accepted > 0 {
-                let mut actual = self.ae2_network();
-                if actual
-                    .insert_energy(address.network_pos(), f64::from(accepted) * 0.5)
-                    .is_ok()
-                {
-                    self.ae2_commit_power(&actual);
-                } else {
-                    return 0;
-                }
-            }
-            return accepted;
+            if !simulate && accepted_ae > 0.0 { self.ae2_commit_power(&network); }
+            return received_fe(amount,offered_ae,accepted_ae,fe_ratio);
         }
-        let room = self
-            .ae2_block_entity(address)
-            .and_then(|be| match be {
-                BlockEntity::Ae2(m) => ae2_processing::ae2_private_power_capacity(m.kind)
-                    .map(|cap| as_fe((cap - m.energy).max(0.0))),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let accepted = amount.min(room);
-        if !simulate && accepted > 0 {
-            let Some(BlockEntity::Ae2(m)) = self.ae2_block_entity_mut(address) else {
-                return 0;
-            };
-            m.energy += f64::from(accepted) * 0.5;
-            self.ae2_mark_modified(address);
-        }
-        accepted
+        let Some(BlockEntity::Ae2(m)) = self.ae2_block_entity_mut(address) else {return 0;};
+        let old_energy = m.energy;
+        let accepted_ae = m.private_energy_insert(offered_ae, !simulate);
+        let changed = m.energy != old_energy;
+        if changed { self.ae2_mark_modified(address); }
+        received_fe(amount,offered_ae,accepted_ae,fe_ratio)
     }
     pub(super) fn ae2_tick_external_power(&mut self) {
         let sources: Vec<_> = self
@@ -266,8 +245,14 @@ mod tests {
     use super::*;
     #[test]
     fn source_fe_scaling_and_integer_boundaries() {
-        assert_eq!(as_fe(8.0), 16);
-        assert_eq!(as_fe(0.49), 0);
+        assert_eq!(as_fe_with_ratio(8.0, 0.5), 16);
+        assert_eq!(as_fe_with_ratio(0.49, 0.5), 0);
+        assert_eq!(as_fe_with_ratio(8.0, 2.0), 4);
+        assert_eq!(as_fe_with_ratio(8.0, 1.5), 5);
+        assert_eq!(as_fe_with_ratio(f64::MAX, f64::from_bits(1)), i32::MAX as u32);
+        assert_eq!(received_fe(8, 4.0, 0.4, 0.5), 0);
+        assert_eq!(received_fe(8, 4.0, 3.9, 0.5), 7);
+        assert_eq!(received_fe(8, 4.0, 4.0, 0.5), 8);
         assert_eq!(checked_generation(8, 3), 512);
         assert_eq!(checked_generation(128, 6), i32::MAX as u32);
         assert_eq!(generation_rate(Some(&Tag::Int(-5))), 0);

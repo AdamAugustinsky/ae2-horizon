@@ -79,6 +79,9 @@ pub fn nested_cell_empty(stack: &ItemStack) -> bool {
     if apply_cell_settings(stack, &mut config).is_err() {
         return false;
     }
+    if let Some(source)=stack.data().and_then(|data|data.other("ae2:storage_cell_inv")) {
+        return matches!(source,Tag::List(entries) if entries.is_empty());
+    }
     match stack.data().and_then(|d| d.other(COMPONENT)) {
         None => true,
         Some(Tag::Compound(data)) => match data.get(&CELL_DATA.into()) {
@@ -92,11 +95,18 @@ pub fn nested_cell_empty(stack: &ItemStack) -> bool {
     }
 }
 pub fn read_cell(stack: &ItemStack) -> Result<Cell, String> {
+    read_cell_checked(stack, &|_,_| true)
+}
+/// Decode source keys against the host's installed item/fluid registries.
+pub fn read_cell_checked(stack: &ItemStack, known: &dyn Fn(&str, bool) -> bool) -> Result<Cell, String> {
     if cell_config(&stack.item).is_none() || stack.count != 1 {
         return Err("put exactly one ae2:item_storage_cell_1k in your offhand".into());
     }
     let mut config = cell_config(&stack.item).ok_or("unsupported cell tier")?;
-    apply_cell_settings(stack, &mut config)?;
+    apply_cell_settings_checked(stack, &mut config, known)?;
+    if let Some(entries)=source_cell_entries(stack,false,known)? {
+        return Cell::from_entries(config,entries).map_err(|e|format!("invalid source cell capacity: {e:?}"));
+    }
     let Some(tag) = stack
         .data()
         .and_then(|d| d.other(COMPONENT))
@@ -139,6 +149,7 @@ pub fn read_cell(stack: &ItemStack) -> Result<Cell, String> {
 }
 
 pub fn write_cell(stack: &mut ItemStack, cell: &Cell) -> Result<(), String> {
+    let source=encode_source_cell(cell,false)?;
     let entries = cell
         .entries()
         .map(|(key, amount)| {
@@ -160,6 +171,7 @@ pub fn write_cell(stack: &mut ItemStack, cell: &Cell) -> Result<(), String> {
     stack
         .data_mut()
         .set_other(COMPONENT, Some(Tag::Compound(data)));
+    stack.data_mut().set_other("ae2:storage_cell_inv",(!source.is_empty()).then_some(Tag::List(source)));
     Ok(())
 }
 
@@ -220,12 +232,19 @@ pub fn valid_fluid_id(id: &str) -> bool {
 /// Read the cell item itself. Unknown fluid IDs/components remain preserved;
 /// bucket interaction rejects them unless the host has an exact mapping.
 pub fn read_fluid_cell(stack: &ItemStack) -> Result<Cell, String> {
+    read_fluid_cell_checked(stack, &|_,_| true)
+}
+/// As above, with an explicit registry predicate when available.
+pub fn read_fluid_cell_checked(stack: &ItemStack, known: &dyn Fn(&str, bool) -> bool) -> Result<Cell, String> {
     if stack.count != 1 {
         return Err("hold exactly one fluid storage cell in your offhand".into());
     }
     let mut config =
         fluid_config(&stack.item).ok_or("offhand is not a supported fluid storage cell")?;
-    apply_cell_settings(stack, &mut config)?;
+    apply_cell_settings_checked(stack, &mut config, known)?;
+    if let Some(entries)=source_cell_entries(stack,true,known)? {
+        return Cell::from_entries(config,entries).map_err(|e|format!("invalid source fluid cell capacity: {e:?}"));
+    }
     let custom = match stack.data().and_then(|d| d.other(COMPONENT)) {
         None => return Ok(Cell::new(config)),
         Some(Tag::Compound(map)) => map,
@@ -284,6 +303,11 @@ pub fn write_fluid_cell(stack: &mut ItemStack, cell: &Cell) -> Result<(), String
     {
         return Err("fluid cell type mismatch".into());
     }
+    let source=match encode_source_cell(cell,true) {
+        Ok(entries)=>Some(entries),
+        Err(error) if stack.data().and_then(|data|data.other("ae2:storage_cell_inv")).is_some()=>return Err(error),
+        Err(_)=>None,
+    };
     let mut entries = Vec::new();
     for (key, amount) in cell.entries() {
         if !valid_fluid_id(&key.item_id) || *amount > i64::MAX as u64 {
@@ -307,7 +331,67 @@ pub fn write_fluid_cell(stack: &mut ItemStack, cell: &Cell) -> Result<(), String
     stack
         .data_mut()
         .set_other(COMPONENT, Some(Tag::Compound(data)));
+    if let Some(source)=source {stack.data_mut().set_other("ae2:storage_cell_inv",(!source.is_empty()).then_some(Tag::List(source)));}
     Ok(())
+}
+
+fn source_cell_entries(stack:&ItemStack,fluid:bool,known:&dyn Fn(&str,bool)->bool)->Result<Option<Vec<(ItemKey,u64)>>,String> {
+    let Some(source)=stack.data().and_then(|data|data.other("ae2:storage_cell_inv")) else{return Ok(None);};
+    let Tag::List(entries)=source else{return Err("invalid source cell inventory".into());};
+    if entries.len()>Cell::MAX_TYPES{return Err("source cell exceeds its type limit".into());}
+    let mut result=Vec::with_capacity(entries.len());let mut seen=BTreeSet::new();
+    for entry in entries {
+        let value=crate::ae2_generic_stack::decode_tolerant_checked(entry,known)?.ok_or("empty source cell entry")?;
+        // A damaged or foreign-channel source payload must remain on the item
+        // rather than being converted into an empty physical cell.
+        if value.fluid!=fluid{return Err("source cell contains another key type".into());}
+        let amount=u64::try_from(value.amount).ok().filter(|n|*n>0).ok_or("invalid source cell amount")?;
+        if !seen.insert(value.key.clone()){return Err("duplicate source cell key".into());}
+        if !fluid && !can_store_item(&prototype(&value.key)?){return Err("invalid source nested cell".into());}
+        result.push((value.key,amount));
+    }
+    Ok(Some(result))
+}
+fn encode_source_cell(cell:&Cell,fluid:bool)->Result<Vec<Tag>,String> {
+    let entries=cell.entries().map(|(key,amount)|{
+        let amount=i64::try_from(*amount).map_err(|_|"source cell amount overflow")?;
+        crate::ae2_generic_stack::encode(&crate::ae2_generic_stack::GenericStack{key:key.clone(),fluid,amount})
+    }).collect::<Result<Vec<_>,String>>()?;
+    let Tag::List(entries)=crate::ae2_components::normalize("ae2:storage_cell_inv",Tag::List(entries))? else{return Err("invalid source cell list".into());};
+    Ok(entries)
+}
+/// Convert source CONFIG_TYPES slots into the native Workbench representation.
+/// Unsupported channels are skipped just as ConfigInventory.setStack does.
+fn source_filter_entries(stack:&ItemStack,source:&Tag,known:&dyn Fn(&str,bool)->bool)->Result<Vec<Tag>,String> {
+    let Tag::List(entries)=source else{return Err("invalid source cell configuration".into());};
+    if entries.len()>63{return Err("too many source cell filters".into());}
+    let view=matches!(stack.item.as_ref(),"ae2:view_cell"|"ae2:creative_storage_cell");
+    let cell_fluid=stack.item.starts_with("ae2:fluid_storage_cell_")||stack.item.starts_with("ae2:portable_fluid_cell_");
+    let mut filters=Vec::new();
+    for (index,entry) in entries.iter().enumerate() {
+        let Some(value)=crate::ae2_generic_stack::decode_tolerant_checked(entry,known)? else{continue;};
+        if !view && value.fluid!=cell_fluid {continue;}
+        let mut native=if value.fluid {match Tag::compound([("fluid",Tag::String(value.key.item_id.as_str().into())),("components",Tag::ByteArray(value.key.components))]) {Tag::Compound(data)=>data,_=>unreachable!()}}
+            else {match Tag::compound([("item",save::item_to_nbt(&prototype(&value.key)?))]) {Tag::Compound(data)=>data,_=>unreachable!()}};
+        native.insert("Slot".into(),Tag::Int(index as i32));filters.push(Tag::Compound(native));
+    }
+    Ok(filters)
+}
+/// CellConfig writes a fixed-size nullable list in CONFIG_TYPES mode; amounts
+/// are zero even if an imported config carried a nonzero amount.
+pub fn encode_source_filters(filters:&[Tag])->Result<Vec<Tag>,String> {
+    let slots=decode_view_filter_slots(filters)?;let mut source=Vec::with_capacity(slots.len());
+    for entry in slots {
+        let Some(entry)=entry else {source.push(Tag::Compound(Default::default()));continue;};
+        let (key,fluid)=if let Some(item)=entry.get("item") {
+            let item=save::item_from_nbt(item).ok_or("invalid filter item")?;(key(&item)?,false)
+        } else if let (Some(Tag::String(id)),Some(Tag::ByteArray(components)))=(entry.get("fluid"),entry.get("components")) {
+            (ItemKey{item_id:id.to_string().map_err(|_|"invalid filter fluid")?,components:components.clone()},true)
+        } else {return Err("invalid cell filter".into());};
+        source.push(crate::ae2_generic_stack::encode(&crate::ae2_generic_stack::GenericStack{key,fluid,amount:0})?);
+    }
+    let Tag::List(source)=crate::ae2_components::normalize("ae2:storage_cell_config_inv",Tag::List(source))? else{return Err("invalid source filter list".into());};
+    Ok(source)
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreativeCellKey {
@@ -367,11 +451,14 @@ impl ViewCellSettings {
 }
 
 pub fn read_view_cell(stack: &ItemStack) -> Result<ViewCellSettings, String> {
+    read_view_cell_checked(stack, &|_,_| true)
+}
+pub fn read_view_cell_checked(stack: &ItemStack, known:&dyn Fn(&str,bool)->bool) -> Result<ViewCellSettings, String> {
     if stack.item.as_ref() != "ae2:view_cell" || stack.count != 1 { return Err("not a singular view cell".into()); }
     let upgrades = crate::ae2_upgrade_inventory::Inventory::read(stack)?;
     let fuzzy = upgrades.slots.iter().flatten().any(|card| card.item.as_ref() == "ae2:fuzzy_card");
     let inverted = upgrades.slots.iter().flatten().any(|card| card.item.as_ref() == "ae2:inverter_card");
-    let settings = cell_settings(stack)?;
+    let settings = cell_settings_checked(stack,known)?;
     let fuzzy_mode = match settings.get(&"fuzzy_mode".into()) {
         None => "ignore_all".to_owned(),
         Some(Tag::String(mode)) => mode.to_string().map_err(|_| "invalid view-cell fuzzy mode")?,
@@ -401,10 +488,13 @@ pub fn read_view_cell(stack: &ItemStack) -> Result<ViewCellSettings, String> {
     Ok(ViewCellSettings { filters, fuzzy, inverted, fuzzy_mode })
 }
 pub fn creative_cell_keys(stack: &ItemStack) -> Result<Vec<CreativeCellKey>, String> {
+    creative_cell_keys_checked(stack, &|_,_| true)
+}
+pub fn creative_cell_keys_checked(stack: &ItemStack, known:&dyn Fn(&str,bool)->bool) -> Result<Vec<CreativeCellKey>, String> {
     if stack.item.as_ref() != "ae2:creative_storage_cell" || stack.count != 1 {
         return Err("not a creative storage cell".into());
     }
-    let settings = cell_settings(stack)?;
+    let settings = cell_settings_checked(stack,known)?;
     let Some(Tag::List(cards)) = settings.get(&"upgrades".into()) else {
         return Err("invalid creative cell cards".into());
     };
@@ -449,17 +539,16 @@ pub fn apply_cell_settings(
     stack: &ItemStack,
     config: &mut ae2_cell_core::CellConfig,
 ) -> Result<(), String> {
+    apply_cell_settings_checked(stack,config,&|_,_| true)
+}
+pub fn apply_cell_settings_checked(
+    stack: &ItemStack,
+    config: &mut ae2_cell_core::CellConfig,
+    known: &dyn Fn(&str,bool)->bool,
+) -> Result<(), String> {
     use ae2_cell_core::{Channel, Filter, FilterMode, ItemKey};
-    let Some(custom) = stack.data().and_then(|d| d.other("minecraft:custom_data")) else {
-        return Ok(());
-    };
-    let Tag::Compound(map) = custom else {
-        return Err("invalid cell custom data".into());
-    };
-    let Some(settings) = map.get(&"ae2_cell_settings".into()) else {
-        return Ok(());
-    };
-    let Some(Tag::List(cards)) = settings.get("upgrades") else {
+    let settings = cell_settings_checked(stack,known)?;
+    let Some(Tag::List(cards)) = settings.get(&"upgrades".into()) else {
         return Err("invalid cell upgrades".into());
     };
     let max = match config.tool {
@@ -472,7 +561,7 @@ pub fn apply_cell_settings(
     if cards.len() > max {
         return Err("too many cell upgrades".into());
     };
-    let fuzzy_mode = match settings.get("fuzzy_mode") {
+    let fuzzy_mode = match settings.get(&"fuzzy_mode".into()) {
         None => "ignore_all".to_owned(),
         Some(Tag::String(s)) => s.to_string().map_err(|_| "invalid cell fuzzy mode")?,
         _ => return Err("invalid cell fuzzy mode".into()),
@@ -528,7 +617,7 @@ pub fn apply_cell_settings(
             _ => return Err("unsupported cell card".into()),
         }
     }
-    let Some(Tag::List(filters)) = settings.get("filters") else {
+    let Some(Tag::List(filters)) = settings.get(&"filters".into()) else {
         return Err("invalid cell filters".into());
     };
     if filters.len() > 63 {
@@ -568,13 +657,16 @@ pub fn apply_cell_settings(
 }
 
 pub fn cell_settings(stack: &ItemStack) -> Result<Compound, String> {
+    cell_settings_checked(stack,&|_,_| true)
+}
+pub fn cell_settings_checked(stack: &ItemStack, known:&dyn Fn(&str,bool)->bool) -> Result<Compound, String> {
     let existing = match stack.data().and_then(|d| d.other("minecraft:custom_data")) {
         None => None,
         Some(Tag::Compound(m)) => m.get(&"ae2_cell_settings".into()),
         Some(_) => return Err("invalid cell custom data".into()),
     };
-    match existing {
-        None => Ok(
+    let mut settings = match existing {
+        None =>
             match Tag::compound([
                 ("upgrades", Tag::List(vec![])),
                 ("filters", Tag::List(vec![])),
@@ -582,10 +674,25 @@ pub fn cell_settings(stack: &ItemStack) -> Result<Compound, String> {
                 Tag::Compound(m) => m,
                 _ => unreachable!(),
             },
-        ),
-        Some(Tag::Compound(m)) => Ok(m.clone()),
-        _ => Err("invalid cell settings".into()),
+        Some(Tag::Compound(m)) => m.clone(),
+        _ => return Err("invalid cell settings".into()),
+    };
+    if let Some(source) = stack.data().and_then(|data|data.other("ae2:upgrades")) {
+        let Tag::List(cards) = source else { return Err("invalid source upgrades component".into()); };
+        let max=crate::ae2_upgrade_inventory::capacity(&stack.item).ok_or("unsupported upgrade owner")?;
+        let slots=crate::ae2_upgrade_inventory::decode_source(cards,max)?;
+        settings.insert("upgrades".into(),Tag::List(crate::ae2_upgrade_inventory::encode(&slots)?));
     }
+    if let Some(source) = stack.data().and_then(|data|data.other("ae2:storage_cell_fuzzy_mode")) {
+        let Tag::String(mode) = source else { return Err("invalid source fuzzy mode".into()); };
+        let mode=mode.to_string().map_err(|_|"invalid source fuzzy mode")?.to_ascii_lowercase();
+        if !["ignore_all","percent_99","percent_75","percent_50","percent_25"].contains(&mode.as_str()) {return Err("invalid source fuzzy mode".into());}
+        settings.insert("fuzzy_mode".into(),Tag::String(mode.as_str().into()));
+    }
+    if let Some(source)=stack.data().and_then(|data|data.other("ae2:storage_cell_config_inv")) {
+        settings.insert("filters".into(),Tag::List(source_filter_entries(stack,source,known)?));
+    }
+    Ok(settings)
 }
 pub fn can_store_item(stack: &ItemStack) -> bool {
     if stack.item.as_ref() == "ae2:creative_storage_cell" {
@@ -601,6 +708,63 @@ pub fn can_store_item(stack: &ItemStack) -> bool {
 mod tests {
     use super::*;
     use ae2_cell_core::Action;
+    #[test]
+    fn unknown_source_item_becomes_lossless_missing_content_at_registry_boundary() {
+        let original=Tag::compound([("#t",Tag::String("ae2:i".into())),("id",Tag::String("removed:ore".into())),("#",Tag::Long(12))]);
+        let mut stack=ItemStack::new("ae2:item_storage_cell_1k",1);
+        stack.data_mut().set_other("ae2:storage_cell_inv",Some(Tag::List(vec![original.clone()])));
+        let known=|id:&str, fluid:bool| fluid || id != "removed:ore";
+        let cell=read_cell_checked(&stack,&known).unwrap();
+        let (key,amount)=cell.entries().next().unwrap();
+        assert_eq!((key.item_id.as_str(),*amount),("ae2:missing_content",12));
+        assert_eq!(prototype(key).unwrap().data().unwrap().other("ae2:missing_content_aekey_data"),Some(&original));
+        write_cell(&mut stack,&cell).unwrap();
+        assert_eq!(stack.data().unwrap().other("ae2:storage_cell_inv"),Some(&Tag::List(vec![original])));
+        assert_eq!(read_cell_checked(&stack,&known).unwrap().entries().next().unwrap().0.item_id,"ae2:missing_content");
+    }
+    #[test]
+    fn source_item_cell_contents_override_legacy_and_persist_mutations() {
+        let mut cell=ItemStack::new("ae2:item_storage_cell_1k",1);
+        let mut item=ItemStack::new("minecraft:diamond",1);item.data_mut().custom_name=Some("Saved key".into());
+        let key=key(&item).unwrap();
+        let source=crate::ae2_generic_stack::encode(&crate::ae2_generic_stack::GenericStack{key:key.clone(),fluid:false,amount:10}).unwrap();
+        cell.data_mut().set_other("ae2:storage_cell_inv",Some(Tag::List(vec![source])));
+        let mut contents=read_cell(&cell).unwrap();assert_eq!(contents.count(&key),10);
+        assert_eq!(contents.insert(&key,3,Action::Modulate),3);write_cell(&mut cell,&contents).unwrap();
+        let restored=save::item_from_nbt(&save::item_to_nbt(&cell)).unwrap();assert_eq!(read_cell(&restored).unwrap().count(&key),13);
+        let source=restored.data().unwrap().other("ae2:storage_cell_inv").unwrap();
+        assert!(matches!(source,Tag::List(entries) if entries[0].get("#")==Some(&Tag::Long(13))));
+    }
+    #[test]
+    fn source_fluid_cell_and_sparse_view_filters_preserve_components() {
+        let patch=Tag::compound([("test:temperature",Tag::String("warm".into()))]);
+        let bytes=nbt::write_network(&patch,Limits::default()).unwrap();
+        let key=ItemKey{item_id:"minecraft:water".into(),components:bytes};
+        let value=crate::ae2_generic_stack::GenericStack{key:key.clone(),fluid:true,amount:1000};
+        let mut cell=ItemStack::new("ae2:fluid_storage_cell_1k",1);
+        cell.data_mut().set_other("ae2:storage_cell_inv",Some(Tag::List(vec![crate::ae2_generic_stack::encode(&value).unwrap()])));
+        let mut contents=read_fluid_cell(&cell).unwrap();assert_eq!(contents.count(&key),1000);
+        assert_eq!(contents.extract(&key,250,Action::Modulate),250);write_fluid_cell(&mut cell,&contents).unwrap();
+        assert_eq!(read_fluid_cell(&save::item_from_nbt(&save::item_to_nbt(&cell)).unwrap()).unwrap().count(&key),750);
+        let mut view=ItemStack::new("ae2:view_cell",1);
+        let mut filter=value.clone();filter.amount=0;
+        view.data_mut().set_other("ae2:storage_cell_config_inv",Some(Tag::List(vec![Tag::Compound(Default::default()),crate::ae2_generic_stack::encode(&filter).unwrap()])));
+        let settings=cell_settings(&view).unwrap();let Tag::List(filters)=settings.get(&"filters".into()).unwrap() else{panic!("filters")};
+        let encoded=encode_source_filters(filters).unwrap();assert!(matches!(&encoded[0],Tag::Compound(map) if map.is_empty()));
+        assert_eq!(crate::ae2_generic_stack::decode(&encoded[1]).unwrap(),Some(filter));
+    }
+    #[test]
+    fn source_view_cell_cards_and_fuzzy_mode_override_legacy_settings() {
+        let mut cell=ItemStack::new("ae2:view_cell",1);
+        let card=ItemStack::new("ae2:fuzzy_card",1);
+        cell.data_mut().set_other("ae2:upgrades",Some(Tag::List(vec![Tag::compound([("slot",Tag::Int(1)),("item",save::item_to_nbt(&card))])])));
+        cell.data_mut().set_other("ae2:storage_cell_fuzzy_mode",Some(Tag::String("PERCENT_50".into())));
+        cell.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("ae2_cell_settings",Tag::compound([("upgrades",Tag::List(vec![])),("filters",Tag::List(vec![])),("fuzzy_mode",Tag::String("ignore_all".into()))]))])));
+        let settings=read_view_cell(&cell).unwrap();assert!(settings.fuzzy);assert_eq!(settings.fuzzy_mode,"percent_50");
+        let restored=save::item_from_nbt(&save::item_to_nbt(&cell)).unwrap();assert!(read_view_cell(&restored).unwrap().fuzzy);
+        cell.data_mut().set_other("ae2:storage_cell_fuzzy_mode",Some(Tag::String("bogus".into())));
+        assert!(read_view_cell(&cell).is_err());
+    }
     #[test]
     fn shared_item_codec_roundtrips_components_and_rejects_corruption() {
         let mut item = ItemStack::new("minecraft:diamond_sword", 1);
@@ -623,7 +787,9 @@ mod tests {
                 Tag::compound([("version", Tag::Int(99)), ("entries", Tag::List(vec![]))]),
             )])),
         );
-        assert!(read_cell(&holder).is_err());
+        assert_eq!(read_cell(&holder).unwrap().count(&key), 1, "valid source contents remain authoritative");
+        holder.data_mut().set_other("ae2:storage_cell_inv", None);
+        assert!(read_cell(&holder).is_err(), "without source contents the corrupt legacy payload is rejected");
     }
     #[test]
     fn view_cell_validates_physical_cards_and_mixed_channel_scopes() {

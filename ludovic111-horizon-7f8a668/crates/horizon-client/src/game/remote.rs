@@ -160,9 +160,19 @@ pub(super) struct Remote {
     #[cfg(feature = "ae2-lab")]
     pub(super) ae2_search: Option<horizon_client::ui::EditBox>,
     #[cfg(feature = "ae2-lab")]
+    pub(super) ae2_terminal_screen: bool,
+    #[cfg(feature = "ae2-lab")]
+    ae2_encoding_screen: bool,
+    #[cfg(feature = "ae2-lab")]
+    ae2_encoding_processing: bool,
+    #[cfg(feature = "ae2-lab")]
     ae2_priority_screen: bool,
     #[cfg(feature = "ae2-lab")]
     ae2_priority_token: Option<u64>,
+    #[cfg(feature = "ae2-lab")]
+    ae2_stock_spec: Option<(u32,i64)>,
+    #[cfg(feature = "ae2-lab")]
+    ae2_base_screen: bool,
     #[cfg(feature = "ae2-lab")]
     ae2_priority_search_backup: Option<horizon_client::ui::EditBox>,
     #[cfg(feature = "ae2-lab")]
@@ -490,9 +500,19 @@ impl Game<'_> {
             #[cfg(feature = "ae2-lab")]
             ae2_search: None,
             #[cfg(feature = "ae2-lab")]
+            ae2_terminal_screen: false,
+            #[cfg(feature = "ae2-lab")]
+            ae2_encoding_screen: false,
+            #[cfg(feature = "ae2-lab")]
+            ae2_encoding_processing: false,
+            #[cfg(feature = "ae2-lab")]
             ae2_priority_screen: false,
             #[cfg(feature = "ae2-lab")]
             ae2_priority_token: None,
+            #[cfg(feature = "ae2-lab")]
+            ae2_stock_spec: None,
+            #[cfg(feature = "ae2-lab")]
+            ae2_base_screen: false,
             #[cfg(feature = "ae2-lab")]
             ae2_priority_search_backup: None,
             #[cfg(feature = "ae2-lab")]
@@ -1707,6 +1727,13 @@ impl Game<'_> {
                 }
             }
             #[cfg(feature = "ae2-lab")]
+            C::CustomPayload(p) if p.channel == "ae2:base_screen" => {
+                if let Ok(bytes)=<&[u8;4]>::try_from(p.data.as_slice()) {
+                    let window=i32::from_be_bytes(*bytes);
+                    if let Some(r)=self.remote.as_mut().filter(|r|r.menu.as_ref().is_some_and(|m|m.0==window)){r.ae2_base_screen=true;}
+                }
+            }
+            #[cfg(feature = "ae2-lab")]
             C::CustomPayload(p) if p.channel == "ae2:priority_editor" => {
                 if p.data.len()<=512 {
                     if let Ok(value)=serde_json::from_slice::<serde_json::Value>(&p.data) {
@@ -1714,15 +1741,20 @@ impl Game<'_> {
                         let token=value.get("token").and_then(|v|v.as_u64());
                         let mode=value.get("mode").and_then(|v|v.as_str()).unwrap_or("");
                         let text=value.get("value").and_then(|v|v.as_str()).unwrap_or("");
+                        let is_stock=value.get("kind").and_then(|v|v.as_str())==Some("stock");
+                        let stock_spec=if is_stock {
+                            value.get("unit").and_then(|v|v.as_u64()).and_then(|n|u32::try_from(n).ok()).filter(|n|matches!(n,1|1000))
+                                .zip(value.get("max").and_then(|v|v.as_i64()).filter(|n|(0..=i64::from(i32::MAX)).contains(n)))
+                        } else {None};
                         if let Some(r)=self.remote.as_mut().filter(|r|r.menu.as_ref().is_some_and(|m|Some(i64::from(m.0))==window)) {
                             match mode {
-                                "open" if !r.ae2_priority_screen && token.is_some() => {
+                                "open" if !r.ae2_priority_screen && token.is_some() && (!is_stock || stock_spec.is_some()) => {
                                     r.ae2_priority_search_backup=r.ae2_search.take();r.ae2_priority_screen=true;
-                                    r.ae2_priority_token=token;
+                                    r.ae2_priority_token=token;r.ae2_stock_spec=stock_spec;
                                     let mut field=horizon_client::ui::EditBox::new(0.0,0.0,66.0,12.0);field.max_length=16;field.set_value(text);field.highlight=0;field.focused=true;r.ae2_search=Some(field);
                                 },
                                 "set" if r.ae2_priority_screen && r.ae2_priority_token==token && token.is_some() => if let Some(field)=r.ae2_search.as_mut(){field.set_value(text);field.focused=true;},
-                                "close" if r.ae2_priority_screen && r.ae2_priority_token==token && token.is_some() => {r.ae2_priority_screen=false;r.ae2_priority_token=None;r.ae2_search=r.ae2_priority_search_backup.take();},
+                                "close" if r.ae2_priority_screen && r.ae2_priority_token==token && token.is_some() => {r.ae2_priority_screen=false;r.ae2_priority_token=None;r.ae2_stock_spec=None;r.ae2_search=r.ae2_priority_search_backup.take();},
                                 _=>{}
                             }
                         }
@@ -1777,6 +1809,28 @@ impl Game<'_> {
                 }
             }
             #[cfg(feature = "ae2-lab")]
+            C::CustomPayload(p) if p.channel == "ae2:encoding_menu" => {
+                if let Ok(bytes)=<[u8;4]>::try_from(p.data.as_slice()) {
+                    let window=i32::from_be_bytes(bytes);
+                    if let Some(remote)=self.remote.as_mut().filter(|r|r.menu.as_ref().is_some_and(|menu|menu.0==window)) {
+                        remote.ae2_encoding_screen=true;
+                    }
+                }
+            }
+            #[cfg(feature = "ae2-lab")]
+            C::CustomPayload(p) if p.channel == "ae2:encoding_state" => {
+                if p.data.len()==5 && matches!(p.data[4],0|1) {
+                    if let Ok(bytes)=<&[u8;4]>::try_from(&p.data[..4]) {
+                        let window=i32::from_be_bytes(*bytes);
+                        if let Some(remote)=self.remote.as_mut().filter(|r|r.menu.as_ref().is_some_and(|m|m.0==window)) {remote.ae2_encoding_processing=p.data[4]==1;}
+                    }
+                }
+            }
+            #[cfg(feature = "ae2-lab")]
+            C::CustomPayload(p) if p.channel == horizon_client::ae2_job_status::CHANNEL => {
+                self.ae2_accept_job_status(&p.data);
+            }
+            #[cfg(feature = "ae2-lab")]
             C::CustomPayload(p) if p.channel == "ae2:bus_ack_enable" => {
                 if let Ok(bytes)=<[u8;4]>::try_from(p.data.as_slice()) {
                     let window=i32::from_be_bytes(bytes);
@@ -1823,6 +1877,11 @@ impl Game<'_> {
                 self.send(S::ClientInformation(info));
             }
             C::Respawn(p) => {
+                // A dimension transition replaces the player's menu even when
+                // no separate close packet was sent. Discard its local cursor
+                // and slots before the new inventory-window sync; that sync
+                // restores any cursor the server still legitimately holds.
+                self.remote_close_local();
                 #[cfg(feature = "ae2-lab")]
                 self.ae2_visual_cache.clear();
                 self.world.dynamic_shapes.clear();
@@ -5046,7 +5105,7 @@ impl Game<'_> {
     /// when none is open).
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_focused(&self) -> bool {
-        self.screen == Screen::Inventory
+        self.ae2_local_priority_focused() || self.ae2_local_craft_focused() || self.ae2_local_terminal_search_focused() || self.screen == Screen::Inventory
             && self
                 .remote
                 .as_ref()
@@ -5059,13 +5118,28 @@ impl Game<'_> {
         text: Option<&str>,
         key: Option<winit::keyboard::KeyCode>,
     ) {
+        if self.ae2_local_priority_focused() {
+            self.ae2_local_priority_input(text,key);
+            return;
+        }
+        if self.ae2_local_craft_focused() {
+            self.ae2_local_craft_input(text,key);
+            return;
+        }
+        if self.ae2_local_terminal_search_focused() {
+            self.ae2_local_terminal_search_input(text,key);
+            return;
+        }
         if self.remote.as_ref().is_some_and(|r|r.ae2_craft_screen==1) && key==Some(winit::keyboard::KeyCode::Enter) {
             // The server validates the latest text before opening a preview.
             self.remote_menu_ops(&[(Some(302),0,Input::Pickup)]);
             return;
         }
         if self.remote.as_ref().is_some_and(|r|r.ae2_priority_screen) && key==Some(winit::keyboard::KeyCode::Enter) {
-            if self.remote.as_ref().and_then(|r|r.ae2_search.as_ref()).is_some_and(|field|super::ae2_terminal::priority_confirmable(&field.value)) {
+            if self.remote.as_ref().is_some_and(|r|r.ae2_search.as_ref().is_some_and(|field|match r.ae2_stock_spec {
+                Some((unit,max))=>super::ae2_number_entry::number_value(&field.value,unit,0,max,'.').is_some(),
+                None=>super::ae2_terminal::priority_confirmable(&field.value),
+            })) {
                 self.remote_menu_ops(&[(Some(308),0,Input::Pickup)]);
             }
             return;
@@ -5099,6 +5173,18 @@ impl Game<'_> {
         &mut self,
         shortcut: horizon_client::clipboard::EditShortcut,
     ) {
+        if self.ae2_local_priority_focused() {
+            self.ae2_local_priority_shortcut(shortcut);
+            return;
+        }
+        if self.ae2_local_craft_focused() {
+            self.ae2_local_craft_shortcut(shortcut);
+            return;
+        }
+        if self.ae2_local_terminal_search_focused() {
+            self.ae2_local_terminal_search_shortcut(shortcut);
+            return;
+        }
         let priority_token=self.remote.as_ref().and_then(|r|r.ae2_priority_token);
         let energy_token=self.remote.as_ref().and_then(|r|r.ae2_energy_token);
         let Some(field) = self.remote.as_mut().and_then(|r| r.ae2_search.as_mut()) else {
@@ -5111,11 +5197,16 @@ impl Game<'_> {
     }
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_click(&mut self, ox: f32, oy: f32, right: bool) -> bool {
+        if self.ae2_local_provider_priority_open() {
+            return self.ae2_local_priority_click_field(ox,oy,right);
+        }
+        if self.ae2_local_craft_screen()==1 {return self.ae2_local_craft_click_field(ox,oy,right);}
+        if self.ae2_terminal_open() {return self.ae2_local_terminal_search_click(ox,oy,right);}
         let (mx, my) = self.cursor;
         let amount = self.remote.as_ref().is_some_and(|r|r.ae2_craft_screen==1 || r.ae2_priority_screen || r.ae2_energy_screen);
         let access=self.remote.as_ref().is_some_and(|r|r.ae2_pattern_access_screen);
         let (x,y,width)=if amount {(48.0,55.0,66.0)} else if access {(104.0,4.0,65.0)} else {(80.0,3.0,90.0)};
-        let hit = !right && mx >= ox+x && mx < ox+x+width && my >= oy+y && my < oy+y+12.0;
+        let hit = (!right || !amount) && mx >= ox+x && mx < ox+x+width && my >= oy+y && my < oy+y+12.0;
         let shift = self.has_shift_down();
         let Some(field) = self.remote.as_mut().and_then(|r| r.ae2_search.as_mut()) else {
             return false;
@@ -5126,12 +5217,20 @@ impl Game<'_> {
             field.y = oy + y;
             field.width = width;
             field.height = 12.0;
+            if right {field.set_value("");}
             field.click(&self.gui.atlas, mx, shift, false);
         }
+        if hit && right {self.send(S::RenameItem(play::RenameItem{name:String::new()}));}
         hit
     }
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_draw(&self, batch: &mut HudBatch, ox: f32, oy: f32) {
+        if self.ae2_local_provider_priority_open() {
+            self.ae2_local_priority_draw(batch,ox,oy);
+            return;
+        }
+        if self.ae2_local_craft_screen()==1 {self.ae2_local_craft_draw(batch,ox,oy);return;}
+        if self.ae2_terminal_open() {self.ae2_local_terminal_search_draw(batch,ox,oy);return;}
         if let Some(mut field) = self.remote.as_ref().and_then(|r| r.ae2_search.clone()) {
             let amount=self.remote.as_ref().is_some_and(|r|r.ae2_craft_screen==1 || r.ae2_priority_screen || r.ae2_energy_screen);
             let access=self.remote.as_ref().is_some_and(|r|r.ae2_pattern_access_screen);
@@ -5157,6 +5256,20 @@ impl Game<'_> {
     /// engine doesn't model sends the clicks unpredicted. False when a click's
     /// slot isn't one of the menu's.
     pub(super) fn remote_menu_ops(&mut self, ops: &[(Option<usize>, i32, Input)]) -> bool {
+        #[cfg(feature="ae2-lab")]
+        if let [(Some(slot),2,Input::Clone)]=ops {
+            let processing=self.remote.as_ref().is_some_and(|r|r.ae2_encoding_screen && r.ae2_encoding_processing && !r.ae2_priority_screen);
+            if processing && ((300..=308).contains(slot)||(318..=320).contains(slot)) && self.slot_view(*slot).is_some() {
+                let (window,menu)=self.remote_menu();
+                if let Some(wire)=Self::menu_slot_index(&menu,*slot) {self.send_clicks(window,vec![(wire as i16,2,Input::Clone,Vec::new(),self.carried.clone())],false);return true;}
+            }
+        }
+        #[cfg(feature="ae2-lab")]
+        if let [(Some(slot),_,Input::Clone)]=ops {
+            let ae2=self.remote.as_ref().is_some_and(|r|r.ae2_base_screen || r.ae2_terminal_screen || r.ae2_bus_screen
+                || r.ae2_network_tool_screen || r.ae2_network_status_screen || r.ae2_anchor_screen || r.ae2_pattern_access_screen || r.ae2_craft_screen!=0);
+            if ae2 && self.slot_view(*slot).is_some_and(|item|item.item.as_ref()=="ae2:wrapped_generic_stack") {return true;}
+        }
         #[cfg(feature="ae2-lab")]
         if self.remote.as_ref().is_some_and(|r| r.ae2_terminal_toolbox.is_some())
             && ops.iter().any(|(slot, _, _)| slot.is_some_and(|s| (365..374).contains(&s)))
@@ -5447,10 +5560,43 @@ impl Game<'_> {
             .as_ref()
             .and_then(|r| r.menu.as_ref().map(|m| m.0))
             .unwrap_or(0);
+        #[cfg(feature = "ae2-lab")]
+        if self.remote.as_ref().is_some_and(|r|r.ae2_crafting_screen)
+            && super::ae2_client_config::settings().clear_grid_on_close {
+            // CraftingTermScreen.onClose sends its grid-to-network action
+            // before closing the menu. Preserve ordering on the same link.
+            self.send_clicks(id,vec![(37,0,Input::Pickup,Vec::new(),self.carried.clone())],false);
+        }
+        #[cfg(feature = "ae2-lab")]
+        if self.remote.as_ref().is_some_and(|r|r.ae2_encoding_screen)
+            && super::ae2_client_config::settings().clear_grid_on_close {
+            self.send(S::CustomPayload(horizon_protocol::packets::configuration::CustomPayload {
+                channel:"ae2:clear_encoding".into(),data:id.to_be_bytes().to_vec(),
+            }));
+        }
         self.send(S::ContainerClose(play::ContainerClose { container: id }));
         self.remote_close_local();
     }
+    #[cfg(feature = "ae2-lab")]
+    pub(super) fn ae2_sync_job_pins(&mut self) {
+        let Some(window)=self.remote.as_ref().filter(|r|r.ae2_terminal_screen)
+            .and_then(|r|r.menu.as_ref().map(|m|m.0)) else{return;};
+        let Ok(data)=serde_json::to_vec(&serde_json::json!({"window":window,"pins":self.ae2_job_ui.wires(),"language":self.settings.language.clone(),"search_mod_name":super::ae2_client_config::settings().search_mod_name_in_tooltips})) else{return;};
+        self.send(S::CustomPayload(horizon_protocol::packets::configuration::CustomPayload {
+            channel:"ae2:pinned_keys".into(),data,
+        }));
+    }
+    #[cfg(feature = "ae2-lab")]
+    fn ae2_remember_terminal_search(&mut self) {
+        let search=self.remote.as_ref().filter(|r|r.ae2_terminal_screen).and_then(|r|
+            if r.ae2_priority_screen {r.ae2_priority_search_backup.as_ref()} else {r.ae2_search.as_ref()});
+        if let Some(field)=search {self.ae2_remembered_search=field.value.clone();}
+    }
     fn remote_close_local(&mut self) {
+        #[cfg(feature = "ae2-lab")]
+        if self.remote.as_ref().is_some_and(|r|r.ae2_terminal_screen) {self.ae2_job_ui.terminal_closed();}
+        #[cfg(feature = "ae2-lab")]
+        self.ae2_remember_terminal_search();
         #[cfg(feature = "ae2-lab")]
         self.ae2_flush_bus_on_close();
         self.recipe_ui.reset_screen();
@@ -5460,8 +5606,13 @@ impl Game<'_> {
             #[cfg(feature = "ae2-lab")]
             {
                 r.ae2_search = None;
+                r.ae2_terminal_screen = false;
+                r.ae2_encoding_screen = false;
+                r.ae2_encoding_processing = false;
                 r.ae2_priority_screen = false;
                 r.ae2_priority_token = None;
+                r.ae2_stock_spec = None;
+                r.ae2_base_screen = false;
                 r.ae2_priority_search_backup = None;
                 r.ae2_energy_screen = false;
                 r.ae2_energy_token = None;
@@ -5552,6 +5703,10 @@ impl Game<'_> {
     fn remote_open_screen(&mut self, p: play::OpenScreen) {
         #[cfg(feature = "ae2-lab")]
         self.ae2_flush_bus_on_close();
+        #[cfg(feature = "ae2-lab")]
+        let returned_from_crafting = self.remote.as_ref().is_some_and(|r|r.ae2_craft_screen!=0);
+        #[cfg(feature = "ae2-lab")]
+        self.ae2_remember_terminal_search();
         // A new RecipeBookComponent owns fresh ghost slots and an overlay,
         // even when the server replaces a menu without a close packet.
         self.recipe_ui.reset_screen();
@@ -5664,10 +5819,20 @@ impl Game<'_> {
         let ae2_craft_screen = if p.title == horizon_protocol::text::literal("AE2 Craft Amount") {1} else if p.title == horizon_protocol::text::literal("AE2 Craft Confirm") {2} else if p.title == horizon_protocol::text::literal("AE2 Crafting Status") {3} else {0};
         #[cfg(feature = "ae2-lab")]
         let ae2_terminal = ae2_crafting || p.title == horizon_protocol::text::literal("AE2 ME Terminal");
+        #[cfg(feature = "ae2-lab")]
+        if ae2_terminal {self.ae2_job_ui.terminal_opened();}
+        #[cfg(feature = "ae2-lab")]
+        let settings = super::ae2_client_config::settings();
+        #[cfg(feature = "ae2-lab")]
+        let restored_search = (ae2_terminal && (settings.remember_last_search || returned_from_crafting))
+            .then(||self.ae2_remembered_search.clone()).filter(|value|!value.is_empty());
         if let Some(r) = self.remote.as_mut() {
             #[cfg(feature = "ae2-lab")]
             {
                 r.ae2_crafting_screen=ae2_crafting;
+                r.ae2_terminal_screen=ae2_terminal;
+                r.ae2_encoding_screen=false;
+                r.ae2_encoding_processing=false;
                 r.ae2_network_tool_screen=ae2_network_tool;
                 r.ae2_network_status_screen=ae2_network_status;
                 r.ae2_anchor_screen=ae2_anchor;
@@ -5682,13 +5847,16 @@ impl Game<'_> {
                 r.ae2_craft_screen=ae2_craft_screen;
                 r.ae2_priority_screen=false;
                 r.ae2_priority_token=None;
+                r.ae2_stock_spec=None;
+                r.ae2_base_screen=false;
                 r.ae2_priority_search_backup=None;
                 r.ae2_energy_screen=false;
                 r.ae2_energy_token=None;
                 r.ae2_search = (ae2_terminal || ae2_pattern_access || ae2_craft_screen==1).then(|| {
                     let mut field = horizon_client::ui::EditBox::new(0.0, 0.0, 90.0, 12.0);
-                    field.focused = ae2_craft_screen==1 || ae2_pattern_access;
+                    field.focused = ae2_craft_screen==1 || ae2_pattern_access || ae2_terminal && settings.auto_focus_search;
                     if ae2_craft_screen==1 {field.set_value("1");field.highlight=0;}
+                    else if let Some(value)=restored_search.as_deref() {field.set_value(value);field.highlight=0;}
                     field.max_length = if ae2_craft_screen==1 {16} else {128};
                     field
                 });
@@ -5714,6 +5882,12 @@ impl Game<'_> {
         }
         self.screen = Screen::Inventory;
         self.capture(false);
+        #[cfg(feature = "ae2-lab")]
+        if let Some(name)=restored_search {
+            self.send(S::RenameItem(play::RenameItem {name}));
+        }
+        #[cfg(feature = "ae2-lab")]
+        if ae2_terminal {self.ae2_sync_job_pins();}
     }
     /// `ClientPacketListener.handleMountScreenOpen`: a horse's or llama's
     /// inventory; for another entity the window is closed again.

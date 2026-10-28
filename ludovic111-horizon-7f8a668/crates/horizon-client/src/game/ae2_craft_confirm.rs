@@ -20,11 +20,20 @@ pub(super) struct GuestCraftConfirm {
     confirmation: bool,
     cpu: Option<super::ae2_global::GridAddress>,
     report_page: usize,
+    calculation: Option<ae2_crafting_core::calculation::Calculation>,
+    snapshot: Option<ae2_crafting_core::extended::Registry>,
+    report: Option<Result<(ae2_crafting_core::extended::Plan,ae2_crafting_core::Inventory),String>>,
     status_mode: bool,
     status_cpu: Option<super::ae2_global::GridAddress>,
     status_job: Option<[i64;2]>,
     status_versions: std::collections::VecDeque<(i32,super::ae2_global::GridAddress,Option<[i64;2]>)>,
     status_owner: Option<(super::ae2_parts::PartAddress,(u64,[i32;4]))>,
+}
+/// In-frame sessions use the same report model and planner as LAN menus.
+pub(super) struct LocalCraftConfirm {
+    session: GuestCraftConfirm,
+    field: horizon_client::ui::EditBox,
+    items: Vec<Option<ItemStack>>,
 }
 fn craft_amount_text(value: &str, fluid: bool) -> Option<(u64, bool)> {
     let unit = if fluid { 1000 } else { 1 };
@@ -41,6 +50,206 @@ enum CraftOrigin {
 }
 
 impl Game<'_> {
+    pub(super) fn ae2_local_craft_screen(&self)->u8 {
+        self.ae2_local_craft.as_ref().map_or(0,|s|if s.session.status_mode {3} else if s.session.confirmation {2} else {1})
+    }
+    pub(super) fn ae2_craft_menu_items(&self)->Option<&[Option<ItemStack>]> {
+        if let Some(local)=self.ae2_local_craft.as_ref() {Some(&local.items)}
+        else {self.container_kind().map(|entity|entity.slots())}
+    }
+    pub(super) fn ae2_local_craft_slot_view(&self,slot:usize)->Option<ItemStack> {
+        self.ae2_local_craft.as_ref()?.items.get(slot.checked_sub(300)?)?.clone()
+    }
+    fn ae2_local_craft_refresh(&mut self) {
+        let Some(mut local)=self.ae2_local_craft.take() else{return;};
+        if local.session.status_mode {
+            let cpus=self.ae2_terminal_status_cpus(local.session.pos);
+            if local.session.status_cpu.is_none_or(|cpu|!cpus.contains(&cpu)) {
+                local.session.status_cpu=cpus.first().copied();local.session.report_page=0;
+            }
+            local.session.status_job=local.session.status_cpu.and_then(|cpu|self.ae2_recursive_job_identity(cpu));
+        }
+        let (items,page)=self.ae2_craft_confirm_items(&local.session);
+        local.items=items;local.session.report_page=page;
+        self.ae2_local_craft=Some(local);
+    }
+    pub(super) fn ae2_open_local_craft_confirm(&mut self,pos:(i32,i32,i32),key:ItemKey,fluid:bool) {
+        if !self.ae2_local_terminal_valid() {return;}
+        let part=self.ae2_local_terminal_part();
+        let mut field=horizon_client::ui::EditBox::new(0.0,0.0,66.0,12.0);
+        field.max_length=16;field.set_value("1");field.highlight=0;field.focused=true;
+        let session=GuestCraftConfirm {
+            window:0,state:0,pos,origin:CraftOrigin::Terminal{part,wireless:None},dimension:self.dim.id().to_owned(),key,fluid,
+            amount:if fluid {1000} else {1},craft_missing:false,confirmation:false,cpu:None,report_page:0,
+            calculation:None,snapshot:None,report:None,status_mode:false,status_cpu:None,status_job:None,
+            status_versions:std::collections::VecDeque::new(),status_owner:None,
+        };
+        self.ae2_local_craft=Some(LocalCraftConfirm{session,field,items:Vec::new()});
+        self.ae2_local_craft_refresh();
+    }
+    pub(super) fn ae2_open_local_craft_status(&mut self,pos:(i32,i32,i32)) {
+        if !self.ae2_local_terminal_valid() {return;}
+        let part=self.ae2_local_terminal_part();
+        let cpu=self.ae2_terminal_status_cpus(pos).first().copied();
+        let session=GuestCraftConfirm {
+            window:0,state:0,pos,origin:CraftOrigin::Terminal{part,wireless:None},dimension:self.dim.id().to_owned(),
+            key:ItemKey{item_id:"minecraft:air".into(),components:vec![]},fluid:false,amount:1,craft_missing:false,
+            confirmation:false,cpu:None,report_page:0,calculation:None,snapshot:None,report:None,
+            status_mode:true,status_cpu:cpu,status_job:cpu.and_then(|cpu|self.ae2_recursive_job_identity(cpu)),
+            status_versions:std::collections::VecDeque::new(),status_owner:None,
+        };
+        let field=horizon_client::ui::EditBox::new(0.0,0.0,66.0,12.0);
+        self.ae2_local_craft=Some(LocalCraftConfirm{session,field,items:Vec::new()});self.ae2_local_craft_refresh();
+    }
+    pub(super) fn ae2_local_craft_focused(&self)->bool {
+        self.ae2_local_craft.as_ref().is_some_and(|s|!s.session.status_mode && !s.session.confirmation && s.field.focused)
+    }
+    pub(super) fn ae2_local_craft_input(&mut self,text:Option<&str>,key:Option<winit::keyboard::KeyCode>) {
+        if key==Some(winit::keyboard::KeyCode::Enter) {
+            self.ae2_local_craft_click(Some(302),0,horizon_client::menu::Input::Pickup);return;
+        }
+        let ctrl=self.has_control_down();let shift=self.has_shift_down();
+        if let Some(local)=self.ae2_local_craft.as_mut() {
+            if !key.is_some_and(|key|local.field.key(key,ctrl,shift)) {
+                if let Some(text)=text {local.field.insert_text(text);}
+            }
+        }
+    }
+    pub(super) fn ae2_local_craft_shortcut(&mut self,shortcut:horizon_client::clipboard::EditShortcut) {
+        if let Some(local)=self.ae2_local_craft.as_mut() {local.field.shortcut(shortcut,&mut self.clipboard);}
+    }
+    pub(super) fn ae2_local_craft_click_field(&mut self,ox:f32,oy:f32,right:bool)->bool {
+        let (mx,my)=self.cursor;let hit=!right && mx>=ox+48.0 && mx<ox+114.0 && my>=oy+55.0 && my<oy+67.0;
+        let shift=self.has_shift_down();let Some(local)=self.ae2_local_craft.as_mut() else{return false;};
+        if local.session.confirmation {return false;}
+        local.field.focused=hit;
+        if hit {local.field.x=ox+48.0;local.field.y=oy+55.0;local.field.width=66.0;local.field.height=12.0;local.field.click(&self.gui.atlas,mx,shift,false);}
+        hit
+    }
+    pub(super) fn ae2_local_craft_draw(&self,batch:&mut horizon_client::hud::HudBatch,ox:f32,oy:f32) {
+        if let Some(mut field)=self.ae2_local_craft.as_ref().filter(|s|!s.session.confirmation).map(|s|s.field.clone()) {
+            field.x=ox+48.0;field.y=oy+55.0;field.width=66.0;field.height=12.0;field.draw(batch,&self.gui.atlas,None);
+        }
+    }
+    pub(super) fn ae2_local_craft_click(&mut self,slot:Option<usize>,button:i32,input:horizon_client::menu::Input)->bool {
+        let Some(mut local)=self.ae2_local_craft.take() else{return false;};
+        let valid=self.ae2_local_terminal_valid() && local.session.dimension==self.dim.id()
+            && (local.session.status_mode || if local.session.fluid {self.ae2_craftable_fluids(local.session.pos).contains(&local.session.key)} else {self.ae2_craftable_outputs(local.session.pos).contains(&local.session.key)});
+        if !valid {self.close_container();self.screen=super::Screen::Playing;self.capture(true);return true;}
+        if input!=horizon_client::menu::Input::Pickup || button!=0 {self.ae2_local_craft=Some(local);return true;}
+        if local.session.status_mode {
+            if slot==Some(320) {return true;}
+            let cpus=self.ae2_terminal_status_cpus(local.session.pos);
+            let cpu=local.session.status_cpu;
+            if cpu.is_some_and(|cpu|!cpus.contains(&cpu) || self.ae2_recursive_job_identity(cpu)!=local.session.status_job) {
+                self.ae2_local_craft=Some(local);self.ae2_local_craft_refresh();return true;
+            }
+            match (slot,cpu) {
+                (Some(302),Some(cpu))=>{let _=self.ae2_recursive_toggle_suspended(cpu);},
+                (Some(303),Some(cpu))=>{let _=self.ae2_recursive_cancel(cpu);},
+                (Some(304),_)=>{
+                    local.session.status_cpu=if cpus.is_empty(){None}else{Some(match cpu.and_then(|cpu|cpus.iter().position(|value|*value==cpu)){Some(i)=>cpus[(i+1)%cpus.len()],None=>cpus[0]})};
+                    local.session.report_page=0;
+                },
+                (Some(318),_)=>local.session.report_page=local.session.report_page.saturating_sub(1),
+                (Some(319),Some(cpu))=>{
+                    let pages=self.ae2_recursive_status_rows(cpu).map_or(1,|rows|rows.len().max(1).div_ceil(12));
+                    local.session.report_page=(local.session.report_page+1).min(pages-1);
+                },
+                _=>{}
+            }
+            self.ae2_local_craft=Some(local);self.ae2_local_craft_refresh();return true;
+        }
+        match slot {
+            Some(302) if !local.session.confirmation=>{
+                if let Some((mut amount,missing))=craft_amount_text(&local.field.value,local.session.fluid) {
+                    if missing {
+                        let inventory=if local.session.fluid {self.ae2_grid_fluids(local.session.pos)} else {self.ae2_grid_inventory(local.session.pos)};
+                        let Ok(inventory)=inventory else {self.ae2_local_craft=Some(local);return true;};
+                        let available=inventory.iter().find(|(key,_)|key==&local.session.key).map_or(0,|(_,count)|*count);
+                        amount=amount.saturating_sub(available.min(i32::MAX as u64));
+                        if amount==0 {return true;}
+                    }
+                    local.session.amount=amount;local.session.confirmation=true;
+                    match self.ae2_craft_calculation_snapshot(local.session.pos,&local.session.key,local.session.fluid,amount) {
+                        Ok((registry,inventory,target))=>{
+                            local.session.calculation=Some(ae2_crafting_core::calculation::Calculation::new(registry.clone(),inventory,target,amount));
+                            local.session.snapshot=Some(registry);
+                        },
+                        Err(error)=>local.session.report=Some(Err(error)),
+                    }
+                }
+            },
+            Some(302) if local.session.confirmation=>{
+                if let (Some(registry),Some(Ok((plan,missing))))=(&local.session.snapshot,&local.session.report) {
+                    if !plan.simulated && missing.is_empty() && (!plan.steps.is_empty() || !plan.emitted.is_empty()) {
+                        let owner=self.ae2_local_player_uuid();
+                        match self.ae2_begin_player_craft(local.session.pos,&local.session.key,local.session.fluid,local.session.amount,local.session.cpu,owner,registry,plan) {
+                            Ok(_)=>{self.close_container();self.screen=super::Screen::Playing;self.capture(true);return true;},
+                            Err(error)=>self.system_message(horizon_client::text::Text::literal(error)),
+                        }
+                    }
+                }
+            },
+            Some(303)=>{self.close_container();self.screen=super::Screen::Playing;self.capture(true);return true;},
+            Some(304) if local.session.confirmation=>{
+                if let Some(Ok((plan,_)))=&local.session.report {
+                    if let Ok(candidates)=self.ae2_craft_cpu_candidates(local.session.pos,plan.estimated_bytes) {
+                        local.session.cpu=match local.session.cpu {None=>candidates.first().map(|v|v.0),Some(current)=>candidates.iter().position(|v|v.0==current).and_then(|i|candidates.get(i+1)).map(|v|v.0)};
+                    }
+                }
+            },
+            Some(318) if local.session.confirmation=>local.session.report_page=local.session.report_page.saturating_sub(1),
+            Some(319) if local.session.confirmation=>{
+                if let Some(Ok((plan,missing)))=&local.session.report {
+                    let pages=self.ae2_craft_material_summary(plan,missing).len().max(1).div_ceil(12);
+                    local.session.report_page=(local.session.report_page+1).min(pages-1);
+                }
+            },
+            _=>{}
+        }
+        self.ae2_local_craft=Some(local);self.ae2_local_craft_refresh();true
+    }
+    fn ae2_local_craft_calculating(&self)->bool {
+        self.ae2_local_craft.as_ref().is_some_and(|s|s.session.dimension==self.dim.id() && s.session.calculation.is_some())
+    }
+    fn ae2_guest_craft_calculations(&self,host:&LanHost)->usize {
+        host.play.iter().filter(|(conn,p)|host.hub.guests.iter().any(|g|g.conn==**conn && host.hub.here(g))
+            && p.ae2_craft_confirm.as_ref().is_some_and(|s|s.dimension==self.dim.id() && s.calculation.is_some())).count()
+    }
+    fn ae2_craft_calculation_allowance(active:usize)->u64 {
+        if active==0 {return 0;}
+        let total=horizon_client::ae2_common_config::crafting_calculation_time_per_tick().wrapping_mul(1000);
+        (total/(active.min(i32::MAX as usize) as i32)).max(1) as u64
+    }
+    /// All machine, LAN and in-frame calculations for this level use one
+    /// snapshot even when an earlier worker finishes during the tick.
+    pub(super) fn ae2_craft_tick_allowance(&mut self)->u64 {
+        if let Some(allowance)=self.ae2_local_craft_allowance {return allowance;}
+        let active=self.ae2_active_machine_craft_calculations()
+            +usize::from(self.ae2_local_craft_calculating())
+            +self.lan.as_ref().map_or(0,|host|self.ae2_guest_craft_calculations(host));
+        let allowance=Self::ae2_craft_calculation_allowance(active);
+        self.ae2_local_craft_allowance=Some(allowance);
+        allowance
+    }
+    pub(super) fn ae2_tick_local_craft_calculation(&mut self) {
+        if self.ae2_local_craft.as_ref().is_some_and(|local|local.session.status_mode) {
+            if self.ticks%10==0 {self.ae2_local_craft_refresh();}
+            return;
+        }
+        if !self.ae2_local_craft_calculating() {return;}
+        let allowance=self.ae2_craft_tick_allowance();
+        if let Some(session)=self.ae2_local_craft.as_mut().map(|s|&mut s.session) {
+            if let Some(calculation)=session.calculation.as_mut() {
+                if !calculation.run_slice(allowance) {
+                    session.report=calculation.take_result().map(|result|result.map_err(|e|format!("craft planning: {e:?}")));
+                    session.calculation=None;
+                }
+            }
+        }
+        self.ae2_local_craft_refresh();
+    }
     pub(super) fn lan_open_monitor_craft(&mut self,host:&mut LanHost,conn:u32,pos:(i32,i32,i32),face:&str)->bool {
         let Some(key)=self.ae2_monitor_craft_target(pos,face) else {return false;};
         self.lan_open_craft_confirm(host,conn,pos,key,false,CraftOrigin::Monitor(face.to_owned()))
@@ -90,13 +299,13 @@ impl Game<'_> {
         self.guest_container_closed(host,conn);
         let Some(window)=host.hub.open_window(conn,"minecraft:generic_9x3",horizon_protocol::text::literal("AE2 Craft Amount")) else {return true;};
         host.play.entry(conn).or_default().ae2_craft_confirm=Some(GuestCraftConfirm {
-            window,state:0,pos,origin,dimension:self.dim.id().to_owned(),key,fluid,amount:if fluid {1000} else {1},craft_missing:false,confirmation:false,cpu:None,report_page:0,status_mode:false,status_cpu:None,status_job:None,status_versions:std::collections::VecDeque::new(),status_owner:None,
+            window,state:0,pos,origin,dimension:self.dim.id().to_owned(),key,fluid,amount:if fluid {1000} else {1},craft_missing:false,confirmation:false,cpu:None,report_page:0,calculation:None,snapshot:None,report:None,status_mode:false,status_cpu:None,status_job:None,status_versions:std::collections::VecDeque::new(),status_owner:None,
         });
         self.lan_send_craft_confirm(host,conn);
         true
     }
-    fn lan_send_craft_confirm(&mut self,host:&mut LanHost,conn:u32) {
-        let Some((window,state,pos,key,fluid,amount,confirmation,cpu,requested_page,status_mode,status_cpu,status_direct))=host.play.get(&conn).and_then(|p|p.ae2_craft_confirm.as_ref()).map(|s|(s.window,s.state,s.pos,s.key.clone(),s.fluid,s.amount,s.confirmation,s.cpu,s.report_page,s.status_mode,s.status_cpu,matches!(s.origin,CraftOrigin::Cpu{..}))) else{return;};
+    fn ae2_craft_confirm_items(&self,s:&GuestCraftConfirm)->(Vec<Option<ItemStack>>,usize) {
+        let (key,fluid,confirmation,cpu,requested_page,status_mode,status_cpu,status_direct,report)=(s.key.clone(),s.fluid,s.confirmation,s.cpu,s.report_page,s.status_mode,s.status_cpu,matches!(s.origin,CraftOrigin::Cpu{..}),s.report.clone());
         let mut items=vec![None;27];
         let mut page=0;
         items[0]=if fluid {super::ae2_fluids::fluid_bucket(&key.item_id).map(|id|ItemStack::new(id,1))}
@@ -120,8 +329,9 @@ impl Game<'_> {
             let mut heading=ItemStack::new("minecraft:paper",1);heading.data_mut().custom_name=Some("No crafting CPUs".into());items[1]=Some(heading);
             let mut back=ItemStack::new("minecraft:paper",1);back.data_mut().custom_name=Some("Back to terminal".into());items[20]=Some(back);
         } else if confirmation {
-            let message=match self.ae2_confirm_report(pos,&key,fluid,amount) {
-                Ok((plan,missing))=>{
+            let message=match report {
+                None=>"Calculating...".into(),
+                Some(Ok((plan,missing)))=>{
                     let lines=self.ae2_craft_material_summary(&plan,&missing);
                     let pages=lines.len().max(1).div_ceil(12);
                     page=requested_page.min(pages-1);
@@ -136,7 +346,7 @@ impl Game<'_> {
                     if missing.is_empty() {format!("{} {}, {} bytes",plan.steps.len(),if plan.steps.len()==1 {"step"} else {"steps"},plan.estimated_bytes)}
                     else {"Missing materials".into()}
                 },
-                Err(error)=>error,
+                Some(Err(error))=>error,
             };
             let mut line=ItemStack::new("minecraft:paper",1);
             line.data_mut().custom_name=Some(message);
@@ -145,6 +355,12 @@ impl Game<'_> {
             selector.data_mut().custom_name=Some(cpu.map(|p|format!("CPU: {}",self.ae2_cpu_label(p))).unwrap_or_else(||"CPU: Automatic".into()));
             items[4]=Some(selector);
         }
+        (items,page)
+    }
+    fn lan_send_craft_confirm(&mut self,host:&mut LanHost,conn:u32) {
+        let Some(s)=host.play.get(&conn).and_then(|p|p.ae2_craft_confirm.as_ref()) else{return;};
+        let (window,state,status_cpu)=(s.window,s.state,s.status_cpu);
+        let (mut items,page)=self.ae2_craft_confirm_items(s);
         let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn) else{return;};
         items.extend((9..36).chain(0..9).map(|i|g.inventory[i].clone()));
         let carried=g.carried.clone();
@@ -161,13 +377,6 @@ impl Game<'_> {
             while s.status_versions.len()>32 {s.status_versions.pop_front();}
         }
         host.hub.send_to(conn,&C::ContainerSetContent(play::ContainerSetContent{container:window,state:next_state,items:wire_items,carried:wire_carried}));
-    }
-    fn ae2_confirm_preview(&self,pos:(i32,i32,i32),key:&ItemKey,fluid:bool,amount:u64)->Result<ae2_crafting_core::extended::Plan,String> {
-        if fluid {self.ae2_preview_recursive_fluid_craft(pos,key,amount)}
-        else {self.ae2_preview_recursive_craft(pos,key,amount)}
-    }
-    fn ae2_confirm_report(&self,pos:(i32,i32,i32),key:&ItemKey,fluid:bool,amount:u64)->Result<(ae2_crafting_core::extended::Plan,ae2_crafting_core::Inventory),String> {
-        self.ae2_craft_report(pos,key,fluid,amount)
     }
     pub(super) fn lan_craft_confirm_amount(&mut self,host:&mut LanHost,conn:u32,value:&str)->bool {
         let Some(s)=host.play.get_mut(&conn).and_then(|p|p.ae2_craft_confirm.as_mut()) else{return false;};
@@ -289,27 +498,37 @@ impl Game<'_> {
                 }
                 if let Some(window)=host.hub.open_window(conn,"minecraft:generic_9x3",horizon_protocol::text::literal("AE2 Craft Confirm")) {
                     s.window=window;s.state=0;s.confirmation=true;
+                    match self.ae2_craft_calculation_snapshot(s.pos,&s.key,s.fluid,s.amount) {
+                        Ok((registry,inventory,target))=>{
+                            s.calculation=Some(ae2_crafting_core::calculation::Calculation::new(registry.clone(),inventory,target,s.amount));
+                            s.snapshot=Some(registry);
+                        }
+                        Err(error)=>s.report=Some(Err(error)),
+                    }
                 }
-            } else if s.confirmation && self.ae2_confirm_preview(s.pos,&s.key,s.fluid,s.amount).is_ok() {
-                let power=match &s.origin {CraftOrigin::Terminal{wireless:Some(ctx),..}=>Some(ctx.source),_=>None};
-                let result=self.as_guest(host,conn,|game|{
-                    let old=game.ae2_wireless_power;game.ae2_wireless_power=power;
-                    let result=if s.fluid {
-                        if let Some(cpu)=s.cpu {game.ae2_begin_recursive_fluid_craft_on(s.pos,&s.key,s.amount,cpu)}
-                        else {game.ae2_begin_recursive_fluid_craft(s.pos,&s.key,s.amount)}
-                    } else if let Some(cpu)=s.cpu {game.ae2_begin_recursive_craft_on(s.pos,&s.key,s.amount,cpu)}
-                        else {game.ae2_begin_recursive_craft(s.pos,&s.key,s.amount)};
-                    game.ae2_wireless_power=old;result
-                }).unwrap_or_else(||Err("player unavailable".into()));
-                if let Err(error)=result {
-                    let _=self.as_guest(host,conn,|g|g.system_message(horizon_client::text::Text::literal(error)));
-                } else {
-                    host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:s.window}));
-                    return true;
+            } else if s.confirmation {
+                if let (Some(registry),Some(Ok((plan,missing))))=(&s.snapshot,&s.report) {
+                    if !plan.simulated && missing.is_empty() && (!plan.steps.is_empty() || !plan.emitted.is_empty()) {
+                        let power=match &s.origin {CraftOrigin::Terminal{wireless:Some(ctx),..}=>Some(ctx.source),_=>None};
+                        let owner=host.hub.guests.iter().find(|guest|guest.conn==conn).map(|guest|guest.uuid);
+                        let result=if let Some(owner)=owner {
+                            self.as_guest(host,conn,|game|{
+                                let old=game.ae2_wireless_power;game.ae2_wireless_power=power;
+                                let result=game.ae2_begin_player_craft(s.pos,&s.key,s.fluid,s.amount,s.cpu,owner,registry,plan);
+                                game.ae2_wireless_power=old;result
+                            }).unwrap_or_else(||Err("player unavailable".into()))
+                        } else {Err("player unavailable".into())};
+                        if let Err(error)=result {
+                            let _=self.as_guest(host,conn,|g|g.system_message(horizon_client::text::Text::literal(error)));
+                        } else {
+                            host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:s.window}));
+                            return true;
+                        }
+                    }
                 }
             }
         } else if p.slot==4 && s.confirmation {
-            if let Ok((plan,_))=self.ae2_confirm_report(s.pos,&s.key,s.fluid,s.amount) {
+            if let Some(Ok((plan,_)))=&s.report {
                 if let Ok(candidates)=self.ae2_craft_cpu_candidates(s.pos,plan.estimated_bytes) {
                     s.cpu=match s.cpu {
                         None=>candidates.first().map(|v|v.0),
@@ -320,8 +539,8 @@ impl Game<'_> {
             }
         } else if s.confirmation && matches!(p.slot,18|19) {
             if p.slot==18 {s.report_page=s.report_page.saturating_sub(1);}
-            else if let Ok((plan,missing))=self.ae2_confirm_report(s.pos,&s.key,s.fluid,s.amount) {
-                let pages=self.ae2_craft_material_summary(&plan,&missing).len().max(1).div_ceil(12);
+            else if let Some(Ok((plan,missing)))=&s.report {
+                let pages=self.ae2_craft_material_summary(plan,missing).len().max(1).div_ceil(12);
                 s.report_page=(s.report_page+1).min(pages-1);
             }
         } else if p.slot==3 {
@@ -337,6 +556,26 @@ impl Game<'_> {
     }
     pub(super) fn lan_refresh_craft_confirms(&mut self,host:&mut LanHost) {
         let conns:Vec<_>=host.play.iter().filter_map(|(&conn,p)|p.ae2_craft_confirm.as_ref().map(|_|conn)).collect();
+        // TickHandler divides the total signed Java-int budget between all
+        // calculations for this level, with a minimum one-microsecond slice.
+        let active=self.ae2_guest_craft_calculations(host)+usize::from(self.ae2_local_craft_calculating())
+            +self.ae2_active_machine_craft_calculations();
+        let allowance=Self::ae2_craft_calculation_allowance(active);
+        if active>0 {self.ae2_local_craft_allowance=Some(allowance);}
+        let mut completed=Vec::new();
+        if active>0 {
+            for &conn in &conns {
+                if !host.hub.guests.iter().any(|g|g.conn==conn && host.hub.here(g)) {continue;}
+                let Some(session)=host.play.get_mut(&conn).and_then(|p|p.ae2_craft_confirm.as_mut()) else{continue;};
+                if session.dimension!=self.dim.id() {continue;}
+                let Some(calculation)=session.calculation.as_mut() else{continue;};
+                if !calculation.run_slice(allowance) {
+                    session.report=calculation.take_result().map(|result|result.map_err(|e|format!("craft planning: {e:?}")));
+                    session.calculation=None;
+                    completed.push(conn);
+                }
+            }
+        }
         for conn in conns {
             if !host.hub.guests.iter().any(|g|g.conn==conn && host.hub.here(g)){continue;}
             let Some(mut s)=host.play.get_mut(&conn).and_then(|p|p.ae2_craft_confirm.take()) else{continue;};
@@ -353,7 +592,7 @@ impl Game<'_> {
             }
             let refresh_status=s.status_mode && self.ae2_server_tick()%10==0;
             host.play.entry(conn).or_default().ae2_craft_confirm=Some(s);
-            if refresh_status {self.lan_send_craft_confirm(host,conn);}
+            if refresh_status || completed.contains(&conn) {self.lan_send_craft_confirm(host,conn);}
         }
     }
 }

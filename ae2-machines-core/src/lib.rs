@@ -3,6 +3,8 @@
 use ae2_cell_core::ItemKey;
 use serde::{Deserialize, Serialize};
 
+pub mod stored_energy;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Channel {
     Item,
@@ -204,9 +206,9 @@ impl BusState {
             return Ok(TickResult::Idle);
         }
         self.pending_pulse = false;
-        let mut ops = self.operations();
+        let initial_ops = self.operations();
+        let mut ops = initial_ops;
         let factor = self.channel.amount_per_operation();
-        let mut work = false;
         match direction {
             Direction::Import => {
                 // Import strategies process each key space with a shared operation
@@ -233,7 +235,6 @@ impl BusState {
                     if moved > 0 {
                         ops = ops.saturating_sub((moved / key_factor).max(1));
                         remaining_amount -= moved;
-                        work = true;
                     }
                 }
             }
@@ -274,9 +275,6 @@ impl BusState {
                         if moved > 0 || self.fuzzy {
                             ops = ops.saturating_sub((moved / factor).max(1));
                         }
-                        if moved > 0 {
-                            work = true;
-                        }
                         if ops == 0 {
                             break;
                         }
@@ -290,14 +288,17 @@ impl BusState {
                         }
                     }
                 }
-                if work && self.schedule == Schedule::RoundRobin && slots > 0 {
+                // StackTransferContextImpl.hasDoneWork compares the initial
+                // and remaining operations. Crafting preflight and a fuzzy
+                // candidate that moved nothing can both consume an operation.
+                if ops < initial_ops && self.schedule == Schedule::RoundRobin && slots > 0 {
                     self.next_slot = (self.next_slot + visited) % slots;
                 }
             }
         }
         if self.sleeping() {
             Ok(TickResult::Sleep)
-        } else if work {
+        } else if ops < initial_ops {
             Ok(TickResult::Faster)
         } else {
             Ok(TickResult::Slower)
@@ -649,12 +650,57 @@ mod tests {
         host.only = true;
         host.requests.clear();
         host.inner.network.insert(k("available"), 3);
+        bus.schedule = Schedule::RoundRobin;
+        bus.next_slot = 0;
         assert_eq!(
             bus.tick(Direction::Export, true, true, &mut host),
-            Ok(TickResult::Slower)
+            Ok(TickResult::Faster)
         );
         assert_eq!(host.inner.network.get(&k("available")), Some(&3));
         assert_eq!(host.requests, vec![(0, k("available"), 8)]);
+        assert_eq!(bus.next_slot, 1);
+        host.requests.clear();
+        assert_eq!(
+            bus.tick(Direction::Export, true, true, &mut host),
+            Ok(TickResult::Faster)
+        );
+        assert_eq!(host.requests, vec![(1, k("missing"), 8)]);
+        assert_eq!(bus.next_slot, 2);
+    }
+    #[test]
+    fn failed_fuzzy_export_consumes_an_operation_and_rotates() {
+        struct RejectingHost;
+        impl TransferHost for RejectingHost {
+            type Error = ();
+            fn adjacent_slots(&self) -> Vec<(Key, u64)> {
+                Vec::new()
+            }
+            fn fuzzy_matches(&self, a: &Key, b: &Key) -> bool {
+                a == b
+            }
+            fn fuzzy_candidates(&self, filter: &Key) -> Vec<Key> {
+                vec![filter.clone()]
+            }
+            fn transfer_atomic(&mut self, _: Direction, _: &Key, _: u64) -> Result<u64, ()> {
+                Ok(0)
+            }
+        }
+        let mut bus = BusState::new(Channel::Item);
+        bus.schedule = Schedule::RoundRobin;
+        bus.fuzzy = true;
+        bus.config[0] = Some(k("blocked"));
+        bus.config[1] = Some(k("next"));
+        let mut host = RejectingHost;
+        assert_eq!(
+            bus.tick(Direction::Export, true, true, &mut host),
+            Ok(TickResult::Faster)
+        );
+        assert_eq!(bus.next_slot, 1);
+        assert_eq!(
+            bus.tick(Direction::Export, true, true, &mut host),
+            Ok(TickResult::Faster)
+        );
+        assert_eq!(bus.next_slot, 2);
     }
     #[test]
     fn import_filter_inversion_speed_and_transaction_failure() {

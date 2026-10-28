@@ -79,6 +79,7 @@ impl Game<'_> {
                     | MachineKind::SkyStoneChest
                     | MachineKind::SmoothSkyStoneChest
                     | MachineKind::IoPort
+                    | MachineKind::QuantumLink
             ) {
                 return None;
             }
@@ -162,6 +163,10 @@ impl Game<'_> {
                         if index >= 6 || !crate::game::ae2_storage_devices::is_valid_storage_cell(stack) { continue; }
                         max = 1;
                     }
+                    MachineKind::QuantumLink => {
+                        if index != 0 || crate::game::ae2_quantum::frequency(stack).is_none() { continue; }
+                        max = 1;
+                    }
                     _ => {}
                 }
             }
@@ -217,6 +222,9 @@ impl Game<'_> {
                 continue;
             };
             if self.enter_level(None, dim).is_ok() {
+                if matches!(self.world.block_entities.get(&pos), Some(BlockEntity::Ae2(machine)) if machine.kind == MachineKind::QuantumLink) {
+                    self.ae2_quantum_inventory_changed(pos);
+                }
                 self.container_changed(pos);
             }
         }
@@ -615,6 +623,11 @@ impl Game<'_> {
         &mut self, address: GridAddress, face: Direction, stack: &ItemStack,
         limit: u32, simulate: bool, plan: &mut crate::game::ae2_buses::FormationPlan,
     ) -> u32 {
+        if matches!(self.ae2_block_entity(address), Some(BlockEntity::Ae2(machine)) if machine.kind == MachineKind::QuantumLink) {
+            let Some((moved, changed)) = self.ae2_native_container_insert_staged(address, face, stack, limit, simulate) else { return 0 };
+            plan.actions.extend(changed.into_iter().map(|(address, incarnation)| crate::game::ae2_formation::FormationAction::ContainerChanged { address, incarnation }));
+            return moved;
+        }
         if self.ae2_has_interface_face(address, face) {
             return self.ae2_interface_item_insert_staged(address, face, stack, limit, simulate, plan).unwrap_or(0);
         }
@@ -624,6 +637,13 @@ impl Game<'_> {
         &mut self, address: GridAddress, face: Direction, limit: u32,
         filter: Option<&ItemStack>, simulate: bool, plan: &mut crate::game::ae2_buses::FormationPlan,
     ) -> Option<ItemStack> {
+        if matches!(self.ae2_block_entity(address), Some(BlockEntity::Ae2(machine)) if machine.kind == MachineKind::QuantumLink) {
+            let prototype = self.ae2_native_container_candidates(address, face, true)?
+                .into_iter().find(|stack| filter.is_none_or(|f| f.same_item_same_components(stack)))?;
+            let (out, changed) = self.ae2_native_container_extract_staged(address, face, &prototype, limit, simulate)?;
+            plan.actions.extend(changed.into_iter().map(|(address, incarnation)| crate::game::ae2_formation::FormationAction::ContainerChanged { address, incarnation }));
+            return out;
+        }
         if self.ae2_has_interface_face(address, face) {
             return self.ae2_interface_item_extract_staged(address, face, limit, filter, simulate, plan).flatten();
         }
@@ -702,6 +722,10 @@ impl Game<'_> {
                         {
                             continue;
                         }
+                        max = 1;
+                    }
+                    MachineKind::QuantumLink => {
+                        if index != 0 || crate::game::ae2_quantum::frequency(stack).is_none() { continue; }
                         max = 1;
                     }
                     _ => {}

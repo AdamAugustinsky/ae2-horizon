@@ -456,6 +456,32 @@ impl BlockEntities {
         }
         old
     }
+    /// A command's decoded replacement carries loaded inventory/core state,
+    /// unlike a freshly constructed entity. Keep the replacement's remove/add
+    /// callbacks and original raw snapshot in the same journal transaction.
+    #[cfg(feature = "ae2-lab")]
+    pub fn replace_from_data(&mut self, pos: Pos, entity: BlockEntity, raw: &horizon_world::nbt::Tag) -> Option<BlockEntity> {
+        let previous_incarnation = self.incarnation(&pos);
+        let old = self.map.insert(pos, entity);
+        self.new_incarnation(pos);
+        if self.ae2_journal_enabled() {
+            if let (Some(incarnation), Some(entity @ BlockEntity::Ae2(_))) = (previous_incarnation, old.as_ref()) {
+                self.record_ae2(pos, Ae2MutationKind::EntityRemoved { incarnation, entity: entity.clone(), bulk_unload: false });
+            }
+            if let Some(entity @ BlockEntity::Ae2(_)) = self.map.get(&pos).cloned() {
+                let incarnation = self.incarnation(&pos).expect("loaded incarnation");
+                let provider_inventory = if matches!(&entity, BlockEntity::Ae2(m) if m.kind == crate::ae2_world::MachineKind::PatternProvider) {
+                    Ae2ProviderInitialInventory::Saved(raw.get("Items").cloned())
+                } else { Ae2ProviderInitialInventory::Constructed };
+                let cpu_core = if matches!(&entity, BlockEntity::Ae2(m) if ae2_cpu_kind(m.kind)) {
+                    Ae2CpuInitialCore::Saved(raw.get("core").cloned())
+                } else { Ae2CpuInitialCore::Constructed };
+                self.record_ae2(pos, Ae2MutationKind::EntityAdded { incarnation, entity, provider_inventory, cpu_core });
+            }
+        }
+        if old.is_none() { self.add(pos); }
+        old
+    }
     /// The block entity at `pos`, made by `make` when there is none.
     pub fn get_or_insert_with(
         &mut self,
@@ -786,6 +812,23 @@ mod tests {
         assert!(matches!(events[7].kind, Ae2MutationKind::EntityRemoved {incarnation,..} if incarnation == first));
         assert!(matches!(events[8].kind, Ae2MutationKind::EntityAdded {incarnation,..} if incarnation == next));
         assert!(b.take_ae2_mutations().unwrap().is_empty());
+    }
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn ae2_raw_replacement_records_loaded_state_without_losing_lifecycle() {
+        use crate::ae2_world::{Machine,MachineKind};
+        use horizon_world::nbt::Tag;
+        let mut entities=level(); let p=(1,64,2);
+        entities.start_ae2_journal();
+        entities.insert(p,BlockEntity::Ae2(Box::new(Machine::new(MachineKind::PatternProvider))));
+        let old=entities.incarnation(&p).unwrap(); entities.take_ae2_mutations().unwrap();
+        let raw=Tag::compound([("Items",Tag::List(Vec::new()))]);
+        entities.replace_from_data(p,BlockEntity::Ae2(Box::new(Machine::new(MachineKind::PatternProvider))),&raw);
+        let next=entities.incarnation(&p).unwrap(); assert_ne!(old,next);
+        let events=entities.take_ae2_mutations().unwrap(); assert_eq!(events.len(),2);
+        assert!(matches!(&events[0].kind,Ae2MutationKind::EntityRemoved{incarnation,..} if *incarnation==old));
+        assert!(matches!(&events[1].kind,Ae2MutationKind::EntityAdded{incarnation,provider_inventory:Ae2ProviderInitialInventory::Saved(Some(Tag::List(items))),..} if *incarnation==next&&items.is_empty()));
+        assert!(events[0].sequence<events[1].sequence);
     }
     #[cfg(feature = "ae2-lab")]
     #[test]

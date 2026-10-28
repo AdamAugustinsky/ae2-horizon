@@ -1,0 +1,370 @@
+//! Face-owned Pattern Access Terminal. Provider slots always remain physical.
+use super::{Game,lan::LanHost,ae2_global::GridAddress,ae2_parts::PartAddress};
+use horizon_client::{ae2_world::{Machine,MachineKind},containers::BlockEntity,items::ItemStack,menu::{Input,Kind,Menu}};
+use horizon_protocol::packets::play::{self,Clientbound as C};
+use horizon_world::nbt::Tag;
+use horizon_core::geometry::Direction;
+use std::collections::BTreeSet;
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum Owner {Block(GridAddress),Part(PartAddress)}
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct OwnerIdentity { owner:Owner, host:u64, part:Option<[i32;4]> }
+#[derive(Clone,Debug,PartialEq)]
+struct Row {owner:Owner,name:String,group:Group,sort:i64,slots:Vec<Option<ItemStack>>}
+/// Group identity includes the icon components and tooltip, not only the
+/// display name: two different machines can legitimately have the same name.
+#[derive(Clone,Debug,PartialEq,Eq,PartialOrd,Ord)]
+struct Group {icon:ae2_cell_core::ItemKey,name:String,tooltip:Vec<String>}
+fn same_sent_owner(sent:Option<OwnerIdentity>,current:Option<OwnerIdentity>)->bool {
+    sent.is_some() && sent==current
+}
+#[derive(Clone,Debug,PartialEq)]
+enum DisplayLine { Header(Group,usize), Provider(Row) }
+fn display_lines(rows:&[Row])->Vec<DisplayLine> {
+    let mut lines=Vec::new();let mut i=0;
+    while i<rows.len() {
+        let mut end=i+1;while end<rows.len() && rows[end].group==rows[i].group {end+=1;}
+        lines.push(DisplayLine::Header(rows[i].group.clone(),end-i));
+        lines.extend(rows[i..end].iter().cloned().map(DisplayLine::Provider));i=end;
+    }
+    lines
+}
+pub(super) struct GuestPatternAccess {
+    window:i32,state:i32,pos:(i32,i32,i32),face:String,dim:String,page:usize,
+    search:String,filter:u8,rows:Vec<Row>,pinned:Vec<Owner>,menu:Menu,refresh:u8,
+    sent_views:std::collections::VecDeque<(i32,Vec<Option<OwnerIdentity>>)>,
+}
+fn pattern(s:&ItemStack)->bool {
+    super::ae2_processing::decode_pattern(s).is_some() || super::ae2_processing::ae2_decode_processing_pattern(s).is_some() || super::ae2_processing::ae2_decode_special_pattern(s).is_some()
+}
+/// PatternDetailsHelper.isEncodedPattern checks a registered encoded item
+/// type without decoding its payload. Invalid patterns remain recoverable
+/// physical items even though they contribute no crafting definition.
+pub(super) fn encoded_pattern_item(s:&ItemStack)->bool {
+    s.count>0 && matches!(s.item.as_ref(),"ae2:crafting_pattern"|"ae2:processing_pattern"|"ae2:smithing_table_pattern"|"ae2:stonecutting_pattern")
+}
+impl Game<'_> {
+    fn access_filter(&self,pos:(i32,i32,i32),face:&str)->Option<u8> {
+        let BlockEntity::Ae2(host)=self.world.block_entities.get(&pos)? else{return None};
+        let Tag::List(parts)=host.config.get(&"parts".into())? else{return None};
+        let mut found=parts.iter().filter(|p|p.get("face")==Some(&Tag::String(face.into())));
+        let part=found.next()?;if found.next().is_some() || part.get("id")!=Some(&Tag::String("ae2:pattern_access_terminal".into())){return None;}
+        match part.get("ae2_access_filter") {None=>Some(0),Some(Tag::Byte(n)) if (0..=2).contains(n)=>Some(*n as u8),_=>None}
+    }
+    fn access_set_filter(&mut self,pos:(i32,i32,i32),face:&str,filter:u8)->bool {
+        if filter>2 || self.access_filter(pos,face).is_none(){return false;}
+        let Some(BlockEntity::Ae2(host))=self.world.block_entities.get_mut(&pos) else{return false};
+        let Some(Tag::List(parts))=host.config.get_mut(&"parts".into()) else{return false};
+        let Some(Tag::Compound(part))=parts.iter_mut().find(|p|p.get("face")==Some(&Tag::String(face.into()))) else{return false};
+        part.insert("ae2_access_filter".into(),Tag::Byte(filter as i8));
+        self.world.modified.insert((pos.0>>4,pos.2>>4));true
+    }
+    fn access_pattern_matches(&self,pattern:&ItemStack,query:&str)->bool {
+        let mut outputs=Vec::new();
+        if let Some((_,output))=super::ae2_processing::decode_pattern(pattern){outputs.push(output);}
+        if let Some(special)=super::ae2_processing::ae2_decode_special_pattern(pattern){outputs.push(special.output);}
+        if let Some((_,items))=super::ae2_processing::ae2_decode_processing_pattern(pattern){outputs.extend(items.into_iter().flatten());}
+        if outputs.iter().any(|item|{
+            let name=horizon_client::stations::hover_name(&|id|self.pack.names.display_item(id),item);
+            name.to_lowercase().contains(query) || item.item.to_lowercase().contains(query)
+        }) {return true;}
+        super::ae2_processing::ae2_decode_processing_fluids(pattern).is_some_and(|(_,fluids)|
+            fluids.iter().any(|fluid|fluid.key.item_id.to_lowercase().contains(query)))
+    }
+    fn access_owner_identity(&self,owner:Owner)->Option<OwnerIdentity> {
+        let address=match owner {Owner::Block(p)=>p,Owner::Part(p)=>p.host};
+        let (dim,pos)=self.ae2_address_parts(address)?;
+        let world=self.ae2_world_for(dim)?;
+        let host=world.block_entities.incarnation(&pos)?;
+        let part=match owner {
+            Owner::Block(_)=>None,
+            Owner::Part(p)=>{
+                let BlockEntity::Ae2(machine)=world.block_entities.get(&pos)? else{return None};
+                let Tag::List(parts)=machine.config.get(&"parts".into())? else{return None};
+                let face=["east","west","up","down","south","north"].get(usize::from(p.face))?;
+                let mut found=parts.iter().filter(|part|part.get("face")==Some(&Tag::String((*face).into())));
+                let record=found.next()?;if found.next().is_some(){return None;}
+                Some(super::ae2_channels::part_identity(record)?)
+            }
+        };
+        Some(OwnerIdentity{owner,host,part})
+    }
+    fn access_machine(&self,owner:Owner)->Option<Machine> {
+        match owner {
+            Owner::Block(p)=>match self.ae2_block_entity(p)? {BlockEntity::Ae2(m)=>Some((**m).clone()),_=>None},
+            Owner::Part(p)=>self.ae2_part_machine(p).ok().flatten(),
+        }.filter(|m|m.kind==MachineKind::PatternProvider && m.slots.len()==9)
+    }
+    fn access_name(&self,owner:Owner)->Option<String> {
+        match owner {
+            Owner::Block(address)=>{
+                let (dim,pos)=self.ae2_address_parts(address)?;
+                self.ae2_world_for(dim)?.block_names.get(&pos).cloned()
+            }
+            Owner::Part(part)=>{
+                let BlockEntity::Ae2(host)=self.ae2_block_entity(part.host)? else{return None};
+                let Tag::List(parts)=host.config.get(&"parts".into())? else{return None};
+                let face=["east","west","up","down","south","north"].get(usize::from(part.face))?;
+                let part=parts.iter().find(|p|p.get("face")==Some(&Tag::String((*face).into())))?;
+                let stack=horizon_client::save::item_from_nbt(part.get("stack")?)?;
+                stack.custom_name().map(str::to_owned)
+            }
+        }
+    }
+    /// AE2 groups an unnamed provider by its one distinct adjacent machine,
+    /// using sided capability presence even for empty handlers.
+    fn access_group(&self,owner:Owner,component:usize,network:&ae2_network_core::Network,analysis:&ae2_network_core::Analysis)->Option<Group> {
+        let host_icon=match owner {
+            Owner::Block(_) => ItemStack::new("ae2:pattern_provider",1),
+            Owner::Part(p) => {
+                let BlockEntity::Ae2(host)=self.ae2_block_entity(p.host)? else{return None};
+                let Tag::List(parts)=host.config.get(&"parts".into())? else{return None};
+                let face=["east","west","up","down","south","north"].get(usize::from(p.face))?;
+                let part=parts.iter().find(|part|part.get("face")==Some(&Tag::String((*face).into())))?;
+                horizon_client::save::item_from_nbt(part.get("stack")?)?
+            }
+        };
+        let host_key=horizon_client::ae2_cell_codec::key(&host_icon).ok()?;
+        if let Some(name)=self.access_name(owner){return Some(Group{icon:host_key,name,tooltip:Vec::new()});}
+        let address=match owner {Owner::Block(p)=>p,Owner::Part(p)=>p.host};
+        let Some((dim,pos))=self.ae2_address_parts(address) else{return None};
+        let directions:Vec<Direction>=match owner {
+            Owner::Block(address)=>{
+                let Some(state)=self.ae2_grid_block(address).and_then(|id|self.pack.assets.registry.state(id)) else{return None};
+                match super::ae2_autocrafting::provider_push_direction(state) {Ok(Some(direction))=>vec![direction],Ok(None)=>Direction::ALL.to_vec(),Err(())=>return None}
+            },
+            Owner::Part(p)=>vec![[Direction::East,Direction::West,Direction::Up,Direction::Down,Direction::South,Direction::North][usize::from(p.face)]],
+        };
+        let mut groups=BTreeSet::new();
+        for direction in directions {
+            let delta=direction.normal();
+            let Some(x)=pos.0.checked_add(delta[0]) else{continue};
+            let Some(y)=pos.1.checked_add(delta[1]) else{continue};
+            let Some(z)=pos.2.checked_add(delta[2]) else{continue};
+            let Some(target)=self.ae2_dimension_address(dim,(x,y,z)) else{continue};
+            let side=direction.opposite();
+            let same_grid=network.physical_connection(address.network_pos(),target.network_pos())
+                && analysis.nodes.get(&target.network_pos()).is_some_and(|s|s.component==component);
+            if same_grid && (self.ae2_interface_supports(target,side) || self.ae2_provider_part_at(target,side).is_some()
+                || matches!(self.ae2_block_entity(target),Some(BlockEntity::Ae2(m)) if m.kind==MachineKind::PatternProvider)) {continue;}
+            let assembler=matches!(self.ae2_block_entity(target),Some(BlockEntity::Ae2(m)) if m.kind==MachineKind::MolecularAssembler);
+            if !assembler && !self.ae2_native_item_supports(target,side) && !self.ae2_native_fluid_supports(target,side){continue;}
+            let Some(block)=self.ae2_grid_block(target) else{continue};
+            let id=self.res.facts().get(block).name.to_string();
+            let mut label=self.ae2_world_for(dim).and_then(|world|world.block_names.get(&(x,y,z)).cloned())
+                .unwrap_or_else(||self.pack.names.display_item(&id));
+            let mut icon=ItemStack::new(&id,1);
+            if let Some(BlockEntity::Ae2(host))=self.ae2_block_entity(target) {
+                if host.kind==MachineKind::CableBus {
+                    let face=match side {Direction::East=>"east",Direction::West=>"west",Direction::Up=>"up",Direction::Down=>"down",Direction::South=>"south",Direction::North=>"north"};
+                    let Some(Tag::List(parts))=host.config.get(&"parts".into()) else{continue};
+                    let Some(part)=parts.iter().find(|p|p.get("face")==Some(&Tag::String(face.into()))) else{continue};
+                    let Some(stack)=part.get("stack").and_then(horizon_client::save::item_from_nbt) else{continue};
+                    icon=stack.clone();label=horizon_client::stations::hover_name(&|id|self.pack.names.display_item(id),&stack);
+                }
+            }
+            if let Ok(icon)=horizon_client::ae2_cell_codec::key(&icon) {groups.insert(Group{icon,name:label,tooltip:Vec::new()});}
+        }
+        if groups.len()==1 {groups.into_iter().next()} else {
+            let tooltip=if groups.len()>1 {groups.into_iter().map(|group|group.name).collect()} else {Vec::new()};
+            Some(Group{icon:host_key,name:"Pattern Provider".into(),tooltip})
+        }
+    }
+    fn access_store(&mut self,owner:Owner,machine:&Machine)->Result<(),String> {
+        let old_slots=self.access_machine(owner).map(|old|old.slots);
+        let result=match owner {
+            Owner::Part(p)=>self.ae2_store_part_machine(p,machine),
+            Owner::Block(p)=>{
+                let Some(BlockEntity::Ae2(target))=self.ae2_block_entity_mut(p) else{return Err("provider disappeared".into());};
+                if target.kind!=MachineKind::PatternProvider {return Err("provider changed".into());}
+                **target=machine.clone();self.ae2_mark_modified(p);Ok(())
+            }
+        };
+        if result.is_ok() && old_slots.as_ref().is_some_and(|old|old!=&machine.slots) {
+            match owner {
+                Owner::Block(address)=>self.ae2_provider_patterns_changed(address,None),
+                Owner::Part(part)=>self.ae2_provider_patterns_changed(part.host,Some(part.face)),
+            }
+        }
+        result
+    }
+    fn access_rows(&self,pos:(i32,i32,i32),search:&str,filter:u8,pinned:&[Owner])->(Vec<Row>,Vec<Owner>) {
+        let n=self.ae2_network();let Ok(a)=n.analyze() else{return (Vec::new(),Vec::new())};
+        let Some(node)=self.ae2_local_address(pos).and_then(|p|a.nodes.get(&p.network_pos())) else{return (Vec::new(),Vec::new())};
+        if !node.online{return (Vec::new(),Vec::new());}
+        let mut rows=Vec::new();let mut pins=Vec::new();
+        for p in &a.components[node.component].positions {
+            let Some(address)=GridAddress::from_network(*p) else{continue;};
+            let Some(status)=a.nodes.get(p) else{continue;};
+            let mut owners=Vec::new();
+            if status.online {owners.push(Owner::Block(address));}
+            for (&face,part) in &status.parts {if part.online {owners.push(Owner::Part(PartAddress{host:address,face}));}}
+            for owner in owners {
+                let Some(machine)=self.access_machine(owner) else{continue;};
+                let visible=!matches!(machine.config.get(&"terminal_visible".into()),Some(Tag::Byte(0)));
+                if filter!=2 && !visible {continue;}
+                if filter==1 && machine.slots.iter().all(Option::is_some) && !pinned.contains(&owner){continue;}
+                if filter==1 {pins.push(owner);}
+                let location=self.ae2_address_parts(address).map(|(dim,p)|if dim==self.dim {format!("{},{},{}",p.0,p.1,p.2)} else {format!("{} {},{},{}",dim.id(),p.0,p.1,p.2)}).unwrap_or_else(||"?".into());
+                let Some(group)=self.access_group(owner,node.component,&n,&a) else{continue};
+                let name=match owner {Owner::Block(_)=>format!("{} {location}",group.name),Owner::Part(p)=>format!("{} {} {location}",group.name,["E","W","U","D","S","N"][usize::from(p.face)])};
+                let query=search.to_lowercase();
+                if !query.is_empty() && !group.name.to_lowercase().contains(&query)
+                    && !machine.slots.iter().flatten().any(|pattern|self.access_pattern_matches(pattern,&query)) {continue;}
+                let sort=self.ae2_address_parts(address).map_or(0,|(_,p)|((i64::from(p.2))<<24)^((i64::from(p.0))<<8)^i64::from(p.1));
+                rows.push(Row{owner,name,group,sort,slots:machine.slots});
+            }
+        }
+        rows.sort_by(|a,b|a.group.name.to_lowercase().cmp(&b.group.name.to_lowercase()).then(a.group.cmp(&b.group)).then(a.sort.cmp(&b.sort)));
+        (rows,pins)
+    }
+    pub(super) fn lan_open_pattern_access(&mut self,host:&mut LanHost,conn:u32,pos:(i32,i32,i32),face:&str)->bool {
+        let Some(filter)=self.access_filter(pos,face) else{return false};
+        self.lan_pattern_access_closed(host,conn,None);
+        self.lan_ae2_terminal_closed(host,conn,None);self.lan_ae2_machine_closed(host,conn,None);
+        self.lan_ae2_portable_closed(host,conn,None);self.lan_ae2_network_tool_closed(host,conn,None);self.lan_ae2_anchor_closed(host,conn,None);
+        self.lan_ae2_bus_closed(host,conn,None);self.lan_craft_confirm_closed(host,conn,None);
+        self.lan_station_closed(host,conn,None);self.lan_crafting_closed(host,conn,None);self.guest_container_closed(host,conn);
+        let Some(window)=host.hub.open_window(conn,"minecraft:generic_9x6",horizon_protocol::text::literal("AE2 Pattern Access")) else{return true;};
+        host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload {
+            channel:"ae2:bus_ack_enable".into(),data:window.to_be_bytes().to_vec(),
+        }));
+        host.play.entry(conn).or_default().ae2_pattern_access=Some(GuestPatternAccess{window,state:0,pos,face:face.into(),dim:self.dim.id().into(),page:0,search:String::new(),filter,rows:Vec::new(),pinned:Vec::new(),menu:Menu::new(Kind::Chest(6)),refresh:0,sent_views:std::collections::VecDeque::new()});
+        self.lan_send_pattern_access(host,conn);true
+    }
+    fn lan_send_pattern_access(&mut self,host:&mut LanHost,conn:u32) {
+        let Some((window,state,pos,face,page,search,filter,pinned))=host.play.get(&conn).and_then(|p|p.ae2_pattern_access.as_ref()).map(|s|(s.window,s.state,s.pos,s.face.clone(),s.page,s.search.clone(),s.filter,s.pinned.clone())) else{return};
+        let (rows,pins)=if self.ae2_part_online(pos,&face){self.access_rows(pos,&search,filter,&pinned)} else{(Vec::new(),Vec::new())};
+        let lines=display_lines(&rows);let max_scroll=lines.len().saturating_sub(6);let page=page.min(max_scroll);
+        let mut items=vec![None;54];let mut layout=Vec::new();let mut owners=vec![None;6];
+        for (i,line) in lines.iter().skip(page).take(6).enumerate(){
+            match line {
+                DisplayLine::Header(group,count)=>layout.push(serde_json::json!({"kind":"header","name":group.name,"count":count,"tooltip":group.tooltip,"icon":{"id":group.icon.item_id,"components":group.icon.components}})),
+                DisplayLine::Provider(row)=>{owners[i]=self.access_owner_identity(row.owner);items[i*9..i*9+9].clone_from_slice(&row.slots);layout.push(serde_json::json!({"kind":"provider","name":row.name}));}
+            }
+        }
+        let data=serde_json::to_vec(&serde_json::json!({"window":window,"rows":layout,"offset":page,"maximum":max_scroll,"filter":filter})).unwrap_or_default();
+        host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload{channel:"ae2:pattern_layout".into(),data}));
+        let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn) else{return};
+        items.extend((9..36).chain(0..9).map(|i|g.inventory[i].clone()));let carried=g.carried.clone();
+        let wire=items.iter().map(|s|host.hub.stack(s)).collect();let carried=host.hub.stack(&carried);
+        let Some(s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.as_mut()) else{return};
+        s.rows=rows;s.pinned=pins;s.page=page;s.state=(state+1)&0x7fff;let state=s.state;
+        s.sent_views.push_back((state,owners));while s.sent_views.len()>64 {s.sent_views.pop_front();}
+        host.hub.send_to(conn,&C::ContainerSetContent(play::ContainerSetContent{container:window,state,items:wire,carried}));
+    }
+    pub(super) fn lan_pattern_access_search(&mut self,host:&mut LanHost,conn:u32,value:&str)->bool {
+        let Some(s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.as_mut()) else{return false};
+        s.search=value.chars().take(128).collect();s.page=0;self.lan_send_pattern_access(host,conn);true
+    }
+    pub(super) fn lan_pattern_access_click(&mut self,host:&mut LanHost,conn:u32,p:&play::ContainerClick)->bool {
+        let Some(mut s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.take()) else{return false};
+        if p.container!=s.window {host.play.entry(conn).or_default().ae2_pattern_access=Some(s);return false;}
+        let Some(gi)=host.hub.guests.iter().position(|g|g.conn==conn && host.hub.here(g)) else{return true};
+        if s.dim!=self.dim.id() || !host.hub.guests[gi].within_block_range([s.pos.0,s.pos.1,s.pos.2],4.0) {
+            host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:s.window}));return true;
+        }
+        let (rows,_)=if self.ae2_part_online(s.pos,&s.face){self.access_rows(s.pos,&s.search,s.filter,&s.pinned)}else{(Vec::new(),Vec::new())};
+        let stale_target=(0..54).contains(&p.slot) && {
+            let index=p.slot as usize/9;
+            let old=s.sent_views.iter().rev().find(|(state,_)|*state==p.state).and_then(|(_,view)|view.get(index)).copied().flatten();
+            let current=display_lines(&rows).get(s.page+index).and_then(|line|match line {DisplayLine::Provider(row)=>self.access_owner_identity(row.owner),_=>None});
+            !same_sent_owner(old,current)
+        };
+        if rows!=s.rows || stale_target {
+            host.play.entry(conn).or_default().ae2_pattern_access=Some(s);self.lan_send_pattern_access(host,conn);return true;
+        }
+        let input=super::lan_crafting::input(p.input);
+        if (0..54).contains(&p.slot) {
+            let lines=display_lines(&rows);let index=s.page+p.slot as usize/9;let slot=p.slot as usize%9;
+            if let Some(DisplayLine::Provider(row))=lines.get(index) {
+                if let Some(mut machine)=self.access_machine(row.owner) {
+                    let snapshot=self.ae2_snapshot_blocks();let old_inventory=host.hub.guests[gi].inventory.clone();let old_cursor=host.hub.guests[gi].carried.clone();
+                    let current=machine.slots[slot].clone();
+                    if input==Input::QuickMove {
+                        if let Some(item)=current {if let Some(remaining)=self.as_guest(host,conn,|g|g.give(item)){machine.slots[slot]=remaining;}}
+                    } else if input==Input::Clone && host.hub.guests[gi].creative() && host.hub.guests[gi].carried.is_none() {
+                        host.hub.guests[gi].carried=current;
+                    } else if input==Input::Pickup && matches!(p.button,0|1) {
+                        let held=host.hub.guests[gi].carried.clone();
+                        if held.is_none() {host.hub.guests[gi].carried=current;machine.slots[slot]=None;}
+                        else if (p.button==0 || current.is_none()) && held.as_ref().is_some_and(|x|x.count==1 && encoded_pattern_item(x)) {
+                            host.hub.guests[gi].carried=current;machine.slots[slot]=held;
+                        }
+                    }
+                    if self.access_store(row.owner,&machine).is_err() {
+                        self.ae2_restore_blocks(snapshot);host.hub.guests[gi].inventory=old_inventory;host.hub.guests[gi].carried=old_cursor;
+                    }
+                }
+            }
+        } else if p.slot == -10 {s.page=s.page.saturating_sub(1);}
+        else if p.slot == -11 {s.page=(s.page+1).min(display_lines(&rows).len().saturating_sub(6));}
+        else if p.slot == -12 {let next=(s.filter+1)%3;if self.access_set_filter(s.pos,&s.face,next){s.filter=next;s.page=0;s.pinned.clear();}}
+        else if (54..90).contains(&p.slot) && input==Input::QuickMove {
+            let index=if p.slot<81 {9+(p.slot as usize-54)} else {p.slot as usize-81};
+            if let Some(item)=host.hub.guests[gi].inventory.get(index).and_then(Clone::clone).filter(|v|v.count==1 && pattern(v)) {
+                for row in &rows {
+                    let Some(mut machine)=self.access_machine(row.owner) else{continue;};
+                    let Some(slot)=machine.slots.iter().position(Option::is_none) else{continue;};
+                    machine.slots[slot]=Some(item.clone());
+                    if self.access_store(row.owner,&machine).is_ok(){host.hub.guests[gi].inventory[index]=None;break;}
+                }
+            }
+        }
+        else if (54..90).contains(&p.slot) {
+            self.guest_menu_op(host,gi,&mut s.menu,|m,env|{let _=m.click(env,i32::from(p.slot),i32::from(p.button),input);});
+        }
+        host.play.entry(conn).or_default().ae2_pattern_access=Some(s);self.lan_send_pattern_access(host,conn);true
+    }
+    pub(super) fn lan_pattern_access_closed(&mut self,host:&mut LanHost,conn:u32,window:Option<i32>)->bool {
+        if host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.take_if(|s|window.is_none_or(|w|w==s.window))).is_none(){return false;}
+        if let Some(gi)=host.hub.guests.iter().position(|g|g.conn==conn){self.guest_carried_back(host,gi);}true
+    }
+    pub(super) fn lan_refresh_pattern_access(&mut self,host:&mut LanHost) {
+        let viewers:Vec<_>=host.play.iter().filter_map(|(&id,p)|p.ae2_pattern_access.as_ref().map(|s|(id,s.pos,s.face.clone(),s.dim.clone(),s.window))).collect();
+        for (conn,pos,face,dim,window) in viewers {
+            let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn && host.hub.here(g)) else{continue;};
+            let filter=self.access_filter(pos,&face);
+            if dim!=self.dim.id() || !g.within_block_range([pos.0,pos.1,pos.2],4.0) || filter.is_none() {
+                self.lan_pattern_access_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));
+            } else if let Some(s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.as_mut()) {
+                if filter!=Some(s.filter) {s.filter=filter.unwrap();s.page=0;s.pinned.clear();self.lan_send_pattern_access(host,conn);continue;}
+                s.refresh=s.refresh.saturating_add(1);
+                if s.refresh>=10 {
+                    s.refresh=0;
+                    let (search,filter,old,pinned)=(s.search.clone(),s.filter,s.rows.clone(),s.pinned.clone());
+                    let rows=if self.ae2_part_online(pos,&face){self.access_rows(pos,&search,filter,&pinned).0}else{Vec::new()};
+                    if rows!=old {self.lan_send_pattern_access(host,conn);}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Group;
+    use ae2_cell_core::ItemKey;
+    #[test]
+    fn pattern_access_stale_row_rejects_replaced_host_or_part() {
+        use super::{Owner,OwnerIdentity,same_sent_owner};
+        use crate::game::ae2_global::GridAddress;
+        let address=GridAddress::from_network(ae2_network_core::Pos{x:1,y:64,z:2}).unwrap();
+        let old=OwnerIdentity{owner:Owner::Block(address),host:7,part:None};
+        assert!(same_sent_owner(Some(old),Some(old)));
+        assert!(!same_sent_owner(Some(old),Some(OwnerIdentity{host:8,..old})));
+        let old_part=OwnerIdentity{owner:Owner::Part(super::PartAddress{host:address,face:0}),part:Some([1,2,3,4]),..old};
+        assert!(!same_sent_owner(Some(old_part),Some(OwnerIdentity{part:Some([5,6,7,8]),..old_part})));
+        assert!(!same_sent_owner(None,None));
+    }
+    #[test]
+    fn pattern_access_group_identity_keeps_icon_components_and_tooltip() {
+        let group=Group{icon:ItemKey{item_id:"minecraft:chest".into(),components:vec![1]},name:"Smelter".into(),tooltip:vec![]};
+        let mut changed=group.clone();changed.icon.components.push(2);
+        assert_ne!(group,changed);
+        changed=group.clone();changed.tooltip.push("Other machine".into());
+        assert_ne!(group,changed);
+        assert_eq!(group,group.clone());
+    }
+}

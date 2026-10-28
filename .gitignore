@@ -1,0 +1,18 @@
+# Proprietary game data and downloaded/generated AE2 content are local only.
+.local/
+**/.local/
+/ae2-reference/
+/content/
+**/target/
+**/node_modules/
+feasibility/guidebook-stage/assets/
+feasibility/guidebook-stage/validation.json
+feasibility/guidebook-stage/compiled-guide.json
+.DS_Store
+*.log
+*.jar
+*.hmod
+*.sock
+*.dmp
+.env
+.env.*

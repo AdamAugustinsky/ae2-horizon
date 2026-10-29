@@ -778,7 +778,10 @@ impl Streaming {
             world.modified.insert(key);
         }
         #[cfg(feature = "ae2-lab")]
-        world.block_entities.record_ae2_chunk_states(&chunk);
+        {
+            world.block_entities.prepare_vanilla_metadata(&chunk);
+            world.block_entities.record_ae2_chunk_states(&chunk);
+        }
         world
             .block_entities
             .load_chunk(std::mem::take(&mut chunk.block_entities));

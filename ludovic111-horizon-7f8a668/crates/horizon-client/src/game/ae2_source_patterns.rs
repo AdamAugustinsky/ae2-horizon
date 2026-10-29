@@ -29,32 +29,28 @@ fn flag(tag:&Tag,key:&str)->Result<bool,String> {
 }
 
 #[derive(Clone,Debug,PartialEq)]
-pub(super) struct SourceCrafting {pub grid:Vec<Option<ItemStack>>,pub output:ItemStack,pub recipe:String,pub substitutes:bool,pub fluid_substitutes:bool}
+pub(super) struct SourceCrafting {pub grid:Vec<Option<ItemStack>>,pub input_amounts:Vec<u64>,pub output:ItemStack,pub recipe:String,pub substitutes:bool,pub fluid_substitutes:bool}
 pub(super) fn crafting(stack:&ItemStack)->Option<Result<SourceCrafting,String>> {
     let source=stack.data()?.other("ae2:encoded_crafting_pattern")?;
     Some((||{
         let Some(Tag::List(inputs))=source.get("inputs") else{return Err("invalid crafting pattern inputs".into());};
         if inputs.len()>9 {return Err("too many crafting pattern inputs".into());}
-        let mut grid=Vec::with_capacity(9);
+        let mut grid=Vec::with_capacity(9);let mut input_amounts=Vec::with_capacity(9);
         for entry in inputs {
-            if matches!(entry,Tag::Compound(data) if data.is_empty()){grid.push(None);}else{
+            if matches!(entry,Tag::Compound(data) if data.is_empty()){grid.push(None);input_amounts.push(0);}else{
                 let item=item(entry)?;
-                // AECraftingPattern.getCraftingInputs uses
-                // GenericStack.fromItemStack, which unwraps item keys before
-                // the recipe sees them. Non-unit and fluid wrappers need a
-                // separate execution model; never fabricate an input for them.
-                let item=if let Some(value)=ae2_generic_stack::unwrap_item_stack(&item)? {
-                    if value.fluid || value.amount!=1 {return Err("unsupported wrapped crafting input".into());}
-                    horizon_client::ae2_cell_codec::prototype(&value.key)?
-                } else {
-                    if item.count!=1 {return Err("crafting input is not singular".into());}item
-                };
-                grid.push(Some(item));
+                // getCraftingInputs keeps the GenericStack amount; recipe
+                // matching separately uses AEItemKey.toStack(), a one-item
+                // prototype. Wrapped fluid fails the source's item-key cast.
+                let value=ae2_generic_stack::from_item_stack(&item)?.ok_or("empty crafting input")?;
+                if value.fluid {return Err("fluid crafting input".into());}
+                let amount=u64::try_from(value.amount).ok().filter(|amount|*amount>0).ok_or("nonpositive crafting input amount")?;
+                grid.push(Some(horizon_client::ae2_cell_codec::prototype(&value.key)?));input_amounts.push(amount);
             }
         }
-        grid.resize(9,None);
+        grid.resize(9,None);input_amounts.resize(9,0);
         if grid.iter().all(Option::is_none){return Err("empty crafting pattern".into());}
-        Ok(SourceCrafting {grid,output:item(source.get("result").ok_or("missing pattern result")?)?,recipe:name(source,"recipeId")?,
+        Ok(SourceCrafting {grid,input_amounts,output:item(source.get("result").ok_or("missing pattern result")?)?,recipe:name(source,"recipeId")?,
             substitutes:flag(source,"canSubstitute")?,fluid_substitutes:flag(source,"canSubstituteFluids")?})
     })())
 }
@@ -131,7 +127,13 @@ mod tests {
         assert_eq!(decoded.grid[0],Some(input));assert_eq!(decoded.output,output);
         let mut too_many=wrapped.clone();too_many.data_mut().set_other("ae2:wrapped_stack",Some(ae2_generic_stack::encode(&GenericStack{key,fluid:false,amount:2}).unwrap()));
         grid[0]=Some(too_many);pattern.data_mut().set_other("ae2:encoded_crafting_pattern",Some(encode_crafting(&grid,&decoded.output,"minecraft:oak_planks",false,false).unwrap()));
-        assert!(crafting(&pattern).unwrap().is_err());
+        let decoded=crafting(&pattern).unwrap().unwrap();
+        assert_eq!(decoded.grid[0].as_ref().unwrap().count,1);assert_eq!(decoded.input_amounts[0],2);
+        let mut ordinary=ItemStack::new("minecraft:oak_log",3);ordinary.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("variant",Tag::String("wrapped".into()))])));
+        let mut encoded=encode_crafting(&vec![Some(ItemStack::new("minecraft:oak_log",1)),None,None,None,None,None,None,None,None],&decoded.output,"minecraft:oak_planks",false,false).unwrap();
+        if let Tag::Compound(data)=&mut encoded {if let Some(Tag::List(inputs))=data.get_mut(&"inputs".into()){inputs[0]=save::item_to_nbt(&ordinary);}}
+        pattern.data_mut().set_other("ae2:encoded_crafting_pattern",Some(encoded));
+        let decoded=crafting(&pattern).unwrap().unwrap();assert_eq!(decoded.grid[0].as_ref().unwrap().count,1);assert_eq!(decoded.input_amounts[0],3);
         let fluid=GenericStack{key:horizon_client::ae2_cell_codec::fluid_key("minecraft:water"),fluid:true,amount:1000};
         grid[0]=Some(ae2_generic_stack::wrap(&fluid).unwrap());pattern.data_mut().set_other("ae2:encoded_crafting_pattern",Some(encode_crafting(&grid,&decoded.output,"minecraft:oak_planks",false,false).unwrap()));
         assert!(crafting(&pattern).unwrap().is_err());

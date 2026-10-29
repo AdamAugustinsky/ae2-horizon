@@ -30,6 +30,12 @@ use std::collections::HashMap;
 pub type Pos = (i32, i32, i32);
 
 #[cfg(feature = "ae2-lab")]
+fn vanilla_metadata_entity(entity:&BlockEntity)->bool {
+    matches!(entity,BlockEntity::Chest(_) | BlockEntity::Furnace(_)
+        | BlockEntity::Brewing(_) | BlockEntity::Crafter(_) | BlockEntity::Beacon(_))
+}
+
+#[cfg(feature = "ae2-lab")]
 fn ae2_cpu_kind(kind: crate::ae2_world::MachineKind) -> bool {
     use crate::ae2_world::MachineKind::*;
     matches!(kind, CraftingUnit | CraftingAccelerator | CraftingMonitor | CraftingStorage1k
@@ -132,6 +138,12 @@ pub struct BlockEntities {
     map: HashMap<Pos, BlockEntity>,
     /// Process-local identity of each physical block-entity incarnation.
     incarnations: FxHashMap<Pos, u64>,
+    /// Raw vanilla components retained only for the incarnation that received
+    /// them. Position-keyed chunk tags can otherwise belong to a removed BE.
+    #[cfg(feature = "ae2-lab")]
+    vanilla_metadata: FxHashMap<Pos,(u64,horizon_world::nbt::Tag)>,
+    #[cfg(feature = "ae2-lab")]
+    vanilla_loaded_metadata: FxHashMap<Pos,horizon_world::nbt::Tag>,
     #[cfg(feature = "ae2-lab")]
     ae2_journal: std::sync::Mutex<Ae2Journal>,
     #[cfg(feature = "ae2-lab")]
@@ -390,12 +402,63 @@ impl BlockEntities {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let token = NEXT.fetch_add(1, Ordering::Relaxed);
         assert_ne!(token, 0, "block entity incarnation counter exhausted");
+        #[cfg(feature = "ae2-lab")]
+        self.vanilla_metadata.remove(&pos);
         self.incarnations.insert(pos, token);
     }
     /// Unique during this process. An entity temporarily taken for its tick
     /// keeps its identity; replacement, unload and later load create a new one.
     pub fn incarnation(&self, pos: &Pos) -> Option<u64> {
         self.incarnations.get(pos).copied()
+    }
+    /// Bind decoded raw data to the actual live container, never its address
+    /// alone. Temporary `take`/`put` preserves its incarnation.
+    #[cfg(feature = "ae2-lab")]
+    pub fn remember_vanilla_metadata(&mut self,pos:Pos,raw:&horizon_world::nbt::Tag) {
+        if !self.map.get(&pos).is_some_and(vanilla_metadata_entity) {return}
+        if let Some(incarnation)=self.incarnation(&pos) {
+            self.vanilla_metadata.insert(pos,(incarnation,raw.clone()));
+        }
+    }
+    #[cfg(feature = "ae2-lab")]
+    pub fn supports_vanilla_metadata(&self,pos:&Pos)->bool {
+        self.map.get(pos).is_some_and(vanilla_metadata_entity)
+    }
+    #[cfg(feature = "ae2-lab")]
+    pub fn vanilla_metadata(&self,pos:&Pos)->Option<&horizon_world::nbt::Tag> {
+        let (owner,raw)=self.vanilla_metadata.get(pos)?;
+        (self.incarnation(pos)==Some(*owner)).then_some(raw)
+    }
+    /// Stage only metadata for BEs that this specific incoming chunk decoded.
+    /// Duplicate source records are ignored instead of guessing an owner.
+    #[cfg(feature = "ae2-lab")]
+    pub fn prepare_vanilla_metadata(&mut self,chunk:&crate::chunk::Chunk) {
+        self.vanilla_loaded_metadata.clear();
+        let Some(saved)=chunk.saved.as_deref() else{return};
+        let wanted:FxHashSet<_>=chunk.block_entities.iter().filter(|(_,entity)|vanilla_metadata_entity(entity)).map(|(pos,_)|*pos).collect();
+        let mut duplicate=FxHashSet::default();
+        for (pos,tag) in &saved.block_entity_sources {
+            if !wanted.contains(pos) || duplicate.contains(pos) {continue}
+            if self.vanilla_loaded_metadata.insert(*pos,tag.clone()).is_some() {
+                self.vanilla_loaded_metadata.remove(pos);
+                duplicate.insert(*pos);
+            }
+        }
+    }
+    /// Replace position-only originals with the data attached to the current
+    /// incarnation before serializing the authoritative chunk.
+    #[cfg(feature = "ae2-lab")]
+    pub fn project_vanilla_metadata(&self,chunk:&mut crate::chunk::Chunk) {
+        use std::sync::Arc;
+        let positions:FxHashSet<_>=chunk.block_entities.iter().filter(|(_,entity)|vanilla_metadata_entity(entity)).map(|(pos,_)|*pos).collect();
+        if positions.is_empty(){return}
+        let owned:Vec<_>=positions.iter().filter_map(|pos|self.vanilla_metadata(pos).map(|tag|(*pos,tag.clone()))).collect();
+        if chunk.saved.is_none() && owned.is_empty(){return}
+        let saved=Arc::make_mut(chunk.saved.get_or_insert_with(||Arc::new(crate::save::ChunkExtras::default())));
+        saved.block_entity_sources.retain(|(pos,_)|!positions.contains(pos));
+        saved.block_entity_sources.extend(owned);
+        saved.rolled_loot.retain(|roll|!positions.contains(&roll.pos) || self.vanilla_metadata(&roll.pos)
+            .and_then(|tag|crate::save::text(tag.get("LootTable"))).as_deref()==Some(roll.table.as_str()));
     }
     /// Whether the ticking table has been built.
     pub fn has_states(&self) -> bool {
@@ -494,6 +557,8 @@ impl BlockEntities {
     /// `LevelChunk.removeBlockEntity`: the block entity and its slot.
     pub fn remove(&mut self, pos: &Pos) -> Option<BlockEntity> {
         self.cancel(pos);
+        #[cfg(feature = "ae2-lab")]
+        self.vanilla_metadata.remove(pos);
         let incarnation = self.incarnations.remove(pos);
         let removed = self.map.remove(pos);
         #[cfg(feature = "ae2-lab")]
@@ -549,11 +614,15 @@ impl BlockEntities {
         #[cfg(feature = "ae2-lab")]
         let journal_enabled = self.ae2_journal_enabled();
         let (live, pending, freed, incarnations) = (&mut self.live, &mut self.pending, &mut self.freed, &mut self.incarnations);
+        #[cfg(feature = "ae2-lab")]
+        let metadata=&mut self.vanilla_metadata;
         self.map.retain(|p, e| {
             let kept = keep(p, e);
             if !kept {
                 *freed |= live.remove(p).is_some();
                 pending.remove(p);
+                #[cfg(feature = "ae2-lab")]
+                metadata.remove(p);
                 let incarnation = incarnations.remove(p);
                 #[cfg(feature = "ae2-lab")]
                 if journal_enabled {
@@ -580,6 +649,8 @@ impl BlockEntities {
         }
         self.map.clear();
         self.incarnations.clear();
+        #[cfg(feature = "ae2-lab")]
+        {self.vanilla_metadata.clear();self.vanilla_loaded_metadata.clear();}
         self.tickers.clear();
         self.live.clear();
         self.added.clear();
@@ -604,6 +675,10 @@ impl BlockEntities {
             let old = self.map.insert(p, e);
             self.new_incarnation(p);
             #[cfg(feature = "ae2-lab")]
+            if let Some(raw)=self.vanilla_loaded_metadata.remove(&p) {
+                self.remember_vanilla_metadata(p,&raw);
+            }
+            #[cfg(feature = "ae2-lab")]
             if self.ae2_journal_enabled() {
                 if let (Some(incarnation), Some(entity @ BlockEntity::Ae2(_))) = (previous, old.as_ref()) {
                     self.record_ae2(p, Ae2MutationKind::EntityRemoved { incarnation, entity: entity.clone(), bulk_unload: false });
@@ -625,6 +700,8 @@ impl BlockEntities {
         for p in order {
             self.add(p);
         }
+        #[cfg(feature = "ae2-lab")]
+        self.vanilla_loaded_metadata.clear();
     }
     /// `LevelChunk.setBlockState` on a block entity's position, from state
     /// `old` to `new`: a ticker made, kept or dropped.
@@ -674,6 +751,8 @@ impl BlockEntities {
             if !self.map.contains_key(&pos) {
                 self.incarnations.remove(&pos);
                 #[cfg(feature = "ae2-lab")]
+                self.vanilla_metadata.remove(&pos);
+                #[cfg(feature = "ae2-lab")]
                 if let Some((incarnation, entity)) = self.ae2_taken.remove(&pos) {
                     self.record_ae2(pos, Ae2MutationKind::EntityRemoved { incarnation, entity, bulk_unload: false });
                 }
@@ -702,6 +781,42 @@ impl BlockEntities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn vanilla_metadata_follows_loaded_incarnation_and_never_a_replacement() {
+        use horizon_world::nbt::Tag;
+        use std::sync::Arc;
+        let p=(2,64,3);
+        let raw=Tag::compound([
+            ("id",Tag::String("minecraft:shulker_box".into())),
+            ("CustomName",Tag::compound([("text",Tag::String("Vault".into())),("color",Tag::String("red".into()))])),
+            ("lock",Tag::compound([("sentinel",Tag::Int(7))])),
+        ]);
+        let mut chunk=crate::chunk::Chunk::empty(0,0);
+        chunk.block_entities.push((p,BlockEntity::Chest(vec![None;27])));
+        chunk.saved=Some(Arc::new(crate::save::ChunkExtras {block_entity_sources:vec![(p,raw.clone())],..Default::default()}));
+        let mut b=level();
+        b.prepare_vanilla_metadata(&chunk);
+        b.load_chunk(std::mem::take(&mut chunk.block_entities));
+        assert_eq!(b.vanilla_metadata(&p),Some(&raw));
+        let e=b.take(&p).unwrap();b.put(p,e);
+        assert_eq!(b.vanilla_metadata(&p),Some(&raw),"taking for a tick keeps the same owner");
+        chunk.block_entities.push((p,b.get(&p).unwrap().clone()));
+        b.project_vanilla_metadata(&mut chunk);
+        assert_eq!(chunk.saved.as_ref().unwrap().block_entity_sources,vec![(p,raw.clone())]);
+        b.remove(&p);
+        b.insert(p,BlockEntity::Chest(vec![None;27]));
+        assert!(b.vanilla_metadata(&p).is_none(),"the new block must not inherit the old name or lock");
+        chunk.block_entities[0].1=b.get(&p).unwrap().clone();
+        b.project_vanilla_metadata(&mut chunk);
+        assert!(chunk.saved.as_ref().unwrap().block_entity_sources.is_empty());
+        b.remember_vanilla_metadata(p,&raw);
+        b.retain(|_,_|false);
+        assert!(b.vanilla_metadata(&p).is_none(),"chunk unload removes the old owner");
+        b.load_chunk(vec![(p,BlockEntity::Chest(vec![None;27]))]);
+        assert!(b.vanilla_metadata(&p).is_none(),"a later unrelated load is fresh");
+    }
 
     fn hopper() -> BlockEntity {
         BlockEntity::Chest(vec![None; 5])

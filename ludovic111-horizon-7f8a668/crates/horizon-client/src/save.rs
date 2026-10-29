@@ -675,6 +675,34 @@ fn merge_block_entity(original: &Tag, loaded: &Tag, current: &Tag) -> Tag {
     }
     merged
 }
+/// Current modeled data plus the raw components attached to this incarnation.
+/// A rich source name is retained only while its plain value still matches.
+#[cfg(feature = "ae2-lab")]
+pub fn live_vanilla_block_entity(
+    pos:(i32,i32,i32),
+    entity:&crate::containers::BlockEntity,
+    block:&str,
+    name:Option<&str>,
+    original:Option<&Tag>,
+) -> Tag {
+    let mut current=encode_block_entity(pos,entity,block);
+    let original=original.filter(|tag|crate::block_entity_nbt::id(tag)==crate::block_entity_nbt::id(&current));
+    if let (Some(name),Tag::Compound(map))=(name,&mut current) {
+        let source=original.and_then(|tag|tag.get("CustomName"))
+            .filter(|raw|crate::entity_nbt::name_text(raw).plain()==name);
+        map.insert("CustomName".into(),source.cloned().unwrap_or_else(||Tag::String(name.into())));
+    }
+    let Some(original)=original else{return current};
+    let loaded=decode_block_entity(original).map_or_else(
+        ||current.clone(),
+        |(saved_pos,saved)|encode_block_entity(saved_pos,&saved,block),
+    );
+    let mut merged=merge_block_entity(original,&loaded,&current);
+    if name.is_none() && let Tag::Compound(map)=&mut merged {
+        map.remove(&"CustomName".into());
+    }
+    merged
+}
 /// `BannerBlockEntity.loadAdditional` (and the `components` a block entity keeps).
 pub fn decode_banner(tag: &Tag) -> crate::containers::Banner {
     crate::containers::Banner {
@@ -1275,7 +1303,17 @@ pub fn encode_with(
                 .filter(|tag| {
                     crate::block_entity_nbt::id(tag) == crate::block_entity_nbt::id(&current)
                 });
-            let merged = match source {
+            #[cfg(feature = "ae2-lab")]
+            if let (Some((_,name)),Some(raw),Tag::Compound(map))=(
+                chunk.block_names.iter().find(|(q,_)|q==p),
+                source.and_then(|tag|tag.get("CustomName")),
+                &mut current,
+            ) {
+                if crate::entity_nbt::name_text(raw).plain()==name.as_str() {
+                    map.insert("CustomName".into(),raw.clone());
+                }
+            }
+            let mut merged = match source {
                 Some(original) => {
                     let loaded = decode_block_entity(original).map_or_else(
                         || current.clone(),
@@ -1285,6 +1323,14 @@ pub fn encode_with(
                 }
                 None => current,
             };
+            #[cfg(feature = "ae2-lab")]
+            if matches!(e,crate::containers::BlockEntity::Chest(_) | crate::containers::BlockEntity::Furnace(_)
+                | crate::containers::BlockEntity::Brewing(_) | crate::containers::BlockEntity::Crafter(_)
+                | crate::containers::BlockEntity::Beacon(_))
+                && !chunk.block_names.iter().any(|(q,_)|q==p)
+                && let Tag::Compound(map)=&mut merged {
+                map.remove(&"CustomName".into());
+            }
             let mut saved = crate::block_entity_nbt::canonical(&merged).unwrap_or(merged);
             if let Some(r) = extras.and_then(|x| x.rolled_loot.iter().find(|r| r.pos == *p))
                 && let Tag::Compound(map) = &mut saved
@@ -1546,7 +1592,11 @@ fn decode_column(
             }
             match decode_block_entity(e) {
                 Some(mut be) => {
-                    if let Some(name) = text(e.get("CustomName")) {
+                    #[cfg(feature = "ae2-lab")]
+                    let name=e.get("CustomName").map(|raw|crate::entity_nbt::name_text(raw).plain());
+                    #[cfg(not(feature = "ae2-lab"))]
+                    let name=text(e.get("CustomName"));
+                    if let Some(name) = name {
                         chunk.block_names.push((be.0, name));
                     }
                     if let Some(rolled) = roll_loaded_loot(&chunk, biomes, e, &mut be) {
@@ -3978,6 +4028,32 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn vanilla_block_entity_raw_components_follow_live_name_changes() {
+        use super::*;
+        use crate::containers::BlockEntity;
+        let p=(2,64,3);
+        let styled=Tag::compound([("text",Tag::String("Vault".into())),("color",Tag::String("red".into()))]);
+        let lock=Tag::compound([("sentinel",Tag::Int(7))]);
+        let source=Tag::compound([
+            ("id",Tag::String("minecraft:shulker_box".into())),
+            ("x",Tag::Int(p.0)),("y",Tag::Int(p.1)),("z",Tag::Int(p.2)),
+            ("CustomName",styled.clone()),("lock",lock.clone()),
+        ]);
+        let entity=BlockEntity::Chest(vec![None;27]);
+        let same=live_vanilla_block_entity(p,&entity,"minecraft:shulker_box",Some("Vault"),Some(&source));
+        assert_eq!(same.get("CustomName"),Some(&styled));
+        assert_eq!(same.get("lock"),Some(&lock));
+        let renamed=live_vanilla_block_entity(p,&entity,"minecraft:shulker_box",Some("New"),Some(&source));
+        assert_eq!(renamed.get("CustomName"),Some(&Tag::String("New".into())));
+        let cleared=live_vanilla_block_entity(p,&entity,"minecraft:shulker_box",None,Some(&source));
+        assert_eq!(cleared.get("CustomName"),None);
+        assert_eq!(cleared.get("lock"),Some(&lock));
+        let replacement=live_vanilla_block_entity(p,&entity,"minecraft:shulker_box",None,None);
+        assert_eq!(replacement.get("lock"),None);
+    }
+
     #[test]
     fn corrupt_saved_start_fails_neighbor_generation_without_disk_writes_then_recovers() {
         use super::*;

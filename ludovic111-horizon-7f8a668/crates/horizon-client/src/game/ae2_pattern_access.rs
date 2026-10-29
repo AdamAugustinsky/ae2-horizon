@@ -31,7 +31,7 @@ fn display_lines(rows:&[Row])->Vec<DisplayLine> {
     lines
 }
 pub(super) struct GuestPatternAccess {
-    window:i32,state:i32,pos:(i32,i32,i32),face:String,dim:String,page:usize,
+    window:i32,state:i32,pos:(i32,i32,i32),face:String,dim:String,page:usize,terminal:OwnerIdentity,
     search:String,filter:u8,rows:Vec<Row>,pinned:Vec<Owner>,menu:Menu,refresh:u8,
     sent_views:std::collections::VecDeque<(i32,Vec<Option<OwnerIdentity>>)>,
 }
@@ -89,6 +89,14 @@ impl Game<'_> {
             }
         };
         Some(OwnerIdentity{owner,host,part})
+    }
+    /// A menu belongs to the original host and face-part incarnation, even
+    /// if another Pattern Access terminal is installed at the same address.
+    fn access_terminal_identity(&self,pos:(i32,i32,i32),face:&str)->Option<OwnerIdentity> {
+        self.access_filter(pos,face)?;
+        let face=["east","west","up","down","south","north"].iter().position(|name|*name==face)? as u8;
+        let host=self.ae2_local_address(pos)?;
+        self.access_owner_identity(Owner::Part(PartAddress{host,face}))
     }
     fn access_machine(&self,owner:Owner)->Option<Machine> {
         match owner {
@@ -221,6 +229,7 @@ impl Game<'_> {
     }
     pub(super) fn lan_open_pattern_access(&mut self,host:&mut LanHost,conn:u32,pos:(i32,i32,i32),face:&str)->bool {
         let Some(filter)=self.access_filter(pos,face) else{return false};
+        let Some(terminal)=self.access_terminal_identity(pos,face) else{return false};
         self.lan_pattern_access_closed(host,conn,None);
         self.lan_ae2_terminal_closed(host,conn,None);self.lan_ae2_machine_closed(host,conn,None);
         self.lan_ae2_portable_closed(host,conn,None);self.lan_ae2_network_tool_closed(host,conn,None);self.lan_ae2_anchor_closed(host,conn,None);
@@ -230,11 +239,14 @@ impl Game<'_> {
         host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload {
             channel:"ae2:bus_ack_enable".into(),data:window.to_be_bytes().to_vec(),
         }));
-        host.play.entry(conn).or_default().ae2_pattern_access=Some(GuestPatternAccess{window,state:0,pos,face:face.into(),dim:self.dim.id().into(),page:0,search:String::new(),filter,rows:Vec::new(),pinned:Vec::new(),menu:Menu::new(Kind::Chest(6)),refresh:0,sent_views:std::collections::VecDeque::new()});
+        host.play.entry(conn).or_default().ae2_pattern_access=Some(GuestPatternAccess{window,state:0,pos,face:face.into(),dim:self.dim.id().into(),page:0,terminal,search:String::new(),filter,rows:Vec::new(),pinned:Vec::new(),menu:Menu::new(Kind::Chest(6)),refresh:0,sent_views:std::collections::VecDeque::new()});
         self.lan_send_pattern_access(host,conn);true
     }
     fn lan_send_pattern_access(&mut self,host:&mut LanHost,conn:u32) {
-        let Some((window,state,pos,face,page,search,filter,pinned))=host.play.get(&conn).and_then(|p|p.ae2_pattern_access.as_ref()).map(|s|(s.window,s.state,s.pos,s.face.clone(),s.page,s.search.clone(),s.filter,s.pinned.clone())) else{return};
+        let Some((window,state,pos,face,page,search,filter,pinned,terminal))=host.play.get(&conn).and_then(|p|p.ae2_pattern_access.as_ref()).map(|s|(s.window,s.state,s.pos,s.face.clone(),s.page,s.search.clone(),s.filter,s.pinned.clone(),s.terminal)) else{return};
+        if self.access_terminal_identity(pos,&face)!=Some(terminal) {
+            self.lan_pattern_access_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));return;
+        }
         let (rows,pins)=if self.ae2_part_online(pos,&face){self.access_rows(pos,&search,filter,&pinned)} else{(Vec::new(),Vec::new())};
         let lines=display_lines(&rows);let max_scroll=lines.len().saturating_sub(6);let page=page.min(max_scroll);
         let mut items=vec![None;54];let mut layout=Vec::new();let mut owners=vec![None;6];
@@ -255,15 +267,21 @@ impl Game<'_> {
         host.hub.send_to(conn,&C::ContainerSetContent(play::ContainerSetContent{container:window,state,items:wire,carried}));
     }
     pub(super) fn lan_pattern_access_search(&mut self,host:&mut LanHost,conn:u32,value:&str)->bool {
-        let Some(s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.as_mut()) else{return false};
+        let Some((pos,face,dim,terminal,window))=host.play.get(&conn).and_then(|p|p.ae2_pattern_access.as_ref()).map(|s|(s.pos,s.face.clone(),s.dim.clone(),s.terminal,s.window)) else{return false};
+        let valid=dim==self.dim.id() && self.access_terminal_identity(pos,&face)==Some(terminal)
+            && host.hub.guests.iter().any(|g|g.conn==conn && host.hub.here(g) && g.within_block_range([pos.0,pos.1,pos.2],4.0));
+        if !valid {self.lan_pattern_access_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));return true;}
+        let Some(s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.as_mut()) else{return true};
         s.search=value.chars().take(128).collect();s.page=0;self.lan_send_pattern_access(host,conn);true
     }
     pub(super) fn lan_pattern_access_click(&mut self,host:&mut LanHost,conn:u32,p:&play::ContainerClick)->bool {
         let Some(mut s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.take()) else{return false};
         if p.container!=s.window {host.play.entry(conn).or_default().ae2_pattern_access=Some(s);return false;}
         let Some(gi)=host.hub.guests.iter().position(|g|g.conn==conn && host.hub.here(g)) else{return true};
-        if s.dim!=self.dim.id() || !host.hub.guests[gi].within_block_range([s.pos.0,s.pos.1,s.pos.2],4.0) {
-            host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:s.window}));return true;
+        if s.dim!=self.dim.id() || !host.hub.guests[gi].within_block_range([s.pos.0,s.pos.1,s.pos.2],4.0)
+            || self.access_terminal_identity(s.pos,&s.face)!=Some(s.terminal) {
+            let window=s.window;host.play.entry(conn).or_default().ae2_pattern_access=Some(s);
+            self.lan_pattern_access_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));return true;
         }
         let (rows,_)=if self.ae2_part_online(s.pos,&s.face){self.access_rows(s.pos,&s.search,s.filter,&s.pinned)}else{(Vec::new(),Vec::new())};
         let stale_target=(0..54).contains(&p.slot) && {
@@ -322,11 +340,12 @@ impl Game<'_> {
         if let Some(gi)=host.hub.guests.iter().position(|g|g.conn==conn){self.guest_carried_back(host,gi);}true
     }
     pub(super) fn lan_refresh_pattern_access(&mut self,host:&mut LanHost) {
-        let viewers:Vec<_>=host.play.iter().filter_map(|(&id,p)|p.ae2_pattern_access.as_ref().map(|s|(id,s.pos,s.face.clone(),s.dim.clone(),s.window))).collect();
-        for (conn,pos,face,dim,window) in viewers {
+        let viewers:Vec<_>=host.play.iter().filter_map(|(&id,p)|p.ae2_pattern_access.as_ref().map(|s|(id,s.pos,s.face.clone(),s.dim.clone(),s.window,s.terminal))).collect();
+        for (conn,pos,face,dim,window,terminal) in viewers {
             let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn && host.hub.here(g)) else{continue;};
             let filter=self.access_filter(pos,&face);
-            if dim!=self.dim.id() || !g.within_block_range([pos.0,pos.1,pos.2],4.0) || filter.is_none() {
+            if dim!=self.dim.id() || !g.within_block_range([pos.0,pos.1,pos.2],4.0) || filter.is_none()
+                || self.access_terminal_identity(pos,&face)!=Some(terminal) {
                 self.lan_pattern_access_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));
             } else if let Some(s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.as_mut()) {
                 if filter!=Some(s.filter) {s.filter=filter.unwrap();s.page=0;s.pinned.clear();self.lan_send_pattern_access(host,conn);continue;}

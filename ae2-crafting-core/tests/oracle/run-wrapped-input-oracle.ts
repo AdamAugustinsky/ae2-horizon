@@ -25,6 +25,8 @@ for (const [marker, path, signature] of [
   ['// ACTUAL_FROM_ITEM', `${root}api/stacks/GenericStack.java`, '    public static GenericStack fromItemStack('],
   ['// ACTUAL_UNWRAP_ITEM', `${root}api/stacks/GenericStack.java`, '    public static GenericStack unwrapItemStack('],
   ['// ACTUAL_CRAFTING_INPUTS', `${root}crafting/pattern/AECraftingPattern.java`, '    public static List<GenericStack> getCraftingInputs('],
+  ['// ACTUAL_CONDENSE', `${root}crafting/pattern/AEPatternHelper.java`, '    public static List<GenericStack> condenseStacks('],
+  ['// ACTUAL_INPUT_CONSTRUCTOR', `${root}crafting/pattern/AECraftingPattern.java`, '        private Input('],
 ] as const) {
   assert(template.includes(marker), `Missing insertion marker ${marker}`);
   template = template.replace(marker, extract(path, signature));

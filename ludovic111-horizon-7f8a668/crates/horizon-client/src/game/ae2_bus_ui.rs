@@ -129,6 +129,169 @@ impl Game<'_> {
         if dirty {self.world.modified.insert((pos.0 >> 4, pos.2 >> 4));}
         true
     }
+    pub(super) fn ae2_local_energy_focused(&self)->bool {
+        self.ae2_local_bus_open() && self.ae2_local_energy.as_ref().is_some_and(|field|field.focused)
+    }
+    fn ae2_apply_local_energy(&mut self) {
+        if !self.ae2_local_bus_valid(){return;}
+        let Some(text)=self.ae2_local_energy.as_ref().map(|field|field.value.clone()) else{return};
+        let Some((pos,face))=self.ae2_local_bus.as_ref().map(|s|(s.pos,s.face)) else{return};
+        let Some(mut data)=self.bus_ui_read(pos,face) else{return};
+        let Ok(mut state)=super::ae2_emitter::energy_emitter_read(&data) else{return};
+        if let Some(value)=super::ae2_number_entry::number_value(&text,1,0,i64::MAX,'.') {
+            if value!=state.threshold {
+                state.threshold=value;
+                if super::ae2_emitter::energy_emitter_store(&mut data,&state).is_ok() && self.bus_ui_store_with_dirty(pos,face,data,false) {
+                    if let Some(host)=self.ae2_local_address(pos) {self.ae2_energy_emitter_threshold_callback(super::ae2_parts::PartAddress{host,face});}
+                }
+            }
+        }
+        if let Some(session)=self.ae2_local_bus.as_mut() {
+            if let Some(edit)=session.energy_edit.as_mut(){edit.text=text.clone();}
+            if session.emitter_edit.is_some(){session.emitter_edit=Some(text);}
+        }
+    }
+    pub(super) fn ae2_local_energy_input(&mut self,text:Option<&str>,key:Option<winit::keyboard::KeyCode>) {
+        if !self.ae2_local_bus_valid(){return;}
+        let ctrl=self.has_control_down();let shift=self.has_shift_down();
+        if let Some(field)=self.ae2_local_energy.as_mut(){if !key.is_some_and(|key|field.key(key,ctrl,shift)){if let Some(text)=text{field.insert_text(text);}}}
+        self.ae2_apply_local_energy();
+    }
+    pub(super) fn ae2_local_energy_shortcut(&mut self,shortcut:horizon_client::clipboard::EditShortcut) {
+        if let Some(field)=self.ae2_local_energy.as_mut(){field.shortcut(shortcut,&mut self.clipboard);}
+        self.ae2_apply_local_energy();
+    }
+    pub(super) fn ae2_local_energy_click_field(&mut self,ox:f32,oy:f32,right:bool)->bool {
+        let (mx,my)=self.cursor;let hit=!right && mx>=ox+48.0 && mx<ox+114.0 && my>=oy+55.0 && my<oy+67.0;let shift=self.has_shift_down();
+        let Some(field)=self.ae2_local_energy.as_mut() else{return false};field.focused=hit;
+        if hit {field.x=ox+48.0;field.y=oy+55.0;field.width=66.0;field.height=12.0;field.click(&self.gui.atlas,mx,shift,false);}hit
+    }
+    pub(super) fn ae2_local_energy_draw(&self,batch:&mut horizon_client::hud::HudBatch,ox:f32,oy:f32) {
+        if let Some(mut field)=self.ae2_local_energy.clone(){field.x=ox+48.0;field.y=oy+55.0;field.width=66.0;field.height=12.0;field.draw(batch,&self.gui.atlas,None);}
+    }
+    pub(super) fn ae2_local_bus_title(&self)->&'static str {
+        match self.ae2_local_bus.as_ref().and_then(|s|self.bus_ui_read(s.pos,s.face)).and_then(|data|field(&data,"id")).as_deref() {
+            Some("ae2:level_emitter")=>"AE2 Level Emitter",Some("ae2:energy_level_emitter")=>"AE2 Energy Level Emitter",_=>"AE2 Bus"
+        }
+    }
+    /// Replay emitter physical slots and player gestures through the same
+    /// persistent native Menu used by the server, committing effects only
+    /// after the face-owned upgrade inventory is accepted.
+    fn ae2_local_emitter_physical(&mut self,session:&mut GuestBus,mut data:Compound,slot:Option<usize>,button:i32,input:Input)->bool {
+        let storage=field(&data,"id").as_deref()==Some("ae2:level_emitter");
+        let mut state=if storage {super::ae2_emitter::emitter_read(&data).ok()}else{None};
+        if storage && state.is_none(){return false;}
+        let before_random=self.world.random.clone();
+        let result={
+            let env=self.menu_env();let menu=&mut session.menu;
+            for (i,item) in self.inventory.iter().enumerate(){menu.set_player_item(i,item.clone());}
+            for (i,slot) in [39,38,37,36].into_iter().enumerate(){menu.set_player_item(slot,self.armor[i].clone());}
+            menu.set_player_item(40,self.offhand.clone());menu.selected=self.selected;menu.creative=self.creative;
+            menu.carried=self.carried.clone();
+            if let Some(state)=state.as_ref(){menu.set_slot(&env,36,state.upgrades[0].clone());}
+            menu.recipe_durability_rng=Some(before_random.clone());
+            let clicked=menu.click(&env,slot.map_or(-999,|slot|slot as i32),button,input);
+            let random=menu.recipe_durability_rng.take();
+            let dropped=std::mem::take(&mut menu.dropped);let equipped=std::mem::take(&mut menu.equipped);
+            menu.drops.clear();menu.crafted.clear();
+            clicked.map(|()|{
+                let inventory=(0..36).map(|i|menu.player_item(i).cloned()).collect::<Vec<_>>();
+                let armor=std::array::from_fn(|i|menu.player_item([39,38,37,36][i]).cloned());
+                (inventory,armor,menu.player_item(40).cloned(),menu.carried.take(),menu.slot(36).cloned(),dropped,equipped,random)
+            })
+        };
+        let Ok((inventory,armor,offhand,carried,upgrade,dropped,equipped,random))=result else {session.menu=emitter_session_menu(&data);return false};
+        let mut upgrade_changed=false;
+        if let Some(state)=state.as_mut() {
+            if state.upgrades[0]!=upgrade {
+                state.upgrades[0]=upgrade;upgrade_changed=true;
+                if super::ae2_emitter::emitter_store(&mut data,state).is_err() || !self.bus_ui_store(session.pos,session.face,data.clone()) {
+                    session.menu=emitter_session_menu(&data);return false;
+                }
+            }
+            if emitter_card(state,"ae2:crafting_card") {session.emitter_edit=None;}
+        }
+        self.inventory=inventory;self.armor=armor;self.offhand=offhand;self.carried=carried;
+        if let Some(random)=random {self.world.random=random;}
+        for stack in dropped {self.player_drop(stack);}
+        for (slot,stack) in equipped {self.player_equipped(slot,stack.as_ref());}
+        if upgrade_changed {self.emitter_ui_provider_changed(session.pos,session.face);}
+        true
+    }
+    /// Open the actual clicked bus part and bind its owner identity for the
+    /// lifetime of this in-frame screen.
+    pub(super) fn ae2_open_local_bus(&mut self,pos:Pos,face:[i32;3])->bool {
+        if self.remote.is_some(){return false;}
+        let face=match face {[1,0,0]=>0,[-1,0,0]=>1,[0,1,0]=>2,[0,-1,0]=>3,[0,0,1]=>4,[0,0,-1]=>5,_=>return false};
+        let Some(data)=self.bus_ui_read(pos,face) else{return false};
+        let kind=field(&data,"id").unwrap_or_default();let energy=kind=="ae2:energy_level_emitter";
+        let emitter=energy || kind=="ae2:level_emitter";
+        let Some(signature)=stable(&data) else{return false};let Some(owner_identity)=self.bus_ui_identity(pos,&data) else{return false};
+        let energy_edit=if energy {let Ok(state)=super::ae2_emitter::energy_emitter_read(&data) else{return false};
+            let text=energy_entry_text(state.threshold);let mut field=horizon_client::ui::EditBox::new(0.0,0.0,66.0,12.0);
+            field.max_length=16;field.set_value(&text);field.highlight=0;field.focused=true;self.ae2_local_energy=Some(field);
+            Some(EnergyEdit{token:0,text})
+        }else{self.ae2_local_energy=None;None};
+        self.container=Some(pos);self.ae2_local_bus=Some(GuestBus{
+            window:0,state:0,pos,face,page:0,dim:self.dim.id().into(),signature,
+            menu:if emitter {emitter_session_menu(&data)}else{Menu::new(Kind::Chest(6))},drag:None,fake_revisions:Default::default(),
+            owner_identity,emitter_identity:emitter.then_some(owner_identity),emitter_edit:None,energy_edit,
+        });
+        self.screen=super::Screen::Inventory;self.capture(false);self.right=false;true
+    }
+    pub(super) fn ae2_local_bus_open(&self)->bool {
+        self.remote.is_none() && self.ae2_local_bus.as_ref().is_some_and(|s|self.container==Some(s.pos))
+    }
+    pub(super) fn ae2_local_bus_valid(&self)->bool {
+        self.ae2_local_bus_open() && self.ae2_local_bus.as_ref().is_some_and(|s|
+            s.dim==self.dim.id() && self.bus_ui_read(s.pos,s.face).is_some_and(|data|self.bus_ui_identity(s.pos,&data)==Some(s.owner_identity))
+                && self.eye_position().is_some_and(|eye|horizon_client::lan::guest::within_block_range(eye,self.reach()+4.0,[s.pos.0,s.pos.1,s.pos.2])))
+    }
+    pub(super) fn ae2_local_bus_slot_view(&self,slot:usize)->Option<ItemStack> {
+        if !self.ae2_local_bus_valid(){return None;}let session=self.ae2_local_bus.as_ref()?;let data=self.bus_ui_read(session.pos,session.face)?;
+        let items=match field(&data,"id").as_deref() {
+            Some("ae2:level_emitter")=>self.ae2_emitter_menu_items(&data,session.emitter_edit.as_deref()),
+            Some("ae2:energy_level_emitter")=>self.ae2_energy_emitter_menu_items(&data,session.emitter_edit.as_deref()),
+            _=>self.ae2_bus_menu_items(&data,session.page),
+        }?;
+        items.get(slot.checked_sub(300)?).cloned().flatten()
+    }
+    pub(super) fn ae2_local_bus_fake_slot(&self,slot:usize)->bool {
+        if !self.ae2_local_bus_valid() || !(300..336).contains(&slot){return false;}
+        self.ae2_local_bus.as_ref().and_then(|s|self.bus_ui_read(s.pos,s.face).and_then(|data|match field(&data,"id").as_deref() {
+            Some("ae2:level_emitter")=>Some(slot==300 && s.emitter_edit.is_none()),
+            Some("ae2:energy_level_emitter")=>Some(false),
+            _=>super::ae2_buses::bus_state(&data).ok().map(|state|s.page*36+slot-300<state.slots()),
+        })).unwrap_or(false)
+    }
+    pub(super) fn ae2_local_bus_drag(&mut self,slot:usize,single:bool) {
+        if !self.ae2_local_bus_fake_slot(slot) || self.carried.is_none(){return;}
+        let actual=self.carried.clone();if single {if let Some(stack)=self.carried.as_mut(){stack.count=1;}}
+        self.ae2_local_bus_click(Some(slot),0,Input::Pickup);self.carried=actual;
+    }
+    pub(super) fn ae2_local_bus_click(&mut self,slot:Option<usize>,button:i32,input:Input) {
+        if !self.ae2_local_bus_valid(){self.close_container();self.screen=super::Screen::Playing;self.capture(true);return;}
+        if input==Input::Clone && slot.is_some_and(|slot|self.slot_view(slot).is_some_and(|item|item.item.as_ref()=="ae2:wrapped_generic_stack")){return;}
+        let (button,input)=if slot.is_some_and(|slot|self.ae2_local_bus_fake_slot(slot)) {
+            if matches!(input,Input::Swap|Input::Throw) && self.carried.is_some(){return;}
+            if input==Input::Swap && button!=40{return;}
+            if input==Input::QuickMove {(button,Input::Pickup)}else if input==Input::Pickup {(button,input)}else{(i32::from(button==1),Input::Pickup)}
+        }else{(button,input)};
+        let Some(mut session)=self.ae2_local_bus.take() else{return};let Some(data)=self.bus_ui_read(session.pos,session.face) else{return};
+        let wire=match slot {Some(slot @ 300..=353)=>Some(slot-300),Some(slot @ 0..=8)=>Some(81+slot),Some(slot @ 9..=35)=>Some(54+slot-9),_=>None};
+        match field(&data,"id").as_deref() {
+            Some("ae2:level_emitter")=>if !self.ae2_emitter_config_action(&mut session,data.clone(),wire,button,input) {
+                self.ae2_local_emitter_physical(&mut session,data,wire,button,input);
+            },
+            Some("ae2:energy_level_emitter")=>{
+                let (handled,echo)=self.ae2_energy_emitter_config_action(&mut session,data.clone(),wire,button,input);
+                if !handled {self.ae2_local_emitter_physical(&mut session,data,wire,button,input);}
+                if let Some((_,text))=echo {if let Some(field)=self.ae2_local_energy.as_mut(){field.set_value(&text);field.focused=true;}}
+            },
+            _=>{self.ae2_bus_action(&mut session,data,wire.unwrap_or(usize::MAX),button,input);}
+        }
+        self.ae2_local_bus=Some(session);
+    }
     pub(super) fn lan_open_ae2_bus(
         &mut self,
         host: &mut LanHost,
@@ -192,31 +355,8 @@ impl Game<'_> {
         if let Some(edit)=energy_edit {Self::energy_payload(host,conn,window,edit.token,"open",&edit.text);}
         true
     }
-    fn lan_send_ae2_bus(&mut self, host: &mut LanHost, conn: u32) {
-        let Some((pos, face, window, page)) = host
-            .play
-            .get(&conn)
-            .and_then(|p| p.ae2_bus.as_ref())
-            .map(|s| (s.pos, s.face, s.window, s.page))
-        else {
-            return;
-        };
-        let Some(data) = self.bus_ui_read(pos, face) else {
-            self.lan_ae2_bus_closed(host, conn, None);
-            host.hub.send_to(
-                conn,
-                &C::ContainerClose(play::ContainerClose { container: window }),
-            );
-            return;
-        };
-        if field(&data,"id").as_deref()==Some("ae2:energy_level_emitter") {self.lan_send_ae2_energy_emitter(host,conn);return;}
-        if field(&data,"id").as_deref()==Some("ae2:level_emitter") {self.lan_send_ae2_emitter(host,conn);return;}
-        let Ok(state) = super::ae2_buses::bus_state(&data) else {
-            return;
-        };
-        let Some(g) = host.hub.guests.iter().find(|g| g.conn == conn) else {
-            return;
-        };
+    fn ae2_bus_menu_items(&self,data:&Compound,page:usize)->Option<Vec<Option<ItemStack>>> {
+        let state=super::ae2_buses::bus_state(data).ok()?;
         let mut items = vec![None; 54];
         for i in 0..36 {
             let slot = page * 36 + i;
@@ -282,6 +422,34 @@ impl Game<'_> {
                 matches!(data.get(&"craft_only".into()), Some(Tag::Byte(1)))
             ));
         }
+        Some(items)
+    }
+    fn lan_send_ae2_bus(&mut self, host: &mut LanHost, conn: u32) {
+        let Some((pos, face, window, page)) = host
+            .play
+            .get(&conn)
+            .and_then(|p| p.ae2_bus.as_ref())
+            .map(|s| (s.pos, s.face, s.window, s.page))
+        else {
+            return;
+        };
+        let Some(data) = self.bus_ui_read(pos, face) else {
+            self.lan_ae2_bus_closed(host, conn, None);
+            host.hub.send_to(
+                conn,
+                &C::ContainerClose(play::ContainerClose { container: window }),
+            );
+            return;
+        };
+        if field(&data,"id").as_deref()==Some("ae2:energy_level_emitter") {self.lan_send_ae2_energy_emitter(host,conn);return;}
+        if field(&data,"id").as_deref()==Some("ae2:level_emitter") {self.lan_send_ae2_emitter(host,conn);return;}
+        let Ok(state) = super::ae2_buses::bus_state(&data) else {
+            return;
+        };
+        let Some(g) = host.hub.guests.iter().find(|g| g.conn == conn) else {
+            return;
+        };
+        let Some(mut items)=self.ae2_bus_menu_items(&data,page) else{return;};
         items.extend((9..36).chain(0..9).map(|i| g.inventory[i].clone()));
         let carried = g.carried.clone();
         let fake:Vec<u8>=(0..state.slots().saturating_sub(page*36).min(36)).map(|slot|slot as u8).collect();
@@ -305,6 +473,376 @@ impl Game<'_> {
                 carried,
             }),
         );
+    }
+    /// Shared source bus ghost/config action. The actor's carried stack is
+    /// authoritative in both the server and in-frame paths.
+    fn ae2_bus_config_action(&mut self,session:&mut GuestBus,mut data:Compound,slot:usize,button:i32,input:Input)->bool {
+        if !(slot<36 || (41..54).contains(&slot)) {return false;}
+        if input!=Input::Pickup || (!(0..=1).contains(&button) && !(matches!(button,2|3) && slot<36 && self.carried.is_some())) {return true;}
+        let kind=field(&data,"id").unwrap_or_default();
+        let before=self.carried.clone();
+        let Ok(mut state)=super::ae2_buses::bus_state(&data) else{return true;};
+        let mut changed=false;
+        if slot < 36 {
+            let index = session.page * 36 + slot;
+            if index < state.slots() {
+                let held = self.carried.as_ref();
+                let wrapped=held.map(|item|super::ae2_encoding::wrapped_ghost(item,&|id,fluid|fluid||self.res.items().get(id).is_some())).transpose();
+                let selected=match wrapped {
+                    Ok(Some(Some(super::ae2_encoding::WrappedGhost::Fluid(fluid))))=>Some(Key::from(&fluid.key)),
+                    Ok(Some(Some(super::ae2_encoding::WrappedGhost::Item(item))))=>super::ae2_lab::key(&item).ok().as_ref().map(Key::from),
+                    Err(_)=>return true,
+                    _ if button==1=>held.and_then(|s|super::ae2_fluids::bucket_fluid(&s.item)).map(super::ae2_fluids::fluid_key).as_ref().map(Key::from),
+                    _=>held.and_then(|s|super::ae2_lab::key(s).ok()).as_ref().map(Key::from),
+                };
+                state.config[index]=selected;
+                changed = true;
+            }
+        } else if slot == 41 {
+            session.page = (session.page + 1) % 2;
+        } else if slot == 42 && matches!(kind.as_str(), "ae2:import_bus" | "ae2:export_bus") {
+            let mode = match (state.redstone, button) {
+                (Redstone::Ignore, 0) => Redstone::High,
+                (Redstone::High, 0) => Redstone::Low,
+                (Redstone::Low, 0) => Redstone::Pulse,
+                (_, 0) => Redstone::Ignore,
+                (Redstone::Ignore, _) => Redstone::Pulse,
+                (Redstone::Pulse, _) => Redstone::Low,
+                (Redstone::Low, _) => Redstone::High,
+                _ => Redstone::Ignore,
+            };
+            let at =
+                horizon_core::position::BlockPos::new(session.pos.0, session.pos.1, session.pos.2);
+            let signal = self.with_level(|b, level, ticks| b.has_neighbor_signal(level, ticks, at));
+            state.set_redstone_mode(mode, signal);
+            changed = true;
+        } else if slot == 43 && kind == "ae2:export_bus" {
+            state.schedule = match (state.schedule, button) {
+                (Schedule::Default, 0) => Schedule::RoundRobin,
+                (Schedule::RoundRobin, 0) => Schedule::Random,
+                (Schedule::Random, 0) => Schedule::Default,
+                (Schedule::Default, _) => Schedule::Random,
+                (Schedule::Random, _) => Schedule::RoundRobin,
+                (Schedule::RoundRobin, _) => Schedule::Default,
+            };
+            changed = true;
+        } else if slot == 44 {
+            let choices = [
+                "ignore_all",
+                "percent_99",
+                "percent_75",
+                "percent_50",
+                "percent_25",
+            ];
+            let current = field(&data, "fuzzy_mode").unwrap_or_default();
+            let i = choices.iter().position(|v| *v == current).unwrap_or(0);
+            let n = if button == 0 {
+                (i + 1) % 5
+            } else {
+                (i + 4) % 5
+            };
+            data.insert("fuzzy_mode".into(), Tag::String(choices[n].into()));
+            changed = true;
+        } else if (45..49).contains(&slot)
+            && matches!(kind.as_str(), "ae2:storage_bus" | "ae2:formation_plane")
+        {
+            let old = match data.get(&"priority".into()) {
+                Some(Tag::Int(n)) => *n,
+                _ => 0,
+            };
+            let n = [1i32, 10, 100, 1000][slot - 45];
+            data.insert(
+                "priority".into(),
+                Tag::Int(if button == 0 {
+                    old.saturating_add(n)
+                } else {
+                    old.saturating_sub(n)
+                }),
+            );
+            changed = true;
+        } else if slot == 49 && kind == "ae2:storage_bus" {
+            let old = field(&data, "access").unwrap_or_else(|| "read_write".into());
+            let next = match old.as_str() {
+                "read_write" => "read_only",
+                "read_only" => "write_only",
+                _ => "read_write",
+            };
+            data.insert("access".into(), Tag::String(next.into()));
+            changed = true;
+        } else if slot == 50 && kind == "ae2:storage_bus" {
+            let enabled = !matches!(data.get(&"filter_on_extract".into()), Some(Tag::Byte(0)));
+            data.insert("filter_on_extract".into(), Tag::Byte(i8::from(!enabled)));
+            changed = true;
+        } else if slot == 52 && kind == "ae2:storage_bus" {
+            let next = match field(&data, "storage_filter").as_deref() {
+                None | Some("extractable_only") => Some("none"),
+                Some("none") => Some("extractable_only"),
+                _ => None,
+            };
+            if let Some(next) = next {
+                data.insert("storage_filter".into(), Tag::String(next.into()));
+                changed = true;
+            }
+        } else if slot == 53 && kind == "ae2:formation_plane" {
+            let entity = matches!(data.get(&"formation_entity".into()), Some(Tag::Byte(1)));
+            data.insert("formation_entity".into(), Tag::Byte(i8::from(!entity)));
+            changed = true;
+        } else if slot == 51
+            && kind == "ae2:export_bus"
+            && matches!(data.get(&"upgrades".into()), Some(Tag::List(cards)) if cards.iter().any(|card| card.get("id") == Some(&Tag::String("ae2:crafting_card".into()))))
+        {
+            let old = matches!(data.get(&"craft_only".into()), Some(Tag::Byte(1)));
+            data.insert("craft_only".into(), Tag::Byte(i8::from(!old)));
+            changed = true;
+
+        }
+        if changed {
+            if let Ok(encoded) = serde_json::to_string(&state) {
+                data.insert("state_json".into(), Tag::String(encoded.as_str().into()));
+                data.insert("bus_next_tick".into(), Tag::Long(0));
+                if !self.bus_ui_store(session.pos, session.face, data) {
+                    self.carried = before;
+                }
+            } else {
+                self.carried = before;
+            }
+        }
+        true
+    }
+    /// Apply bus card and configuration operations to the acting player's
+    /// real inventory and carried stack. Server and local sessions share it.
+    fn ae2_bus_action(&mut self,session:&mut GuestBus,mut data:Compound,slot:usize,button:i32,input:Input)->bool {
+        if input == Input::QuickCraft {
+            let stage = button & 3;
+            let mode = (button >> 2) & 3;
+            match stage {
+                0 => {
+                    session.drag = self.carried.clone().and_then(|carried| {
+                        (mode == 0 || mode == 1 || (mode == 2 && self.creative))
+                            .then_some(BusDrag {
+                                mode,
+                                slots: Vec::new(),
+                                carried,
+                            })
+                    });
+                }
+                1 => {
+                    if let Some(drag) = session.drag.as_mut() {
+                        if drag.mode == mode
+                            && (36..41).contains(&slot)
+                            && !drag.slots.contains(&(slot - 36))
+                            && self.carried.as_ref() == Some(&drag.carried)
+                            && (mode == 2 || drag.slots.len() < drag.carried.count as usize)
+                        {
+                            drag.slots.push(slot - 36);
+                        }
+                    }
+                }
+                2 => {
+                    if let Some(mut drag) = session.drag.take() {
+                        if drag.mode == mode
+                            && self.carried.as_ref() == Some(&drag.carried)
+                        {
+                            let before = self.carried.clone();
+                            let mut cards =
+                                super::ae2_buses::bus_upgrade_slots(&data).unwrap_or_default();
+                            drag.slots.sort_unstable();
+                            let mut remaining = drag.carried.count;
+                            let mut changed = false;
+                            for index in drag.slots {
+                                if index >= cards.len()
+                                    || cards[index].is_some()
+                                    || (mode != 2 && remaining == 0)
+                                {
+                                    continue;
+                                }
+                                let mut one = drag.carried.clone();
+                                one.count = 1;
+                                let mut trial = cards.clone();
+                                trial[index] = Some(one);
+                                let mut proposed = data.clone();
+                                if super::ae2_buses::store_bus_upgrade_slots(&mut proposed, &trial)
+                                    .is_ok()
+                                    && super::ae2_buses::bus_state(&proposed).is_ok()
+                                {
+                                    cards = trial;
+                                    if mode != 2 {
+                                        remaining -= 1;
+                                    }
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                let _ =
+                                    super::ae2_buses::store_bus_upgrade_slots(&mut data, &cards);
+                                data.insert("bus_next_tick".into(), Tag::Long(0));
+                                if mode != 2 {
+                                    self.carried =
+                                        (remaining > 0).then_some(ItemStack {
+                                            count: remaining,
+                                            ..drag.carried
+                                        });
+                                }
+                                if !self.bus_ui_store(session.pos, session.face, data) {
+                                    self.carried = before;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => session.drag = None,
+            }
+            return true;
+        }
+        session.drag = None;
+        if (54..90).contains(&slot) && matches!(input,Input::Swap|Input::Throw|Input::Clone) {
+            let index=if slot<81 {slot-54+9}else{slot-81};
+            self.ae2_machine_player_menu_click(index,button,input);return true;
+        }
+        if input==Input::Throw && (36..41).contains(&slot) && (0..=1).contains(&button) && self.carried.is_none() {
+            if self.eye_position().is_none(){return true;}
+            let mut cards=super::ae2_buses::bus_upgrade_slots(&data).unwrap_or_default();
+            if let Some(item)=cards.get_mut(slot-36).and_then(Option::take) {
+                if super::ae2_buses::store_bus_upgrade_slots(&mut data,&cards).is_ok() {
+                    if item.item.as_ref()=="ae2:crafting_card" {super::ae2_buses::mark_export_card_removed(&mut data);}
+                    data.insert("bus_next_tick".into(),Tag::Long(0));
+                    if self.bus_ui_store(session.pos,session.face,data) {self.player_drop(item);}
+                }
+            }
+            return true;
+        }
+        if input == Input::QuickMove || input == Input::Swap {
+            let before_inventory = self.inventory.clone();let before_offhand=self.offhand.clone();
+            let mut cards = super::ae2_buses::bus_upgrade_slots(&data).unwrap_or_default();
+            let had_crafting = cards
+                .iter()
+                .flatten()
+                .any(|v| v.item.as_ref() == "ae2:crafting_card");
+            let mut changed = false;
+            if input == Input::QuickMove && (36..41).contains(&slot) {
+                let index = slot - 36;
+                if let Some(item) = cards.get(index).and_then(Clone::clone) {
+                    if self.give(item).is_none()
+                    {
+                        cards[index] = None;
+                        changed = true;
+                    }
+                }
+            } else if input == Input::QuickMove && (54..90).contains(&slot) {
+                let index = if slot < 81 { slot - 54 + 9 } else { slot - 81 };
+                if let Some(free) = cards.iter().position(Option::is_none) {
+                    if let Some(mut card) = self.inventory[index].clone() {
+                        card.count = 1;
+                        let mut trial = cards.clone();
+                        trial[free] = Some(card);
+                        let mut proposed = data.clone();
+                        if super::ae2_buses::store_bus_upgrade_slots(&mut proposed, &trial).is_ok()
+                            && super::ae2_buses::bus_state(&proposed).is_ok()
+                        {
+                            cards = trial;
+                            if let Some(stack) = self.inventory[index].as_mut() {
+                                stack.count -= 1;
+                                if stack.count == 0 {
+                                    self.inventory[index] = None;
+                                }
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+            } else if input == Input::Swap
+                && (36..41).contains(&slot)
+                && ((0..=8).contains(&button) || button==40)
+            {
+                let index = slot - 36;
+                let incoming=if button==40 {self.offhand.clone()}else{self.inventory[button as usize].clone()};
+                if index < cards.len() && incoming.as_ref().is_none_or(|v| v.count == 1) {
+                    let existing = cards[index].clone();
+                    let mut trial = cards.clone();
+                    trial[index] = incoming;
+                    let mut proposed = data.clone();
+                    if trial != cards
+                        && super::ae2_buses::store_bus_upgrade_slots(&mut proposed, &trial).is_ok()
+                        && super::ae2_buses::bus_state(&proposed).is_ok()
+                    {
+                        cards = trial;
+                        if button==40 {self.offhand=existing;}else{self.inventory[button as usize]=existing;}
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let has_crafting = cards
+                    .iter()
+                    .flatten()
+                    .any(|v| v.item.as_ref() == "ae2:crafting_card");
+                let _ = super::ae2_buses::store_bus_upgrade_slots(&mut data, &cards);
+                if had_crafting && !has_crafting {
+                    super::ae2_buses::mark_export_card_removed(&mut data);
+                }
+                data.insert("bus_next_tick".into(), Tag::Long(0));
+                if !self.bus_ui_store(session.pos, session.face, data) {
+                    self.inventory = before_inventory;self.offhand=before_offhand;
+                }
+            }
+            return true;
+        }
+        if input!=Input::Pickup || (!(0..=1).contains(&button)
+            && !(matches!(button,2|3) && slot<36 && self.carried.is_some())) {return true;}
+        let before=self.carried.clone();
+        let Ok(state)=super::ae2_buses::bus_state(&data) else{return true;};
+        let mut changed=false;
+        if self.ae2_bus_config_action(session,data.clone(),slot,button,input) {return true;}
+        if (36..41).contains(&slot) {
+            let index = slot - 36;
+            let mut cards = super::ae2_buses::bus_upgrade_slots(&data).unwrap_or_default();
+            let held = self.carried.clone();
+            if index < cards.len() {
+                if held.is_none() {
+                    if let Some(item) = cards[index].take() {
+                        let removed_crafting = item.item.as_ref() == "ae2:crafting_card";
+                        self.carried = Some(item);
+                        let _ = super::ae2_buses::store_bus_upgrade_slots(&mut data, &cards);
+                        if removed_crafting {
+                            super::ae2_buses::mark_export_card_removed(&mut data);
+                        }
+                        changed = true;
+                    }
+                } else if cards[index].is_none() {
+                    let mut item = held.unwrap();
+                    item.count = 1;
+                    let mut trial = cards.clone();
+                    trial[index] = Some(item);
+                    let mut proposed = data.clone();
+                    if super::ae2_buses::store_bus_upgrade_slots(&mut proposed, &trial).is_ok()
+                        && super::ae2_buses::bus_state(&proposed).is_ok()
+                    {
+                        data = proposed;
+                        let carried = self.carried.as_mut().unwrap();
+                        carried.count -= 1;
+                        if carried.count == 0 {
+                            self.carried = None;
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        } else if (54..90).contains(&slot) {
+            let index=if slot<81 {slot-54+9}else{slot-81};
+            self.ae2_machine_player_menu_click(index,button,input);
+        }
+        if changed {
+            if let Ok(encoded) = serde_json::to_string(&state) {
+                data.insert("state_json".into(), Tag::String(encoded.as_str().into()));
+                data.insert("bus_next_tick".into(), Tag::Long(0));
+                if !self.bus_ui_store(session.pos, session.face, data) {
+                    self.carried = before;
+                }
+            } else {
+                self.carried = before;
+            }
+        }
+        true
     }
     pub(super) fn lan_ae2_bus_click(
         &mut self,
@@ -371,358 +909,17 @@ impl Game<'_> {
         let slot = p.slot as usize;
         let raw_input=super::lan_crafting::input(p.input);
         let input=if slot<36 && raw_input==Input::QuickMove {Input::Pickup}else{raw_input};
-        if input == Input::QuickCraft {
-            let stage = i32::from(p.button) & 3;
-            let mode = (i32::from(p.button) >> 2) & 3;
-            match stage {
-                0 => {
-                    session.drag = host.hub.guests[gi].carried.clone().and_then(|carried| {
-                        (mode == 0 || mode == 1 || (mode == 2 && host.hub.guests[gi].creative()))
-                            .then_some(BusDrag {
-                                mode,
-                                slots: Vec::new(),
-                                carried,
-                            })
-                    });
-                }
-                1 => {
-                    if let Some(drag) = session.drag.as_mut() {
-                        if drag.mode == mode
-                            && (36..41).contains(&slot)
-                            && !drag.slots.contains(&(slot - 36))
-                            && host.hub.guests[gi].carried.as_ref() == Some(&drag.carried)
-                            && (mode == 2 || drag.slots.len() < drag.carried.count as usize)
-                        {
-                            drag.slots.push(slot - 36);
-                        }
-                    }
-                }
-                2 => {
-                    if let Some(mut drag) = session.drag.take() {
-                        if drag.mode == mode
-                            && host.hub.guests[gi].carried.as_ref() == Some(&drag.carried)
-                        {
-                            let before = host.hub.guests[gi].carried.clone();
-                            let mut cards =
-                                super::ae2_buses::bus_upgrade_slots(&data).unwrap_or_default();
-                            drag.slots.sort_unstable();
-                            let mut remaining = drag.carried.count;
-                            let mut changed = false;
-                            for index in drag.slots {
-                                if index >= cards.len()
-                                    || cards[index].is_some()
-                                    || (mode != 2 && remaining == 0)
-                                {
-                                    continue;
-                                }
-                                let mut one = drag.carried.clone();
-                                one.count = 1;
-                                let mut trial = cards.clone();
-                                trial[index] = Some(one);
-                                let mut proposed = data.clone();
-                                if super::ae2_buses::store_bus_upgrade_slots(&mut proposed, &trial)
-                                    .is_ok()
-                                    && super::ae2_buses::bus_state(&proposed).is_ok()
-                                {
-                                    cards = trial;
-                                    if mode != 2 {
-                                        remaining -= 1;
-                                    }
-                                    changed = true;
-                                }
-                            }
-                            if changed {
-                                let _ =
-                                    super::ae2_buses::store_bus_upgrade_slots(&mut data, &cards);
-                                data.insert("bus_next_tick".into(), Tag::Long(0));
-                                if mode != 2 {
-                                    host.hub.guests[gi].carried =
-                                        (remaining > 0).then_some(ItemStack {
-                                            count: remaining,
-                                            ..drag.carried
-                                        });
-                                }
-                                if !self.bus_ui_store(session.pos, session.face, data) {
-                                    host.hub.guests[gi].carried = before;
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => session.drag = None,
-            }
-            host.play.entry(conn).or_default().ae2_bus = Some(session);
-            // A full content packet resets the client's in-progress pointer
-            // drag; wait until the final phase before resynchronizing.
-            if stage >= 2 {
-                self.lan_send_ae2_bus(host, conn);
-            }
-            return true;
-        }
-        session.drag = None;
-        if input == Input::QuickMove || input == Input::Swap {
-            let before_inventory = host.hub.guests[gi].inventory.clone();
-            let mut cards = super::ae2_buses::bus_upgrade_slots(&data).unwrap_or_default();
-            let had_crafting = cards
-                .iter()
-                .flatten()
-                .any(|v| v.item.as_ref() == "ae2:crafting_card");
-            let mut changed = false;
-            if input == Input::QuickMove && (36..41).contains(&slot) {
-                let index = slot - 36;
-                if let Some(item) = cards.get(index).and_then(Clone::clone) {
-                    if self
-                        .as_guest(host, conn, |g| g.give(item))
-                        .is_some_and(|rest| rest.is_none())
-                    {
-                        cards[index] = None;
-                        changed = true;
-                    }
-                }
-            } else if input == Input::QuickMove && (54..90).contains(&slot) {
-                let index = if slot < 81 { slot - 54 + 9 } else { slot - 81 };
-                if let Some(free) = cards.iter().position(Option::is_none) {
-                    if let Some(mut card) = host.hub.guests[gi].inventory[index].clone() {
-                        card.count = 1;
-                        let mut trial = cards.clone();
-                        trial[free] = Some(card);
-                        let mut proposed = data.clone();
-                        if super::ae2_buses::store_bus_upgrade_slots(&mut proposed, &trial).is_ok()
-                            && super::ae2_buses::bus_state(&proposed).is_ok()
-                        {
-                            cards = trial;
-                            if let Some(stack) = host.hub.guests[gi].inventory[index].as_mut() {
-                                stack.count -= 1;
-                                if stack.count == 0 {
-                                    host.hub.guests[gi].inventory[index] = None;
-                                }
-                            }
-                            changed = true;
-                        }
-                    }
-                }
-            } else if input == Input::Swap
-                && (36..41).contains(&slot)
-                && (0..=8).contains(&p.button)
-            {
-                let index = slot - 36;
-                let hotbar = p.button as usize;
-                let incoming = host.hub.guests[gi].inventory[hotbar].clone();
-                if index < cards.len() && incoming.as_ref().is_none_or(|v| v.count == 1) {
-                    let existing = cards[index].clone();
-                    let mut trial = cards.clone();
-                    trial[index] = incoming;
-                    let mut proposed = data.clone();
-                    if trial != cards
-                        && super::ae2_buses::store_bus_upgrade_slots(&mut proposed, &trial).is_ok()
-                        && super::ae2_buses::bus_state(&proposed).is_ok()
-                    {
-                        cards = trial;
-                        host.hub.guests[gi].inventory[hotbar] = existing;
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                let has_crafting = cards
-                    .iter()
-                    .flatten()
-                    .any(|v| v.item.as_ref() == "ae2:crafting_card");
-                let _ = super::ae2_buses::store_bus_upgrade_slots(&mut data, &cards);
-                if had_crafting && !has_crafting {
-                    super::ae2_buses::mark_export_card_removed(&mut data);
-                }
-                data.insert("bus_next_tick".into(), Tag::Long(0));
-                if !self.bus_ui_store(session.pos, session.face, data) {
-                    host.hub.guests[gi].inventory = before_inventory;
-                }
-            }
-            host.play.entry(conn).or_default().ae2_bus = Some(session);
-            self.lan_send_ae2_bus(host, conn);
-            return true;
-        }
-        if input != Input::Pickup || (!(0..=1).contains(&p.button)
-            && !(matches!(p.button,2|3) && slot<36 && host.hub.guests[gi].carried.is_some())) {
-            host.play.entry(conn).or_default().ae2_bus = Some(session);
-            self.lan_send_ae2_bus(host, conn);
-            return true;
-        }
-        let kind = field(&data, "id").unwrap_or_default();
-        let before = host.hub.guests[gi].carried.clone();
-        let mut state = match super::ae2_buses::bus_state(&data) {
-            Ok(v) => v,
-            Err(_) => {
-                host.play.entry(conn).or_default().ae2_bus = Some(session);
-                return true;
-            }
-        };
-        if slot<36 && !bus_fake_revision_matches(&session.fake_revisions,p.state,session.page,state.slots()) {
-            host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_send_ae2_bus(host,conn);return true;
-        }
-        let mut changed = false;
-        if slot < 36 {
-            let index = session.page * 36 + slot;
-            if index < state.slots() {
-                let held = host.hub.guests[gi].carried.as_ref();
-                let wrapped=held.map(|item|super::ae2_encoding::wrapped_ghost(item,&|id,fluid|fluid||self.res.items().get(id).is_some())).transpose();
-                let selected=match wrapped {
-                    Ok(Some(Some(super::ae2_encoding::WrappedGhost::Fluid(fluid))))=>Some(Key::from(&fluid.key)),
-                    Ok(Some(Some(super::ae2_encoding::WrappedGhost::Item(item))))=>super::ae2_lab::key(&item).ok().as_ref().map(Key::from),
-                    Err(_)=>{host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_send_ae2_bus(host,conn);return true;},
-                    _ if p.button==1=>held.and_then(|s|super::ae2_fluids::bucket_fluid(&s.item)).map(super::ae2_fluids::fluid_key).as_ref().map(Key::from),
-                    _=>held.and_then(|s|super::ae2_lab::key(s).ok()).as_ref().map(Key::from),
-                };
-                state.config[index]=selected;
-                changed = true;
-            }
-        } else if (36..41).contains(&slot) {
-            let index = slot - 36;
-            let mut cards = super::ae2_buses::bus_upgrade_slots(&data).unwrap_or_default();
-            let held = host.hub.guests[gi].carried.clone();
-            if index < cards.len() {
-                if held.is_none() {
-                    if let Some(item) = cards[index].take() {
-                        let removed_crafting = item.item.as_ref() == "ae2:crafting_card";
-                        host.hub.guests[gi].carried = Some(item);
-                        let _ = super::ae2_buses::store_bus_upgrade_slots(&mut data, &cards);
-                        if removed_crafting {
-                            super::ae2_buses::mark_export_card_removed(&mut data);
-                        }
-                        changed = true;
-                    }
-                } else if cards[index].is_none() {
-                    let mut item = held.unwrap();
-                    item.count = 1;
-                    let mut trial = cards.clone();
-                    trial[index] = Some(item);
-                    let mut proposed = data.clone();
-                    if super::ae2_buses::store_bus_upgrade_slots(&mut proposed, &trial).is_ok()
-                        && super::ae2_buses::bus_state(&proposed).is_ok()
-                    {
-                        data = proposed;
-                        let carried = host.hub.guests[gi].carried.as_mut().unwrap();
-                        carried.count -= 1;
-                        if carried.count == 0 {
-                            host.hub.guests[gi].carried = None;
-                        }
-                        changed = true;
-                    }
-                }
-            }
-        } else if slot == 41 {
-            session.page = (session.page + 1) % 2;
-        } else if slot == 42 && matches!(kind.as_str(), "ae2:import_bus" | "ae2:export_bus") {
-            let mode = match (state.redstone, p.button) {
-                (Redstone::Ignore, 0) => Redstone::High,
-                (Redstone::High, 0) => Redstone::Low,
-                (Redstone::Low, 0) => Redstone::Pulse,
-                (_, 0) => Redstone::Ignore,
-                (Redstone::Ignore, _) => Redstone::Pulse,
-                (Redstone::Pulse, _) => Redstone::Low,
-                (Redstone::Low, _) => Redstone::High,
-                _ => Redstone::Ignore,
-            };
-            let at =
-                horizon_core::position::BlockPos::new(session.pos.0, session.pos.1, session.pos.2);
-            let signal = self.with_level(|b, level, ticks| b.has_neighbor_signal(level, ticks, at));
-            state.set_redstone_mode(mode, signal);
-            changed = true;
-        } else if slot == 43 && kind == "ae2:export_bus" {
-            state.schedule = match (state.schedule, p.button) {
-                (Schedule::Default, 0) => Schedule::RoundRobin,
-                (Schedule::RoundRobin, 0) => Schedule::Random,
-                (Schedule::Random, 0) => Schedule::Default,
-                (Schedule::Default, _) => Schedule::Random,
-                (Schedule::Random, _) => Schedule::RoundRobin,
-                (Schedule::RoundRobin, _) => Schedule::Default,
-            };
-            changed = true;
-        } else if slot == 44 {
-            let choices = [
-                "ignore_all",
-                "percent_99",
-                "percent_75",
-                "percent_50",
-                "percent_25",
-            ];
-            let current = field(&data, "fuzzy_mode").unwrap_or_default();
-            let i = choices.iter().position(|v| *v == current).unwrap_or(0);
-            let n = if p.button == 0 {
-                (i + 1) % 5
-            } else {
-                (i + 4) % 5
-            };
-            data.insert("fuzzy_mode".into(), Tag::String(choices[n].into()));
-            changed = true;
-        } else if (45..49).contains(&slot)
-            && matches!(kind.as_str(), "ae2:storage_bus" | "ae2:formation_plane")
-        {
-            let old = match data.get(&"priority".into()) {
-                Some(Tag::Int(n)) => *n,
-                _ => 0,
-            };
-            let n = [1i32, 10, 100, 1000][slot - 45];
-            data.insert(
-                "priority".into(),
-                Tag::Int(if p.button == 0 {
-                    old.saturating_add(n)
-                } else {
-                    old.saturating_sub(n)
-                }),
-            );
-            changed = true;
-        } else if slot == 49 && kind == "ae2:storage_bus" {
-            let old = field(&data, "access").unwrap_or_else(|| "read_write".into());
-            let next = match old.as_str() {
-                "read_write" => "read_only",
-                "read_only" => "write_only",
-                _ => "read_write",
-            };
-            data.insert("access".into(), Tag::String(next.into()));
-            changed = true;
-        } else if slot == 50 && kind == "ae2:storage_bus" {
-            let enabled = !matches!(data.get(&"filter_on_extract".into()), Some(Tag::Byte(0)));
-            data.insert("filter_on_extract".into(), Tag::Byte(i8::from(!enabled)));
-            changed = true;
-        } else if slot == 52 && kind == "ae2:storage_bus" {
-            let next = match field(&data, "storage_filter").as_deref() {
-                None | Some("extractable_only") => Some("none"),
-                Some("none") => Some("extractable_only"),
-                _ => None,
-            };
-            if let Some(next) = next {
-                data.insert("storage_filter".into(), Tag::String(next.into()));
-                changed = true;
-            }
-        } else if slot == 53 && kind == "ae2:formation_plane" {
-            let entity = matches!(data.get(&"formation_entity".into()), Some(Tag::Byte(1)));
-            data.insert("formation_entity".into(), Tag::Byte(i8::from(!entity)));
-            changed = true;
-        } else if slot == 51
-            && kind == "ae2:export_bus"
-            && matches!(data.get(&"upgrades".into()), Some(Tag::List(cards)) if cards.iter().any(|card| card.get("id") == Some(&Tag::String("ae2:crafting_card".into()))))
-        {
-            let old = matches!(data.get(&"craft_only".into()), Some(Tag::Byte(1)));
-            data.insert("craft_only".into(), Tag::Byte(i8::from(!old)));
-            changed = true;
-        } else if (54..90).contains(&slot) {
-            self.guest_menu_op(host, gi, &mut session.menu, |menu, env| {
-                let _ = menu.click(env, i32::from(p.slot), i32::from(p.button), input);
-            });
-        }
-        if changed {
-            if let Ok(encoded) = serde_json::to_string(&state) {
-                data.insert("state_json".into(), Tag::String(encoded.as_str().into()));
-                data.insert("bus_next_tick".into(), Tag::Long(0));
-                if !self.bus_ui_store(session.pos, session.face, data) {
-                    host.hub.guests[gi].carried = before;
-                }
-            } else {
-                host.hub.guests[gi].carried = before;
+        if slot<36 && input==Input::Pickup {
+            let Ok(state)=super::ae2_buses::bus_state(&data) else {host.play.entry(conn).or_default().ae2_bus=Some(session);return true;};
+            if !bus_fake_revision_matches(&session.fake_revisions,p.state,session.page,state.slots()) {
+                host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_send_ae2_bus(host,conn);return true;
             }
         }
-        host.play.entry(conn).or_default().ae2_bus = Some(session);
-        self.lan_send_ae2_bus(host, conn);
+        let stage=i32::from(p.button)&3;
+        self.as_guest(host,conn,|game|game.ae2_bus_action(&mut session,data,slot,i32::from(p.button),input));
+        host.play.entry(conn).or_default().ae2_bus=Some(session);
+        // Do not reset the client's pointer drag while it is being assembled.
+        if input!=Input::QuickCraft || stage>=2 {self.lan_send_ae2_bus(host,conn);}
         true
     }
     pub(super) fn lan_ae2_bus_closed(
@@ -819,18 +1016,13 @@ impl Game<'_> {
         let part=super::ae2_channels::part_identity(&Tag::Compound(data.clone()))?;
         Some((host,part))
     }
-    fn lan_send_ae2_emitter(&mut self,host:&mut LanHost,conn:u32) {
+    fn ae2_emitter_menu_items(&self,data:&Compound,edit:Option<&str>)->Option<Vec<Option<ItemStack>>> {
         use super::ae2_emitter::{EmitterFilter,emitter_read};
-        let Some((pos,face,window,edit))=host.play.get(&conn).and_then(|p|p.ae2_bus.as_ref())
-            .map(|s|(s.pos,s.face,s.window,s.emitter_edit.clone())) else{return};
-        let Some(data)=self.bus_ui_read(pos,face) else{return};
-        let Ok(state)=emitter_read(&data) else{return};
-        let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn) else{return};
+        let state=emitter_read(data).ok()?;
         let crafting=emitter_card(&state,"ae2:crafting_card");
         let fuzzy=emitter_card(&state,"ae2:fuzzy_card");
         let fluid=matches!(state.filter.as_ref(),Some(EmitterFilter::Fluid(_)));
         let mut items=vec![None;54];
-        let editing=edit.is_some();
         if let Some(edit)=edit {
             for digit in 0..10 {items[digit]=icon(format!("Threshold digit {digit}"));}
             items[10]=icon("Backspace threshold".into());
@@ -859,6 +1051,15 @@ impl Game<'_> {
             }
             if fuzzy {items[44]=icon(format!("Fuzzy mode: {}",state.fuzzy_mode));}
         }
+        Some(items)
+    }
+    fn lan_send_ae2_emitter(&mut self,host:&mut LanHost,conn:u32) {
+        let Some((pos,face,window,edit))=host.play.get(&conn).and_then(|p|p.ae2_bus.as_ref())
+            .map(|s|(s.pos,s.face,s.window,s.emitter_edit.clone())) else{return};
+        let Some(data)=self.bus_ui_read(pos,face) else{return};
+        let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn) else{return};
+        let editing=edit.is_some();
+        let Some(mut items)=self.ae2_emitter_menu_items(&data,edit.as_deref()) else{return};
         items.extend((9..36).chain(0..9).map(|i|g.inventory[i].clone()));
         let carried=g.carried.clone();
         Self::lan_ae2_fake_slots(host,conn,window,if editing {&[]}else{&[0]});
@@ -869,18 +1070,16 @@ impl Game<'_> {
         let items=items.iter().map(|item|host.hub.stack(item)).collect();let carried=host.hub.stack(&carried);
         host.hub.send_to(conn,&C::ContainerSetContent(play::ContainerSetContent{container:window,state:state_id,items,carried}));
     }
-    fn lan_ae2_emitter_click(&mut self,host:&mut LanHost,conn:u32,gi:usize,p:&play::ContainerClick,
-        mut session:GuestBus,mut data:Compound)->bool {
+    /// Source fake/filter and mode operations, shared by server and local
+    /// emitter menus. Physical slots return false for the native menu engine.
+    fn ae2_emitter_config_action(&mut self,session:&mut GuestBus,mut data:Compound,slot:Option<usize>,button:i32,raw_input:Input)->bool {
         use super::ae2_emitter::{EmitterFilter,emitter_read,emitter_store};
-        let Ok(mut state)=emitter_read(&data) else {
-            host.play.entry(conn).or_default().ae2_bus=Some(session);
-            self.lan_ae2_bus_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:p.container}));return true;
-        };
-        let input=super::lan_crafting::input(p.input);let slot=usize::try_from(p.slot).ok();
+        let Ok(mut state)=emitter_read(&data) else{return true;};
+        let input=if session.emitter_edit.is_none() && slot==Some(0) && raw_input==Input::QuickMove {Input::Pickup}else{raw_input};
         let crafting=emitter_card(&state,"ae2:crafting_card");
         let fuzzy=emitter_card(&state,"ae2:fuzzy_card");
         let mut changed=false;let mut refresh=false;
-        if session.emitter_edit.is_some() && matches!(input,Input::Pickup) && matches!(p.button,0|1) {
+        if session.emitter_edit.is_some() && matches!(input,Input::Pickup) && matches!(button,0|1) {
             let mut entry=session.emitter_edit.take().unwrap();
             match slot {
                 Some(digit @ 0..=9)=>{let mut candidate=entry.clone();candidate.push(char::from(b'0'+digit as u8));if candidate.len()<=19 && candidate.parse::<i64>().is_ok(){entry=candidate;}},
@@ -888,50 +1087,66 @@ impl Game<'_> {
             }
             if let Ok(value)=entry.parse::<i64>() {if value>=0 && value!=state.threshold {state.threshold=value;changed=true;}}
             if slot!=Some(12) {session.emitter_edit=Some(entry);}
-        } else if matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(0) {
-            let held=host.hub.guests[gi].carried.as_ref();
+        } else if session.emitter_edit.is_none() && input==Input::Pickup && matches!(button,0..=3) && slot==Some(0) {
+            let held=self.carried.as_ref();
+            if matches!(button,2|3) && held.is_none() {
+                return true;
+            }
             let wrapped=held.map(|item|super::ae2_encoding::wrapped_ghost(item,&|id,fluid|fluid||self.res.items().get(id).is_some())).transpose();
-            let next=match wrapped {
+            let fluid=if button==1 {held.and_then(|held|super::ae2_fluids::bucket_fluid(&held.item)).map(super::ae2_fluids::fluid_key)}else{None};
+            let next=if let Some(fluid)=fluid {Some(EmitterFilter::Fluid(fluid))}else{match wrapped {
                 Ok(Some(Some(super::ae2_encoding::WrappedGhost::Fluid(fluid))))=>Some(EmitterFilter::Fluid(fluid.key)),
                 Ok(Some(Some(super::ae2_encoding::WrappedGhost::Item(mut item))))=>{item.count=1;Some(EmitterFilter::Item(item))},
                 Err(_)=>state.filter.clone(),
                 _=>held.and_then(|held|{super::ae2_lab::key(held).ok()?;let mut one=held.clone();one.count=1;Some(EmitterFilter::Item(one))}),
-            };
+            }};
             changed=state.filter!=next;refresh=changed;state.filter=next;
-        } else if matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(1) {
-            if let Some(key)=host.hub.guests[gi].carried.as_ref().and_then(|item|super::ae2_fluids::bucket_fluid(&item.item)).map(super::ae2_fluids::fluid_key) {
+        } else if matches!(input,Input::Pickup) && matches!(button,0|1) && slot==Some(1) {
+            if let Some(key)=self.carried.as_ref().and_then(|item|super::ae2_fluids::bucket_fluid(&item.item)).map(super::ae2_fluids::fluid_key) {
                 let next=Some(EmitterFilter::Fluid(key));changed=state.filter!=next;refresh=changed;state.filter=next;
             }
-        } else if matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(42) && !crafting {
+        } else if matches!(input,Input::Pickup) && matches!(button,0|1) && slot==Some(42) && !crafting {
             state.low=!state.low;changed=true;refresh=true;
-        } else if matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(43) && crafting {
+        } else if matches!(input,Input::Pickup) && matches!(button,0|1) && slot==Some(43) && crafting {
             state.craft_via_redstone=!state.craft_via_redstone;changed=true;refresh=true;
-        } else if matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(44) && fuzzy {
+        } else if matches!(input,Input::Pickup) && matches!(button,0|1) && slot==Some(44) && fuzzy {
             let values=["ignore_all","percent_99","percent_75","percent_50","percent_25"];
             let current=values.iter().position(|v|*v==state.fuzzy_mode).unwrap_or(0);
-            state.fuzzy_mode=values[if p.button==0 {(current+1)%5}else{(current+4)%5}].into();changed=true;refresh=true;
-        } else if matches!(input,Input::Pickup|Input::QuickMove) && matches!(p.button,0|1)
+            state.fuzzy_mode=values[if button==0 {(current+1)%5}else{(current+4)%5}].into();changed=true;refresh=true;
+        } else if matches!(input,Input::Pickup|Input::QuickMove) && matches!(button,0|1)
             && slot.is_some_and(|slot|(45..49).contains(&slot)) && !crafting {
             let i=slot.unwrap()-45;let base=if input==Input::QuickMove {[1i64,16,32,64][i]}else{[1i64,10,100,1000][i]};
             let amount=if matches!(state.filter.as_ref(),Some(EmitterFilter::Fluid(_))) {base.saturating_mul(1000)} else {base};
-            let old=state.threshold;state.threshold=if p.button==0 {old.saturating_add(amount).max(0)}else{old.saturating_sub(amount).max(0)};changed=old!=state.threshold;
-        } else if matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(49) && !crafting {
+            let old=state.threshold;state.threshold=if button==0 {old.saturating_add(amount).max(0)}else{old.saturating_sub(amount).max(0)};changed=old!=state.threshold;
+        } else if matches!(input,Input::Pickup) && matches!(button,0|1) && slot==Some(49) && !crafting {
             session.emitter_edit=Some(state.threshold.to_string());
         } else if input==Input::QuickMove && slot.is_some_and(|slot|(54..90).contains(&slot)) {
             let index=if slot.unwrap()<81 {slot.unwrap()-54+9}else{slot.unwrap()-81};
-            let value=host.hub.guests[gi].inventory[index].clone();
+            let value=self.inventory[index].clone();
             if state.filter.is_none() && value.as_ref().is_some_and(|v|!matches!(v.item.as_ref(),"ae2:fuzzy_card"|"ae2:crafting_card")) {
                 if let Some(mut item)=value.filter(|item|super::ae2_lab::key(item).is_ok()) {item.count=1;state.filter=Some(EmitterFilter::Item(item));changed=true;refresh=true;}
             } else {
-                return self.lan_ae2_emitter_physical(host,conn,gi,p,session,data,state);
+                return false;
             }
-        } else if input==Input::QuickCraft || (p.slot == -999 && input == Input::Pickup) || slot==Some(36) || slot.is_some_and(|slot|(54..90).contains(&slot)) {
-            return self.lan_ae2_emitter_physical(host,conn,gi,p,session,data,state);
+        } else if input==Input::QuickCraft || (slot.is_none() && input == Input::Pickup) || slot==Some(36) || slot.is_some_and(|slot|(54..90).contains(&slot)) {
+            return false;
         }
         if changed && emitter_store(&mut data,&state).is_ok() && self.bus_ui_store(session.pos,session.face,data) && refresh {
             self.emitter_ui_provider_changed(session.pos,session.face);
         }
-        host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_send_ae2_bus(host,conn);true
+        true
+    }
+    fn lan_ae2_emitter_click(&mut self,host:&mut LanHost,conn:u32,gi:usize,p:&play::ContainerClick,
+        mut session:GuestBus,data:Compound)->bool {
+        let Ok(state)=super::ae2_emitter::emitter_read(&data) else {
+            host.play.entry(conn).or_default().ae2_bus=Some(session);
+            self.lan_ae2_bus_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:p.container}));return true;
+        };
+        let input=super::lan_crafting::input(p.input);let slot=usize::try_from(p.slot).ok();
+        if self.as_guest(host,conn,|game|game.ae2_emitter_config_action(&mut session,data.clone(),slot,i32::from(p.button),input)).unwrap_or(false) {
+            host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_send_ae2_bus(host,conn);return true;
+        }
+        self.lan_ae2_emitter_physical(host,conn,gi,p,session,data,state)
     }
     fn lan_ae2_emitter_physical(&mut self,host:&mut LanHost,conn:u32,gi:usize,p:&play::ContainerClick,
         mut session:GuestBus,mut data:Compound,mut state:super::ae2_emitter::EmitterState)->bool {
@@ -967,12 +1182,8 @@ impl Game<'_> {
 // Staged functions for ae2_bus_ui.rs. The source's real Energy Emitter has
 // no filter or upgrade inventory; number controls use the existing bus keypad.
 impl Game<'_> {
-    fn lan_send_ae2_energy_emitter(&mut self,host:&mut LanHost,conn:u32) {
-        let Some((pos,face,window,edit))=host.play.get(&conn).and_then(|p|p.ae2_bus.as_ref())
-            .map(|s|(s.pos,s.face,s.window,s.emitter_edit.clone())) else{return};
-        let Some(data)=self.bus_ui_read(pos,face) else{return};
-        let Ok(state)=super::ae2_emitter::energy_emitter_read(&data) else{return};
-        let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn) else{return};
+    fn ae2_energy_emitter_menu_items(&self,data:&Compound,edit:Option<&str>)->Option<Vec<Option<ItemStack>>> {
+        let state=super::ae2_emitter::energy_emitter_read(data).ok()?;
         let mut items=vec![None;54];
         if let Some(edit)=edit {
             for digit in 0..10 {items[digit]=icon(format!("Energy threshold digit {digit}"));}
@@ -985,21 +1196,25 @@ impl Game<'_> {
             }
             items[49]=icon(format!("Threshold: {} AE; click for digits",state.threshold.max(0)));
         }
+        Some(items)
+    }
+    fn lan_send_ae2_energy_emitter(&mut self,host:&mut LanHost,conn:u32) {
+        let Some((pos,face,window,edit))=host.play.get(&conn).and_then(|p|p.ae2_bus.as_ref())
+            .map(|s|(s.pos,s.face,s.window,s.emitter_edit.clone())) else{return};
+        let Some(data)=self.bus_ui_read(pos,face) else{return};
+        let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn) else{return};
+        let Some(mut items)=self.ae2_energy_emitter_menu_items(&data,edit.as_deref()) else{return};
         items.extend((9..36).chain(0..9).map(|i|g.inventory[i].clone()));let carried=g.carried.clone();
         let Some(session)=host.play.get_mut(&conn).and_then(|p|p.ae2_bus.as_mut()) else{return};
         let Some(signature)=stable(&data) else{return};session.signature=signature;session.state=(session.state+1)&0x7fff;
         let items=items.iter().map(|item|host.hub.stack(item)).collect();let carried=host.hub.stack(&carried);
         host.hub.send_to(conn,&C::ContainerSetContent(play::ContainerSetContent{container:window,state:session.state,items,carried}));
     }
-    fn lan_ae2_energy_emitter_click(&mut self,host:&mut LanHost,conn:u32,gi:usize,p:&play::ContainerClick,
-        mut session:GuestBus,mut data:Compound)->bool {
-        let Ok(mut state)=super::ae2_emitter::energy_emitter_read(&data) else {
-            host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_ae2_bus_closed(host,conn,None);
-            host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:p.container}));return true;
-        };
-        let input=super::lan_crafting::input(p.input);let slot=usize::try_from(p.slot).ok();let before_threshold=state.threshold;
+    fn ae2_energy_emitter_config_action(&mut self,session:&mut GuestBus,mut data:Compound,slot:Option<usize>,button:i32,input:Input)->(bool,Option<(u64,String)>) {
+        let Ok(mut state)=super::ae2_emitter::energy_emitter_read(&data) else{return (true,None);};
+        let before_threshold=state.threshold;
         let mut changed=false;let mut mode_changed=false;let mut echo=None;
-        if session.emitter_edit.is_some() && matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot.is_some_and(|s|s<=12) {
+        if session.emitter_edit.is_some() && matches!(input,Input::Pickup) && matches!(button,0|1) && slot.is_some_and(|s|s<=12) {
             let mut entry=session.emitter_edit.take().unwrap();match slot {
                 Some(digit @ 0..=9)=>{let mut candidate=entry.clone();candidate.push(char::from(b'0'+digit as u8));if candidate.len()<=16 && candidate.parse::<i64>().is_ok(){entry=candidate;}},
                 Some(10)=>{entry.pop();},Some(11)=>entry.clear(),Some(12)=>{},_=>{}
@@ -1007,25 +1222,25 @@ impl Game<'_> {
             if let Some(value)=super::ae2_number_entry::number_value(&entry,1,0,i64::MAX,'.') {if value!=state.threshold {state.threshold=value;changed=true;}}
             if let Some(edit)=session.energy_edit.as_mut() {edit.text=entry.clone();echo=Some((edit.token,entry.clone()));}
             if slot!=Some(12){session.emitter_edit=Some(entry);}
-        } else if session.emitter_edit.is_none() && matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(42) {
+        } else if session.emitter_edit.is_none() && matches!(input,Input::Pickup) && matches!(button,0|1) && slot==Some(42) {
             state.low=!state.low;changed=true;mode_changed=true;
-        } else if session.emitter_edit.is_none() && matches!(input,Input::Pickup|Input::QuickMove) && matches!(p.button,0|1) && slot.is_some_and(|s|(45..49).contains(&s)) {
+        } else if session.emitter_edit.is_none() && matches!(input,Input::Pickup|Input::QuickMove) && matches!(button,0|1) && slot.is_some_and(|s|(45..49).contains(&s)) {
             let i=slot.unwrap()-45;let amount=if input==Input::QuickMove {[1i64,16,32,64][i]}else{[1i64,10,100,1000][i]};
-            let delta=if p.button==0 {amount}else{-amount};
+            let delta=if button==0 {amount}else{-amount};
             if let Some(edit)=session.energy_edit.as_mut() {
                 if let Some(next)=super::ae2_number_entry::number_step(&edit.text,delta,0,i64::MAX,'.') {
                     if let Some(value)=super::ae2_number_entry::number_value(&next,1,0,i64::MAX,'.') {state.threshold=value;changed=state.threshold!=before_threshold;}
                     edit.text=next.clone();echo=Some((edit.token,next));
                 }
             }
-        } else if session.emitter_edit.is_none() && matches!(input,Input::Pickup) && matches!(p.button,0|1) && slot==Some(49) {
+        } else if session.emitter_edit.is_none() && matches!(input,Input::Pickup) && matches!(button,0|1) && slot==Some(49) {
             session.emitter_edit=Some(state.threshold.max(0).to_string());
         } else if input==Input::QuickMove && slot.is_some_and(|s|(54..90).contains(&s)) {
             // No destination slots exist for an Energy Level Emitter.
-        } else if input==Input::QuickCraft && i32::from(p.button)&3==1 && slot.is_some_and(|s|s<54) {
+        } else if input==Input::QuickCraft && button&3==1 && slot.is_some_and(|s|s<54) {
             // Virtual controls are not inventory destinations.
-        } else if input==Input::QuickCraft || (p.slot == -999 && input == Input::Pickup) || slot.is_some_and(|s|(54..90).contains(&s)) {
-            return self.lan_ae2_energy_emitter_player_click(host,conn,gi,p,session);
+        } else if input==Input::QuickCraft || (slot.is_none() && input == Input::Pickup) || slot.is_some_and(|s|(54..90).contains(&s)) {
+            return (false,None);
         }
         if changed && super::ae2_emitter::energy_emitter_store(&mut data,&state).is_ok()
             && self.bus_ui_store_with_dirty(session.pos,session.face,data,false) {
@@ -1038,6 +1253,17 @@ impl Game<'_> {
                 } else {self.ae2_energy_emitter_threshold_callback(address);}
             }
         }
+        (true,echo)
+    }
+    fn lan_ae2_energy_emitter_click(&mut self,host:&mut LanHost,conn:u32,gi:usize,p:&play::ContainerClick,
+        mut session:GuestBus,data:Compound)->bool {
+        if super::ae2_emitter::energy_emitter_read(&data).is_err() {
+            host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_ae2_bus_closed(host,conn,None);
+            host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:p.container}));return true;
+        }
+        let input=super::lan_crafting::input(p.input);let slot=usize::try_from(p.slot).ok();
+        let (handled,echo)=self.as_guest(host,conn,|game|game.ae2_energy_emitter_config_action(&mut session,data,slot,i32::from(p.button),input)).unwrap_or((true,None));
+        if !handled {return self.lan_ae2_energy_emitter_player_click(host,conn,gi,p,session);}
         if let Some((token,text))=echo {Self::energy_payload(host,conn,session.window,token,"set",&text);}
         host.play.entry(conn).or_default().ae2_bus=Some(session);self.lan_send_ae2_bus(host,conn);true
     }

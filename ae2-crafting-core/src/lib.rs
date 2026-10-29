@@ -225,6 +225,13 @@ pub mod extended {
         emittable: BTreeSet<String>,
         resource_classifier: Option<fn(&str)->ResourceKind>,
         source_inputs: BTreeMap<String,Vec<SourceInput>>,
+        // Encoded per-slot GenericStack amounts. Source crafting patterns use
+        // their sum as the condensed input multiplier independently from the
+        // first slot's candidate template amount.
+        source_multipliers: BTreeMap<String,Vec<u64>>,
+        // Source possible-input arrays can repeat the same key at different
+        // template amounts; a map of keys alone cannot represent this.
+        source_templates: BTreeMap<String,Vec<Vec<(String,u64)>>>,
         source_outputs: BTreeMap<String,BTreeSet<String>>,
     }
     impl Registry {
@@ -271,6 +278,7 @@ pub mod extended {
             };
             self.patterns==other.patterns && self.primary_outputs==other.primary_outputs
                 && self.emittable==other.emittable && self.source_inputs==other.source_inputs
+                && self.source_multipliers==other.source_multipliers && self.source_templates==other.source_templates
                 && self.source_outputs==other.source_outputs
                 && self.patterns.iter().all(|p|p.outputs.keys().all(|key|same_kind(key))
                     && p.inputs.iter().all(|i|i.choices.keys().all(|key|same_kind(key))))
@@ -292,6 +300,24 @@ pub mod extended {
                 return Err(Error::InvalidPattern);
             }
             self.source_inputs.insert(id.to_owned(),inputs);Ok(())
+        }
+        /// Preserve the source per-slot amounts used to condense crafting
+        /// inputs. These are independent of the candidate template amounts.
+        pub fn set_source_multipliers(&mut self,id:&str,multipliers:Vec<u64>)->Result<(),Error> {
+            let pattern=self.patterns.iter().find(|p|p.id==id).ok_or(Error::InvalidPattern)?;
+            if multipliers.len()!=pattern.inputs.len() || multipliers.iter().any(|amount|*amount==0) {return Err(Error::InvalidPattern);}
+            self.source_multipliers.insert(id.to_owned(),multipliers);Ok(())
+        }
+        /// Retain the source's ordered possible templates, including the
+        /// same key at two different amounts (e.g. encoded item and substitute).
+        pub fn set_source_templates(&mut self,id:&str,templates:Vec<Vec<(String,u64)>>)->Result<(),Error> {
+            let pattern=self.patterns.iter().find(|p|p.id==id).ok_or(Error::InvalidPattern)?;
+            let inputs=self.source_inputs.get(id).ok_or(Error::InvalidPattern)?;
+            if templates.len()!=pattern.inputs.len() || templates.iter().zip(&pattern.inputs).zip(inputs).any(|((templates,input),source)| {
+                templates.first().is_none_or(|(key,amount)|key!=&source.primary || input.choices.get(key)!=Some(amount))
+                    || templates.iter().any(|(key,amount)|*amount==0 || !input.choices.contains_key(key))
+            }) {return Err(Error::InvalidPattern);}
+            self.source_templates.insert(id.to_owned(),templates);Ok(())
         }
         /// Source pattern outputs exclude crafting-container remainders,
         /// which the host tracks separately as physical returned items.

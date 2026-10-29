@@ -283,6 +283,10 @@ impl Game<'_> {
                     .ok_or_else(|| err("commands.data.block.invalid", &[]))?;
                 // BlockEntity.saveWithFullMetadata: no chunk-only keepPacked.
                 let mut tag = save::encode_block_entity(key, e, &name);
+                #[cfg(feature = "ae2-lab")]
+                if let Some(original)=self.world.block_entities.vanilla_metadata(&key) {
+                    tag=save::live_vanilla_block_entity(key,e,&name,self.world.block_names.get(&key).map(String::as_str),Some(original));
+                }
                 if let Tag::Compound(c) = &mut tag {
                     c.remove(&"keepPacked".into());
                 }
@@ -335,9 +339,22 @@ impl Game<'_> {
                     }
                     #[cfg(not(feature = "ae2-lab"))]
                     self.world.block_entities.insert(key, new);
+                    #[cfg(feature = "ae2-lab")]
+                    {
+                        self.world.block_entities.remember_vanilla_metadata(key,&tag);
+                        if self.world.block_entities.vanilla_metadata(&key).is_some() {
+                            match tag.get("CustomName").map(|raw|horizon_client::entity_nbt::name_text(raw).plain()) {
+                                Some(name)=>{self.world.block_names.insert(key,name);},
+                                None=>{self.world.block_names.remove(&key);},
+                            }
+                        }
+                    }
                     let state = self.world.block(p[0], p[1], p[2]);
                     // Redraw what shows the block entity (signs, banners).
                     let _ = self.world.set(p[0], p[1], p[2], state);
+                    // A same-state redraw does not dirty the chunk. Persist
+                    // changes to the block entity even when its block is unchanged.
+                    self.world.modified.insert((p[0] >> 4, p[2] >> 4));
                 }
                 Ok(())
             }

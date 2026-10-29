@@ -1043,6 +1043,46 @@ mod recursive {
             None => registry.register(pattern),
         }.map_err(|error| format!("{error:?}"))
     }
+    /// Mirror AECraftingPattern.getRecipeIngredient: shaped offsets use the
+    /// occupied grid origin; shapeless uses the index of this filled slot.
+    fn source_crafting_ingredient<'a>(recipes:&'a horizon_client::crafting::Recipes,name:&str,grid:&[Option<ItemStack>],slot:usize)->Option<&'a horizon_client::crafting::Ingredient> {
+        use horizon_client::crafting::Recipe;
+        let name=name.strip_prefix("minecraft:").unwrap_or(name);
+        let (_,recipe)=recipes.crafting.iter().find(|(id,_)|id==name)?;
+        match recipe {
+            Recipe::Shaped{width,cells,..}=>{
+                let top=grid.iter().enumerate().filter(|(_,s)|s.is_some()).map(|(i,_)|i/3).min()?;
+                let left=grid.iter().enumerate().filter(|(_,s)|s.is_some()).map(|(i,_)|i%3).min()?;
+                let x=(slot%3).checked_sub(left)?;let y=(slot/3).checked_sub(top)?;
+                if x>=*width{return None;}cells.get(y.checked_mul(*width)?.checked_add(x)?)?.as_ref()
+            }
+            Recipe::Shapeless{ingredients,..}=>ingredients.get(grid.iter().take(slot).filter(|s|s.is_some()).count()),
+            Recipe::Special(_)=>None,
+        }
+    }
+    /// Produce the source possible-template sequence: first the selected
+    /// item/fluid and fuzzy matching keys, then the recipe ingredient's items
+    /// in holder order. The same key can appear at two distinct amounts.
+    fn source_crafting_templates(recipes:&horizon_client::crafting::Recipes,name:&str,grid:&[Option<ItemStack>],slot:usize,choices:&[String],primary:&str,primary_amount:u64,substitutions:bool)->Vec<(String,u64)> {
+        let mut templates=vec![(primary.to_owned(),primary_amount)];
+        if parse_fluid(primary).is_none() {
+            if let Ok(original)=from_key(primary) {
+                for key in choices {
+                    if key!=primary && from_key(key).is_ok_and(|item|item.item==original.item) {templates.push((key.clone(),primary_amount));}
+                }
+            }
+        }
+        if substitutions {
+            if let Some(ingredient)=source_crafting_ingredient(recipes,name,grid,slot) {
+                for item in &ingredient.1 {
+                    for key in choices {
+                        if from_key(key).is_ok_and(|stack|stack.item.as_ref()==item) {templates.push((key.clone(),1));}
+                    }
+                }
+            }
+        }
+        templates
+    }
     fn output_add(outputs: &mut Inventory, s: &ItemStack) -> Result<(), String> {
         let entry = outputs.entry(canon(s)).or_default();
         *entry = entry
@@ -1361,8 +1401,9 @@ mod recursive {
                     };
                     if encoded_output.item.as_ref()=="ae2:missing_content" || self.res.items().get(&encoded_output.item).is_none()
                         || grid.iter().flatten().any(|item|item.item.as_ref()=="ae2:missing_content"||self.res.items().get(&item.item).is_none()){continue;}
-                    let source_recipe = pattern.as_ref().and_then(|p| super::super::ae2_source_patterns::crafting(p))
-                        .and_then(Result::ok).map(|source| source.recipe);
+                    let source_crafting = pattern.as_ref().and_then(|p| super::super::ae2_source_patterns::crafting(p))
+                        .and_then(Result::ok);
+                    let source_recipe = source_crafting.as_ref().map(|source|source.recipe.clone());
                     let (name, actual) = if let Some(recipe) = source_recipe.as_deref() {
                         let Some(actual) = self.res.recipes().assemble_named(recipe, &grid, 3) else { continue; };
                         (recipe.strip_prefix("minecraft:").unwrap_or(recipe), actual)
@@ -1457,14 +1498,25 @@ mod recursive {
                     let inputs: Vec<_> = choices.iter().enumerate().filter(|(_, choices)|!choices.is_empty())
                         .map(|(index, choices)| Ingredient {
                             choices: choices.iter().cloned().map(|key| {
-                                let amount = fluid_slots.get(&index).filter(|(fluid,_)| fluid == &key).map_or(1, |(_, amount)| *amount);
+                                let primary=source_inputs[index].as_ref().is_some_and(|input|input.primary==key);
+                                let item_amount=if primary {source_crafting.as_ref().map_or(1,|source|source.input_amounts[index])} else {1};
+                                let amount = fluid_slots.get(&index).filter(|(fluid,_)| fluid == &key).map_or(item_amount, |(_, amount)| *amount);
                                 (key, amount)
                             }).collect(),
                         }).collect();
+                    let multipliers=source_crafting.as_ref().map(|source|choices.iter().enumerate()
+                        .filter(|(_,choices)|!choices.is_empty()).map(|(index,_)|source.input_amounts[index]).collect());
+                    let templates=source_crafting.as_ref().map(|source|choices.iter().enumerate().filter(|(_,choices)|!choices.is_empty()).map(|(index,choices)| {
+                        let primary=&source_inputs[index].as_ref().expect("source crafting input").primary;
+                        let amount=fluid_slots.get(&index).filter(|(fluid,_)|fluid==primary).map_or(source.input_amounts[index],|(_,amount)|*amount);
+                        source_crafting_templates(self.res.recipes(),name,&grid,index,choices,primary,amount,substitutions)
+                    }).collect());
                     register_source_pattern(&mut registry, ExtendedPattern {
                         id:id.clone(), inputs, outputs,
                     }, source)?;
                     registry.set_source_inputs(&id,source_inputs.into_iter().flatten().collect()).map_err(|error|format!("{error:?}"))?;
+                    if let Some(multipliers)=multipliers {registry.set_source_multipliers(&id,multipliers).map_err(|error|format!("{error:?}"))?;}
+                    if let Some(templates)=templates {registry.set_source_templates(&id,templates).map_err(|error|format!("{error:?}"))?;}
                     registry.set_source_outputs(&id,[canon(&actual)]).map_err(|error|format!("{error:?}"))?;
                     specs.insert(id, Spec {
                         provider: owner,
@@ -3375,7 +3427,7 @@ mod recursive {
                         self.world.modified.insert((p.0 >> 4, p.2 >> 4));
                     }
                     let mut plan = super::super::ae2_buses::FormationPlan::default();
-                    let mut drops = Vec::new();
+                    let mut remaining = BTreeMap::<String,(ItemStack,u64)>::new();
                     for (_, address, _, items, fluids) in &jobs {
                         for item in items {
                             let inserted = self
@@ -3388,10 +3440,9 @@ mod recursive {
                                 .unwrap_or(0)
                                 .min(u64::from(item.count));
                             if inserted < u64::from(item.count) {
-                                drops.push(ItemStack {
-                                    count: item.count - inserted as u32,
-                                    ..item.clone()
-                                });
+                                let mut prototype=item.clone();prototype.count=1;
+                                let entry=remaining.entry(canon(&prototype)).or_insert((prototype,0));
+                                entry.1=entry.1.checked_add(u64::from(item.count)-inserted).ok_or("CPU break drop amount overflow")?;
                             }
                         }
                         for (key, amount) in fluids {
@@ -3400,6 +3451,17 @@ mod recursive {
                                 *address, key, *amount, true, false,
                             );
                         }
+                    }
+                    let mut drops=Vec::new();
+                    for (_, (prototype,amount)) in remaining {
+                        // CraftingBlockEntity.breakCluster calls AEItemKey.addDrops
+                        // with a fresh list for every exact key after cancel().
+                        let mut key_drops=Vec::new();
+                        super::super::spill::append_ae2_key_drops(&mut key_drops,&prototype,amount,&|stack| {
+                            let default=self.res.items().get(&stack.item).map_or(64,|info|info.max_stack).max(1);
+                            super::super::ae2_formation::max_stack(stack,default)
+                        });
+                        drops.try_reserve(key_drops.len()).map_err(|_|"CPU break drop allocation failed")?;drops.extend(key_drops);
                     }
                     self.ae2_commit_formation(plan)?;
                     Ok(drops)
@@ -4499,6 +4561,27 @@ mod recursive {
             let mut value=serde_json::to_value(&legacy).unwrap();value.as_object_mut().unwrap().remove("choices");
             let oldest:Spec=serde_json::from_value(value).unwrap();
             let (_,fluids)=choose_grid(&oldest,&step,&recipes,&stations).unwrap();assert_eq!(fluids,BTreeMap::from([(0,(water,1000))]));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        #[test]
+        fn nonunit_source_crafting_never_partially_moves_escrow_into_assembler() {
+            let resources=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.local/resources/26.3");
+            if !resources.join("items.json").exists(){return;}
+            let items=horizon_client::items::Items::catalog(&resources).unwrap();
+            let root=std::env::temp_dir().join(format!("ae2-nonunit-grid-{}",std::process::id()));
+            let dir=root.join("data/minecraft/recipe");std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("nonunit.json"),r#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:oak_log"],"result":{"id":"minecraft:oak_planks","count":4}}"#).unwrap();
+            let recipes=horizon_client::crafting::Recipes::load(&root,&items).unwrap();let stations=horizon_client::stations::StationData::load(&resources,&items);
+            let input=canon(&ItemStack::new("minecraft:oak_log",1));let output=canon(&ItemStack::new("minecraft:oak_planks",4));
+            let mut grid=vec!["-".to_string();9];grid[0]=input.clone();let mut choices=vec![Vec::new();9];choices[0]=vec![input.clone()];
+            let mut recipe_grid=vec![None;9];recipe_grid[0]=Some(ItemStack::new("minecraft:oak_log",1));
+            assert_eq!(source_crafting_templates(&recipes,"minecraft:nonunit",&recipe_grid,0,&choices[0],&input,2,true),vec![(input.clone(),2),(input.clone(),1)]);
+            let spec=Spec{provider:ProviderOwner::Block(GridAddress::from_local(super::super::super::Dim::Overworld,(0,64,0)).unwrap()),slot:0,definition:None,
+                crafting_recipe:Some("minecraft:nonunit".into()),grid,choices,fluid_slots:BTreeMap::new(),processing:false,special:None,special_grid_version:0,
+                fluid_inputs:Vec::new(),fluid_outputs:Vec::new(),extra_outputs:Vec::new(),output:item_data::canon_stack(Some(&ItemStack::new("minecraft:oak_planks",4)))};
+            let mut step=ae2_crafting_core::extended::Step{pattern:"p".into(),inputs:Inventory::from([(input.clone(),4)]),outputs:Inventory::from([(output,4)]),runs:1};
+            let before=step.clone();assert!(choose_grid(&spec,&step,&recipes,&stations).is_none());assert_eq!(step,before);
+            step.inputs.insert(input,1);assert!(choose_grid(&spec,&step,&recipes,&stations).is_some());
             std::fs::remove_dir_all(root).unwrap();
         }
         #[test]

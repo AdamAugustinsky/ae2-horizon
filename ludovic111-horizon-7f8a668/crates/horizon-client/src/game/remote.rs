@@ -5120,7 +5120,7 @@ impl Game<'_> {
     /// when none is open).
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_focused(&self) -> bool {
-        self.ae2_local_priority_focused() || self.ae2_local_craft_focused() || self.ae2_local_terminal_search_focused() || self.screen == Screen::Inventory
+        self.ae2_local_energy_focused() || self.ae2_local_machine_editor_focused() || self.ae2_local_priority_focused() || self.ae2_local_craft_focused() || self.ae2_local_terminal_search_focused() || self.screen == Screen::Inventory
             && self
                 .remote
                 .as_ref()
@@ -5133,6 +5133,8 @@ impl Game<'_> {
         text: Option<&str>,
         key: Option<winit::keyboard::KeyCode>,
     ) {
+        if self.ae2_local_energy_focused() {self.ae2_local_energy_input(text,key);return;}
+        if self.ae2_local_machine_editor_focused() {self.ae2_local_machine_editor_input(text,key);return;}
         if self.ae2_local_priority_focused() {
             self.ae2_local_priority_input(text,key);
             return;
@@ -5188,6 +5190,8 @@ impl Game<'_> {
         &mut self,
         shortcut: horizon_client::clipboard::EditShortcut,
     ) {
+        if self.ae2_local_energy_focused() {self.ae2_local_energy_shortcut(shortcut);return;}
+        if self.ae2_local_machine_editor_focused() {self.ae2_local_machine_editor_shortcut(shortcut);return;}
         if self.ae2_local_priority_focused() {
             self.ae2_local_priority_shortcut(shortcut);
             return;
@@ -5212,6 +5216,8 @@ impl Game<'_> {
     }
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_click(&mut self, ox: f32, oy: f32, right: bool) -> bool {
+        if self.ae2_local_energy.is_some() {return self.ae2_local_energy_click_field(ox,oy,right);}
+        if self.ae2_local_machine_editor_open() {return self.ae2_local_machine_editor_click_field(ox,oy,right);}
         if self.ae2_local_provider_priority_open() {
             return self.ae2_local_priority_click_field(ox,oy,right);
         }
@@ -5240,6 +5246,8 @@ impl Game<'_> {
     }
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_draw(&self, batch: &mut HudBatch, ox: f32, oy: f32) {
+        if self.ae2_local_energy.is_some() {self.ae2_local_energy_draw(batch,ox,oy);return;}
+        if self.ae2_local_machine_editor_open() {self.ae2_local_machine_editor_draw(batch,ox,oy);return;}
         if self.ae2_local_provider_priority_open() {
             self.ae2_local_priority_draw(batch,ox,oy);
             return;
@@ -5426,7 +5434,7 @@ impl Game<'_> {
     }
     #[cfg(feature="ae2-lab")]
     pub(super) fn ae2_is_fake_slot(&self,slot:usize)->bool {
-        if self.remote.is_some() {self.ae2_is_remote_fake_slot(slot)}else{self.ae2_local_encoding_fake_slot(slot)}
+        if self.remote.is_some() {self.ae2_is_remote_fake_slot(slot)}else{self.ae2_local_bus_fake_slot(slot) || self.ae2_local_machine_fake_slot(slot) || self.ae2_local_encoding_fake_slot(slot)}
     }
     #[cfg(feature="ae2-lab")]
     pub(super) fn ae2_fake_drag_action(&mut self,slot:usize,single:bool) {
@@ -5435,7 +5443,8 @@ impl Game<'_> {
             // classified fake slot. They never enter vanilla prediction.
             let button=if single {2}else{3};
             self.remote_menu_ops(&[(Some(slot),button,Input::Pickup)]);
-        } else {self.ae2_local_encoding_drag(slot,single);}
+        } else if self.ae2_local_bus_open() {self.ae2_local_bus_drag(slot,single);}
+        else if self.ae2_local_machine_open() {self.ae2_local_machine_drag(slot,single);} else {self.ae2_local_encoding_drag(slot,single);}
     }
     /// Server acknowledgments delimit authoritative updates for each click,
     /// including rejected and intermediate drag stages.

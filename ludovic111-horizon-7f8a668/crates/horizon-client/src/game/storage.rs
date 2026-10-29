@@ -157,6 +157,19 @@ impl Game<'_> {
             return;
         }
         #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_machine_open() {
+            let pos=self.container.unwrap();
+            if !self.ae2_local_machine_valid() || !horizon_client::lan::guest::within_block_range(eye,range,[pos.0,pos.1,pos.2]) {
+                self.close_container();self.screen=super::Screen::Playing;self.capture(true);
+            }
+            return;
+        }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_bus_open() {
+            if !self.ae2_local_bus_valid(){self.close_container();self.screen=super::Screen::Playing;self.capture(true);}
+            return;
+        }
+        #[cfg(feature = "ae2-lab")]
         if self.ae2_local_terminal_open() {
             let pos=self.container.unwrap();
             if !self.ae2_local_terminal_valid()
@@ -255,6 +268,10 @@ impl Game<'_> {
         #[cfg(feature = "ae2-lab")]
         if self.ae2_local_provider_open() { return Some(3); }
         #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_machine_open() {return Some(3);}
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_bus_open() {return Some(6);}
+        #[cfg(feature = "ae2-lab")]
         if self.ae2_portable_open() { return Some(6); }
         #[cfg(feature = "ae2-lab")]
         if self.ae2_terminal_open() {
@@ -283,6 +300,10 @@ impl Game<'_> {
         if self.ae2_local_provider_open() {
             return Text::literal(if self.ae2_local_provider_priority_open() { "Priority" } else { "ME Pattern Provider" });
         }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_machine_open() {return Text::literal(self.ae2_local_machine_title());}
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_bus_open() {return Text::literal(self.ae2_local_bus_title());}
         #[cfg(feature = "ae2-lab")]
         if self.ae2_terminal_open() {
             return Text::literal("ME Terminal");

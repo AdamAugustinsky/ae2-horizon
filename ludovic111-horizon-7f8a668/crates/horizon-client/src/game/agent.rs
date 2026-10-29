@@ -706,6 +706,10 @@ impl Game<'_> {
                 v["title"] = json!([{ "text": if self.ae2_local_provider_priority_open() { "Priority" } else { "ME Pattern Provider" } }]);
             }
             #[cfg(feature = "ae2-lab")]
+            if self.ae2_local_machine_open() {v["title"]=json!([{ "text": self.ae2_local_machine_title() }]);}
+            #[cfg(feature = "ae2-lab")]
+            if self.ae2_local_bus_open() {v["title"]=json!([{ "text": self.ae2_local_bus_title() }]);}
+            #[cfg(feature = "ae2-lab")]
             if self.ae2_terminal_open() {
                 v["title"] = json!([{ "text": if self.ae2_local_crafting_terminal_open() {"AE2 Crafting Terminal"} else {"AE2 ME Terminal"} }]);
             }

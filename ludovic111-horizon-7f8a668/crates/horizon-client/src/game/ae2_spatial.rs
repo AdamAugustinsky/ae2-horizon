@@ -74,7 +74,10 @@ struct Block {
     offset: [i32; 3],
     state: BlockStateId,
     entity: Option<BlockEntity>,
+    raw_entity: Option<Tag>,
     name: Option<String>,
+    vanilla_metadata: Option<Tag>,
+    rolled_loot: Option<horizon_client::save::RolledLoot>,
     skip: bool,
 }
 struct Plane {
@@ -283,11 +286,32 @@ impl Game<'_> {
                     let p = (min.0 + x, min.1 + y, min.2 + z);
                     let state = self.world.block(p.0, p.1, p.2);
                     let id = &self.res.facts().get(state).name;
+                    let entity=self.world.block_entities.get(&p).cloned();
+                    let raw_id=match id.as_ref() {
+                        "minecraft:decorated_pot"=>Some("minecraft:decorated_pot"),
+                        "minecraft:chiseled_bookshelf"=>Some("minecraft:chiseled_bookshelf"),
+                        "minecraft:campfire"|"minecraft:soul_campfire"=>Some("minecraft:campfire"),
+                        "minecraft:enchanting_table"=>Some("minecraft:enchanting_table"),
+                        other if other.ends_with("_shelf")=>Some("minecraft:shelf"),
+                        _=>None,
+                    };
+                    let raw_entity=if entity.is_none() {
+                        raw_id.and_then(|expected|super::spill::saved_entity(&self.world,[p.0,p.1,p.2])
+                            .filter(|raw|raw.get("id")==Some(&Tag::String(expected.into()))))
+                    } else {None};
+                    let vanilla_metadata=self.world.block_entities.vanilla_metadata(&p).cloned();
+                    let table=vanilla_metadata.as_ref().and_then(|tag|horizon_client::save::text(tag.get("LootTable")));
+                    let rolled_loot=table.as_deref().and_then(|table|self.world.chunks.get(&(p.0>>4,p.2>>4))
+                        .and_then(|chunk|chunk.saved.as_deref())
+                        .and_then(|saved|saved.rolled_loot.iter().find(|roll|roll.pos==p && roll.table==table)).cloned());
                     blocks.push(Block {
                         offset: [x, y, z],
                         state,
-                        entity: self.world.block_entities.get(&p).cloned(),
+                        entity,
+                        raw_entity,
                         name: self.world.block_names.get(&p).cloned(),
+                        vanilla_metadata,
+                        rolled_loot,
                         skip: blacklist.is_some_and(|set| set.contains(id.as_ref())),
                     });
                 }
@@ -312,6 +336,18 @@ impl Game<'_> {
         strip_frame: bool,
     ) -> Result<(), String> {
         let frame = self.pack.assets.registry.default_state("ae2:matrix_frame");
+        let mut raw_positions=HashSet::new();
+        let mut rolled_positions=HashSet::new();
+        for chunk in keys(min,size).filter_map(|key|self.world.chunks.get(&key)) {
+            if let Some(saved)=chunk.saved.as_deref() {
+                for tag in &saved.block_entities {
+                    if let (Some(Tag::Int(x)),Some(Tag::Int(y)),Some(Tag::Int(z)))=(tag.get("x"),tag.get("y"),tag.get("z")) {
+                        raw_positions.insert((*x,*y,*z));
+                    }
+                }
+                rolled_positions.extend(saved.rolled_loot.iter().map(|roll|roll.pos));
+            }
+        }
         for block in &plane.blocks {
             if skip.contains(&block.offset) {
                 continue;
@@ -333,9 +369,29 @@ impl Game<'_> {
                 .map_err(|e| e.to_string())?;
             if let Some(entity) = &block.entity {
                 self.world.block_entities.insert(p, entity.clone());
+                if let Some(raw)=block.vanilla_metadata.as_ref() {
+                    self.world.block_entities.remember_vanilla_metadata(p,raw);
+                }
             }
             if let Some(name) = &block.name {
                 self.world.block_names.insert(p, name.clone());
+            }
+            if let Some(chunk)=self.world.chunks.get_mut(&(p.0>>4,p.2>>4)) {
+                let old=rolled_positions.remove(&p);
+                let old_raw=raw_positions.remove(&p);
+                if old || block.rolled_loot.is_some() || old_raw || block.raw_entity.is_some() {
+                    let chunk=std::sync::Arc::make_mut(chunk);
+                    let saved=std::sync::Arc::make_mut(chunk.saved.get_or_insert_with(||std::sync::Arc::new(horizon_client::save::ChunkExtras::default())));
+                    saved.rolled_loot.retain(|roll|roll.pos!=p);
+                    if let Some(roll)=block.rolled_loot.as_ref() {
+                        let mut roll=roll.clone();roll.pos=p;saved.rolled_loot.push(roll);
+                    }
+                    saved.block_entities.retain(|tag|tag.get("x")!=Some(&Tag::Int(p.0)) || tag.get("y")!=Some(&Tag::Int(p.1)) || tag.get("z")!=Some(&Tag::Int(p.2)));
+                    if let Some(Tag::Compound(raw))=block.raw_entity.as_ref() {
+                        let mut raw=raw.clone();raw.insert("x".into(),Tag::Int(p.0));raw.insert("y".into(),Tag::Int(p.1));raw.insert("z".into(),Tag::Int(p.2));
+                        saved.block_entities.push(Tag::Compound(raw));
+                    }
+                }
             }
             self.world.modified.insert((p.0 >> 4, p.2 >> 4));
         }

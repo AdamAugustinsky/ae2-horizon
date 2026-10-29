@@ -1195,9 +1195,20 @@ impl LevelAccess for GameLevel<'_> {
         for (k, v) in [("x", pos.x), ("y", pos.y), ("z", pos.z)] {
             nbt.insert(k.into(), Tag::Int(v));
         }
-        if let Some((key, entity)) = horizon_client::save::decode_block_entity(&Tag::Compound(nbt))
-        {
+        let tag=Tag::Compound(nbt);
+        if let Some((key, entity)) = horizon_client::save::decode_block_entity(&tag) {
             self.world.block_entities.insert(key, entity);
+            self.world.modified.insert((key.0 >> 4, key.2 >> 4));
+            #[cfg(feature = "ae2-lab")]
+            {
+                self.world.block_entities.remember_vanilla_metadata(key,&tag);
+                if self.world.block_entities.vanilla_metadata(&key).is_some() {
+                    match tag.get("CustomName").map(|raw|horizon_client::entity_nbt::name_text(raw).plain()) {
+                        Some(name)=>{self.world.block_names.insert(key,name);},
+                        None=>{self.world.block_names.remove(&key);},
+                    }
+                }
+            }
         }
     }
     fn set_command_block_powered(&mut self, pos: BlockPos, powered: bool) -> Option<(bool, bool)> {
@@ -1669,6 +1680,12 @@ struct Game<'a> {
     /// In-frame provider menus retain the original block/part identity.
     #[cfg(feature = "ae2-lab")]
     ae2_local_provider: Option<ae2_terminal::LocalProviderSession>,
+    #[cfg(feature = "ae2-lab")]
+    ae2_local_machine: Option<ae2_terminal::LocalMachineSession>,
+    #[cfg(feature = "ae2-lab")]
+    ae2_local_bus: Option<ae2_bus_ui::GuestBus>,
+    #[cfg(feature = "ae2-lab")]
+    ae2_local_energy: Option<horizon_client::ui::EditBox>,
     #[cfg(feature = "ae2-lab")]
     ae2_local_terminal: Option<ae2_terminal::LocalTerminalSession>,
     #[cfg(feature = "ae2-lab")]
@@ -2677,8 +2694,13 @@ impl Game<'_> {
         let mut removed = vec![false; items.len()];
         let mut cells = horizon_client::entities::ItemCells::new(&items);
         let catalog = self.res.items();
-        let max_stack =
-            |stack: &ItemStack| catalog.get(&stack.item).map_or(64, |i| i.max_stack).max(1);
+        let max_stack = |stack: &ItemStack| {
+            let item_default=catalog.get(&stack.item).map_or(64,|i|i.max_stack).max(1);
+            match stack.data().and_then(|data|data.other("minecraft:max_stack_size")) {
+                Some(horizon_world::nbt::Tag::Int(value))=>(*value).clamp(1,99) as u32,
+                _=>item_default,
+            }
+        };
         // A LAN or server guest only shows the host's items.
         let merging = self.remote.is_none();
         for i in 0..items.len() {
@@ -3504,6 +3526,8 @@ impl Game<'_> {
             self.capture(false);
             return;
         }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_open_local_machine(key,None) {return;}
         if &*name == "minecraft:lectern" {
             self.open_lectern(pos);
             return;
@@ -4120,6 +4144,18 @@ impl Game<'_> {
             #[cfg(feature = "ae2-lab")]
             if !held.as_ref().is_some_and(|s|matches!(s.item.as_ref(),"ae2:entropy_manipulator"|"ae2:color_applicator"))
                 && self.ae2_ensure_machine((hit.pos[0],hit.pos[1],hit.pos[2]))
+                && self.ae2_open_local_machine((hit.pos[0],hit.pos[1],hit.pos[2]),Some(hit.face)) {
+                self.swing_arm();return Ok(true);
+            }
+            #[cfg(feature = "ae2-lab")]
+            if !held.as_ref().is_some_and(|s|matches!(s.item.as_ref(),"ae2:entropy_manipulator"|"ae2:color_applicator"))
+                && self.ae2_ensure_machine((hit.pos[0],hit.pos[1],hit.pos[2]))
+                && self.ae2_open_local_bus((hit.pos[0],hit.pos[1],hit.pos[2]),hit.face) {
+                self.swing_arm();return Ok(true);
+            }
+            #[cfg(feature = "ae2-lab")]
+            if !held.as_ref().is_some_and(|s|matches!(s.item.as_ref(),"ae2:entropy_manipulator"|"ae2:color_applicator"))
+                && self.ae2_ensure_machine((hit.pos[0],hit.pos[1],hit.pos[2]))
                 && self.ae2_open_terminal((hit.pos[0],hit.pos[1],hit.pos[2]),Some(hit.face)) {
                 self.screen=Screen::Inventory;
                 self.capture(false);
@@ -4350,7 +4386,7 @@ impl Game<'_> {
         #[cfg(feature="ae2-lab")]
         self.ae2_orient_placed_block(target,hit.face,self.yaw,self.pitch,ae2_replaced_water.iter().any(|(p,water)|*p==target&&*water));
         #[cfg(feature="ae2-lab")]
-        let state=self.world.block(target[0],target[1],target[2]);
+        let state=self.ae2_apply_item_block_state(target,state,&stack);
         self.mod_block_event(target, state, true);
         if let Some(entity) = BlockEntity::for_block(&self.res.facts().get(state).name) {
             let key = (target[0], target[1], target[2]);
@@ -6027,6 +6063,10 @@ impl Game<'_> {
         if self.ae2_local_provider_open() {
             return (0..36).chain(300..327).collect();
         }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_machine_open() {return (0..36).chain(300..327).collect();}
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_bus_open() {return (0..36).chain(300..354).collect();}
         #[cfg(feature="ae2-lab")]
         if self.ae2_pattern_access_screen() {
             let mut slots:Vec<usize>=(0..36).collect();
@@ -6293,6 +6333,10 @@ impl Game<'_> {
         if self.ae2_local_provider_open() && (300..327).contains(&i) {
             return self.ae2_local_provider_slot_view(i);
         }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_machine_open() && (300..327).contains(&i) {return self.ae2_local_machine_slot_view(i);}
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_bus_open() && (300..354).contains(&i) {return self.ae2_local_bus_slot_view(i);}
         #[cfg(feature="ae2-lab")]
         if (365..374).contains(&i) {return self.remote.as_ref().and_then(|r|r.ae2_terminal_toolbox.as_ref()).and_then(|(_, slots)|slots.get(i-365)).cloned().flatten();}
         #[cfg(feature="ae2-lab")]
@@ -6562,6 +6606,10 @@ impl Game<'_> {
         #[cfg(feature = "ae2-lab")]
         { self.ae2_local_provider = None; self.ae2_local_terminal = None; self.ae2_local_craft = None; }
         #[cfg(feature = "ae2-lab")]
+        let local_machine_items=self.ae2_local_machine_close();
+        #[cfg(feature = "ae2-lab")]
+        {self.ae2_local_bus=None;self.ae2_local_energy=None;}
+        #[cfg(feature = "ae2-lab")]
         self.ae2_portable_close();
         self.reset_inventory_clicks();
         self.close_station();
@@ -6571,6 +6619,8 @@ impl Game<'_> {
             return self.remote_close_container();
         }
         let mut returned: Vec<ItemStack> = self.carried.take().into_iter().collect();
+        #[cfg(feature = "ae2-lab")]
+        returned.extend(local_machine_items);
         returned.extend(self.craft_grid.iter_mut().filter_map(Option::take));
         for stack in returned {
             if let Some(rest) = self.give(stack)
@@ -6700,6 +6750,16 @@ impl Game<'_> {
             for &(slot, button, input) in ops {
                 self.ae2_local_provider_click(slot, button, input);
             }
+            return true;
+        }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_machine_open() {
+            for &(slot,button,input) in ops {self.ae2_local_machine_click(slot,button,input);}
+            return true;
+        }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_bus_open() {
+            for &(slot,button,input) in ops {self.ae2_local_bus_click(slot,button,input);}
             return true;
         }
         if self.remote.is_some() && self.screen == Screen::Inventory {
@@ -7397,7 +7457,7 @@ impl Game<'_> {
                     return;
                 }
                 #[cfg(feature = "ae2-lab")]
-                if self.ae2_local_terminal_open() || self.ae2_local_provider_open() || self.ae2_portable_open() {
+                if self.ae2_local_terminal_open() || self.ae2_local_provider_open() || self.ae2_local_machine_open() || self.ae2_local_bus_open() || self.ae2_portable_open() {
                     self.last_inv_click=None;
                     self.inv_clicks.skip_release();
                     return;
@@ -7778,7 +7838,7 @@ impl Game<'_> {
         };
         let batch = self.screen_batch(size);
         #[cfg(feature = "ae2-lab")]
-        if self.ae2_local_provider_priority_open() || self.ae2_local_craft_screen()==1 || self.ae2_terminal_open() {
+        if self.ae2_local_provider_priority_open() || self.ae2_local_machine_editor_open() || self.ae2_local_energy.is_some() || self.ae2_local_craft_screen()==1 || self.ae2_terminal_open() {
             let (ox,oy)=self.inventory_origin(&batch);
             if self.ae2_search_click(ox,oy,right) {return;}
         }
@@ -7794,9 +7854,22 @@ impl Game<'_> {
         }
         #[cfg(feature = "ae2-lab")]
         if self.ae2_local_provider_open() {
-            let input=if held_shift {horizon_client::menu::Input::QuickMove} else {horizon_client::menu::Input::Pickup};
+            let alternate=held_shift || self.ae2_local_provider_priority_open() && self.has_control_down();
+            let input=if alternate {horizon_client::menu::Input::QuickMove} else {horizon_client::menu::Input::Pickup};
             self.ae2_local_provider_click(Some(slot),i32::from(right),input);
             return;
+        }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_machine_open() {
+            let alternate=held_shift || self.ae2_local_machine_editor_open() && self.has_control_down();
+            let input=if alternate {horizon_client::menu::Input::QuickMove}else{horizon_client::menu::Input::Pickup};
+            self.ae2_local_machine_click(Some(slot),i32::from(right),input);return;
+        }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_bus_open() {
+            let alternate=held_shift || self.ae2_local_energy.is_some() && self.has_control_down();
+            let input=if alternate {horizon_client::menu::Input::QuickMove}else{horizon_client::menu::Input::Pickup};
+            self.ae2_local_bus_click(Some(slot),i32::from(right),input);return;
         }
         #[cfg(feature = "ae2-lab")]
         if self.ae2_terminal_open() || self.ae2_portable_open() {
@@ -8868,6 +8941,8 @@ impl Game<'_> {
         )
         .into_iter()
         .map(|mut c| {
+            #[cfg(feature = "ae2-lab")]
+            self.world.block_entities.project_vanilla_metadata(&mut c);
             #[cfg(feature = "ae2-lab")]
             if let Some(modes) = modes.as_ref() { self.ae2_project_saved_node_modes(&mut c, modes); }
             #[cfg(feature = "ae2-lab")]
@@ -13601,6 +13676,12 @@ impl<'a> Game<'a> {
             ae2_job_ui: ae2_job_ui::JobUi::default(),
             #[cfg(feature = "ae2-lab")]
             ae2_local_provider: None,
+            #[cfg(feature = "ae2-lab")]
+            ae2_local_machine: None,
+            #[cfg(feature = "ae2-lab")]
+            ae2_local_bus: None,
+            #[cfg(feature = "ae2-lab")]
+            ae2_local_energy: None,
             #[cfg(feature = "ae2-lab")]
             ae2_local_terminal: None,
             #[cfg(feature = "ae2-lab")]

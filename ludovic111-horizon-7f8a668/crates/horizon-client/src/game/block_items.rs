@@ -17,6 +17,34 @@ fn components(stack: &ItemStack) -> Compound {
 }
 
 impl Game<'_> {
+    /// `BlockItem.updateBlockStateFromTag`: apply each recognized, valid
+    /// property from the item's block-state component and ignore the rest.
+    /// The source updates the same block with client notification flags.
+    #[cfg(feature = "ae2-lab")]
+    pub(super) fn ae2_apply_item_block_state(&mut self,pos:[i32;3],expected:horizon_world::registry::BlockStateId,stack:&ItemStack)->horizon_world::registry::BlockStateId {
+        let old=self.world.block(pos[0],pos[1],pos[2]);
+        // BlockItem only updates a state when placement left the same block.
+        if self.res.facts().get(old).name!=self.res.facts().get(expected).name{return old}
+        let Some(Tag::Compound(properties))=stack.data().and_then(|data|data.other("minecraft:block_state")) else {return old};
+        let Some(mut state)=self.pack.assets.registry.state(old).cloned() else{return old};
+        let mut next=old;
+        for (key,value) in properties {
+            let Tag::String(value)=value else{continue};
+            let key=key.to_string_lossy();
+            if !state.properties.contains_key(&key){continue}
+            let mut candidate=state.clone();
+            candidate.properties.insert(key,value.to_string_lossy());
+            if let Ok(id)=self.pack.assets.registry.resolve(&candidate){state=candidate;next=id;}
+        }
+        if next!=old {
+            let at=horizon_core::position::BlockPos::new(pos[0],pos[1],pos[2]);
+            self.with_level(|blocks,level,ticks| {
+                blocks.set_block(level,ticks,at,next,horizon_world::level::flags::UPDATE_CLIENTS);
+            });
+        }
+        self.world.block(pos[0],pos[1],pos[2])
+    }
+
     /// The block entity at `key` as vanilla saves it, with its custom name.
     fn saved_block_entity(&self, key: (i32, i32, i32)) -> Option<Tag> {
         let entity = self.world.block_entities.get(&key)?;
@@ -28,6 +56,11 @@ impl Game<'_> {
         let mut tag = save::encode_block_entity(key, entity, block);
         if let (Some(name), Tag::Compound(map)) = (self.world.block_names.get(&key), &mut tag) {
             map.insert("CustomName".into(), Tag::String(name.as_str().into()));
+        }
+        #[cfg(feature = "ae2-lab")]
+        if let Some(original)=self.world.block_entities.vanilla_metadata(&key) {
+            tag=save::live_vanilla_block_entity(key,entity,block,self.world.block_names.get(&key).map(String::as_str),Some(original));
+            self.restore_loot_table(key,&mut tag);
         }
         block_entity_nbt::canonical(&tag)
     }
@@ -109,26 +142,44 @@ impl Game<'_> {
         }
         // Banners and signs keep their name themselves.
         if !matches!(entity, BlockEntity::Banner(_) | BlockEntity::Sign(_)) {
-            match save::text(placed.get("CustomName")) {
+            match placed.get("CustomName").map(|value|horizon_client::entity_nbt::name_text(value).plain()) {
                 Some(name) => self.world.block_names.insert(key, name),
                 None => self.world.block_names.remove(&key),
             };
         }
         self.world.block_entities.insert(key, entity);
         #[cfg(feature = "ae2-lab")]
+        self.world.block_entities.remember_vanilla_metadata(key,&placed);
+        #[cfg(feature = "ae2-lab")]
+        if matches!(self.world.block_entities.get(&key),Some(BlockEntity::Ae2(_))) {
+            let name=super::ae2_memory_host::stack_name_component(stack);
+            match name.as_ref() {
+                Some(raw)=>{self.world.block_names.insert(key,horizon_client::entity_nbt::name_text(raw).plain());},
+                None=>{self.world.block_names.remove(&key);},
+            }
+            if let Some(BlockEntity::Ae2(machine))=self.world.block_entities.get_mut(&key) {
+                super::ae2_memory_host::set_machine_name_component(machine,name.as_ref());
+            }
+        }
+        #[cfg(feature = "ae2-lab")]
         self.ae2_import_dismantled_energy(key, stack);
     }
     /// AE2 energy cells retain stored AE as a physical item component on
-    /// wrench disassembly; restore it when that actual item is placed.
+    /// disassembly; restore it when that actual item is placed.
     #[cfg(feature = "ae2-lab")]
     fn ae2_import_dismantled_energy(&mut self,key:(i32,i32,i32),stack:&ItemStack) {
         use horizon_client::ae2_world::MachineKind;
         let max=match stack.item.as_ref() {"ae2:energy_cell"=>200_000.0,"ae2:dense_energy_cell"=>1_600_000.0,_=>return};
-        let energy=stack.data().and_then(|d|d.other("minecraft:custom_data"))
-            .and_then(|v|v.get("ae2:stored_energy"))
+        let energy=stack.data().and_then(|d|d.other("ae2:stored_energy").or_else(||
+            d.other("minecraft:custom_data").and_then(|v|v.get("ae2:stored_energy"))))
             .and_then(|v|match v {Tag::Double(bits)=>Some(f64::from_bits(*bits)),_=>None})
-            .filter(|v|v.is_finite()&&*v>=0.0&&*v<=max);
+            .filter(|v|v.is_finite());
         let Some(energy)=energy else{return};
+        // EnergyCellBlockEntity.importSettings calls StoredEnergyAmount.setStored:
+        // negative and sub-minimum values become zero; over-capacity clamps.
+        let mut stored=ae2_machines_core::stored_energy::StoredEnergy::new(0.0,max);
+        stored.set_stored(energy);
+        let energy=stored.stored();
         let observed=self.ae2_sync_events();
         let mut changed=false;
         if let Some(BlockEntity::Ae2(machine))=self.world.block_entities.get_mut(&key) {

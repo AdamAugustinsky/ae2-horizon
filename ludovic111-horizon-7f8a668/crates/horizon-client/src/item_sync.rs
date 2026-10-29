@@ -9,6 +9,17 @@ use horizon_protocol::registry::{Builtin, Dynamic};
 use horizon_world::nbt::Tag;
 use std::sync::Arc;
 
+/// Components represented by the native item model but not yet carried by
+/// this host's typed vanilla stream codecs. This envelope is used only between
+/// Horizon peers; vanilla AE2 components remain the existing 35-ID list.
+#[cfg(feature = "ae2-lab")]
+pub(crate) fn enveloped_component(id:&str)->bool {
+    crate::ae2_components::PERSISTENT_IDS.contains(&id)
+        || matches!(id,"minecraft:lock"|"minecraft:container_loot"|"minecraft:bees"
+            |"minecraft:block_state"|"minecraft:pot_decorations"|"minecraft:profile"
+            |"minecraft:note_block_sound")
+}
+
 /// A stack from the wire: its item by the built-in registry's id, its
 /// components by the synced registries' (enchantments, trims).
 pub fn from_network(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> ItemStack {
@@ -34,7 +45,7 @@ pub fn from_network(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> ItemStack
                 let had_custom_data = wrapped.remove(&"had_custom_data".into());
                 if known_fields && wrapped.remove(&"version".into()) == Some(Tag::Byte(1)) && matches!(&had_custom_data, Some(Tag::Byte(0 | 1))) {
                     if let Some(Tag::Compound(components)) = components.filter(|value| {
-                        matches!(value, Tag::Compound(map) if map.keys().all(|id| crate::ae2_components::PERSISTENT_IDS.contains(&id.to_string_lossy().as_str())))
+                        matches!(value, Tag::Compound(map) if map.keys().all(|id| enveloped_component(&id.to_string_lossy())))
                     }) {
                         envelope.remove(&key.into());
                         if let Some(previous) = wrapped.remove(&"previous".into()) {
@@ -43,7 +54,16 @@ pub fn from_network(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> ItemStack
                         let data = out.data_mut();
                         data.set_other("minecraft:custom_data", (had_custom_data == Some(Tag::Byte(1)) || !envelope.is_empty()).then_some(Tag::Compound(envelope)));
                         for (id, value) in components {
-                            data.set_other(&id.to_string_lossy(), Some(value));
+                            let id=id.to_string_lossy();
+                            if id=="minecraft:pot_decorations" {
+                                // Pot decorations have a typed StackData field;
+                                // use the existing persistent codec to reconstruct it.
+                                let tag=Tag::compound([("minecraft:pot_decorations",value)]);
+                                let (_,parsed)=crate::item_data::decode_components(Some(&tag));
+                                data.pot_decorations=parsed.and_then(|value|value.pot_decorations);
+                            } else {
+                                data.set_other(&id, Some(value));
+                            }
                         }
                     }
                 }
@@ -332,6 +352,47 @@ mod tests {
         assert_eq!(round(&pair), pair, "zero remains a present component");
         pair.data_mut().set_other("minecraft:custom_data", Some(Tag::compound([] as [(&str, Tag); 0])));
         assert_eq!(round(&pair), pair, "an explicitly empty custom-data component remains present");
+    }
+
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn physical_block_drop_components_survive_client_and_creative_slot_wire() {
+        use horizon_protocol::{buf::{Codec,Reader,Writer},item::Slot};
+        let names=["minecraft:shulker_box","minecraft:beehive","minecraft:decorated_pot","minecraft:archer_pottery_sherd","minecraft:diamond"];
+        let mut components=vec![String::new();78];
+        components[component::CUSTOM_DATA as usize]="minecraft:custom_data".into();
+        components[component::CONTAINER as usize]="minecraft:container".into();
+        let builtin=Builtin {registries:[
+            ("minecraft:item".into(),Ids::from_names(names.iter().map(|name|name.to_string()).collect())),
+            ("minecraft:data_component_type".into(),Ids::from_names(components)),
+        ].into()};
+        let round=|item:&ItemStack| {
+            let packet=crate::lan::guest::stack_to_network(|name|builtin.get("minecraft:item").unwrap().id(name).unwrap(),|_,_|None,&Some(item.clone()));
+            let mut writer=Writer::new();Slot::write(&packet,&mut writer);
+            let mut reader=Reader::new(&writer.data);let decoded=Slot::read(&mut reader).unwrap().unwrap();
+            assert_eq!(reader.remaining(),0);
+            from_network(&decoded,&builtin,&Dynamic::default())
+        };
+        let lock=Tag::compound([("components",Tag::compound([("minecraft:custom_name",Tag::String("Key".into()))]))]);
+        let loot=Tag::compound([("loot_table",Tag::String("minecraft:chests/simple_dungeon".into())),("seed",Tag::Long(12))]);
+        let mut shulker=ItemStack::new("minecraft:shulker_box",1);
+        shulker.data_mut().set_other("minecraft:lock",Some(lock));
+        shulker.data_mut().set_other("minecraft:container_loot",Some(loot));
+        shulker.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("horizon:wire_ae2_components",Tag::String("existing".into()))])));
+        assert_eq!(round(&shulker),shulker,"the lock, loot and existing colliding custom data survive");
+        let mut hive=ItemStack::new("minecraft:beehive",1);
+        hive.data_mut().set_other("minecraft:bees",Some(Tag::List(vec![Tag::compound([
+            ("entity_data",Tag::compound([("id",Tag::String("minecraft:bee".into()))])),
+            ("ticks_in_hive",Tag::Int(7)),("min_ticks_in_hive",Tag::Int(600)),
+        ])])));
+        hive.data_mut().set_other("minecraft:block_state",Some(Tag::compound([("honey_level",Tag::String("4".into()))])));
+        assert_eq!(round(&hive),hive,"the bees and actual block state survive");
+        let mut pot=ItemStack::new("minecraft:decorated_pot",1);
+        pot.data_mut().pot_decorations=Some(Box::new([Some(ItemStack::new("minecraft:archer_pottery_sherd",1)),None,None,None]));
+        assert_eq!(round(&pot),pot,"modeled pot decorations survive");
+        let mut container=ItemStack::new("minecraft:shulker_box",1);
+        container.data_mut().container=vec![(3,hive)];
+        assert_eq!(round(&container),container,"nested item components survive the same wire path");
     }
 
     #[cfg(feature = "ae2-lab")]

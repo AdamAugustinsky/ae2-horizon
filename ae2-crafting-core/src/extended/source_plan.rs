@@ -81,6 +81,7 @@ impl<'a,'b> SourcePlanner<'a,'b> {
             .unwrap_or_else(||pattern.inputs[slot].choices.keys().next().unwrap().clone())
     }
     fn group_multiplier(&self,pattern:&Pattern,slot:usize)->u64 {
+        if let Some(amount)=self.registry.source_multipliers.get(&pattern.id).and_then(|values|values.get(slot)) {return *amount;}
         let choices=&pattern.inputs[slot].choices;
         if choices.len()!=1 {return 1;}
         let Some((key,count))=choices.iter().next() else{return 1;};
@@ -101,14 +102,17 @@ impl<'a,'b> SourcePlanner<'a,'b> {
     fn choices(&self,pattern:Option<(&Pattern,usize)>,key:&str)->Inventory {
         pattern.map(|(p,slot)| {
             let mut choices=p.inputs[slot].choices.clone();
-            if self.group_multiplier(p,slot)!=1 {
+            if !self.registry.source_multipliers.contains_key(&p.id) && self.group_multiplier(p,slot)!=1 {
                 if let Some(value)=choices.get_mut(key) {*value=1;}
             }
             choices
         })
             .unwrap_or_else(||Inventory::from([(key.to_owned(),1)]))
     }
-    fn ordered_choices(&self,choices:&Inventory,primary:&str)->Vec<(String,u64)> {
+    fn ordered_choices(&self,parent:Option<(&Pattern,usize)>,choices:&Inventory,primary:&str)->Vec<(String,u64)> {
+        if let Some(templates)=parent.and_then(|(pattern,slot)|self.registry.source_templates.get(&pattern.id).and_then(|slots|slots.get(slot))) {
+            return templates.clone();
+        }
         let mut ordered=Vec::with_capacity(choices.len());
         if let Some(amount)=choices.get(primary) {ordered.push((primary.to_owned(),*amount));}
         ordered.extend(choices.iter().filter(|(key,_)|key.as_str()!=primary).map(|(key,n)|(key.clone(),*n)));
@@ -129,7 +133,7 @@ impl<'a,'b> SourcePlanner<'a,'b> {
             return Ok(primary.to_owned());
         }
         let amount=choices.get(primary).copied().ok_or(Error::InvalidPattern)?;
-        for (candidate,per) in self.ordered_choices(choices,primary) {
+        for (candidate,per) in self.ordered_choices(parent,choices,primary) {
             if per==amount && self.has_source_pattern(&candidate)? {return Ok(candidate);}
         }
         Ok(primary.to_owned())
@@ -149,7 +153,7 @@ impl<'a,'b> SourcePlanner<'a,'b> {
                     let crafted=self.crafted_key(parent_ref,&key,&choices)?;
                     self.add_bytes(&mut state,self.stack_bytes(&crafted,primary_amount.checked_mul(count).ok_or(Error::Overflow)?))?;
                     let mut need=count;let mut used=Inventory::new();let mut remainders=Inventory::new();
-                    for (candidate,per) in self.ordered_choices(&choices,&key) {
+                    for (candidate,per) in self.ordered_choices(parent_ref,&choices,&key) {
                         let selected=(state.available.get(&candidate).copied().unwrap_or(0)/per).min(need);
                         if selected==0 {continue;}
                         let quantity=selected.checked_mul(per).ok_or(Error::Overflow)?;
@@ -282,7 +286,7 @@ impl<'a,'b> SourcePlanner<'a,'b> {
         let crafted=self.crafted_key(parent,key,&choices)?;
         self.add_bytes(state,self.stack_bytes(&crafted,primary_amount.checked_mul(count).ok_or(Error::Overflow)?))?;
         let mut need=count;let mut used=Inventory::new();let mut remainders=Inventory::new();
-        for (candidate,per) in self.ordered_choices(&choices,key) {
+        for (candidate,per) in self.ordered_choices(parent,&choices,key) {
             let possible=state.available.get(&candidate).copied().unwrap_or(0)/per;
             let selected=possible.min(need);
             if selected==0 {continue;}
@@ -391,7 +395,11 @@ impl<'a,'b> SourcePlanner<'a,'b> {
             state.insert(key,n)?;add(&mut outputs,key,n)?;
         }
         self.add_bytes(state,u128::from(times)*1000)?;
-        if inputs.values().any(|n|n%times!=0) || outputs.values().any(|n|n%times!=0) {
+        let mixed=times>1 && selections.iter().any(|(slot,_,taken)|taken.len()>1
+            || self.registry.source_templates.get(&pattern.id).and_then(|templates|templates.get(*slot)).is_some_and(|templates| {
+                templates.iter().enumerate().any(|(index,(key,amount))|templates[..index].iter().any(|(other,n)|key==other && amount!=n))
+            }));
+        if mixed || inputs.values().any(|n|n%times!=0) || outputs.values().any(|n|n%times!=0) {
             // Preserve the selected physical keys per push, batching only
             // contiguous pushes with exactly the same key/remainder shape.
             // Work is proportional to changes in selection, not push count.
@@ -400,7 +408,7 @@ impl<'a,'b> SourcePlanner<'a,'b> {
             for (slot,_,_) in &selections {
                 let primary=self.primary(pattern,*slot);
                 let choices=self.choices(Some((pattern,*slot)),&primary);
-                orders.push(self.ordered_choices(&choices,&primary));
+                orders.push(self.ordered_choices(Some((pattern,*slot)),&choices,&primary));
             }
             let mut offsets=vec![0;selections.len()];
             while remaining_runs>0 {
@@ -409,14 +417,14 @@ impl<'a,'b> SourcePlanner<'a,'b> {
                 let mut consumed=Vec::<(usize,String,u64)>::new();
                 let mut batch=remaining_runs;
                 for (index,(slot,multiplicity,taken)) in selections.iter().enumerate() {
-                    let mut needed=*multiplicity;
+                    let mut needed=*multiplicity;let mut per_group=Inventory::new();
                     for (key,per) in orders[index].iter().skip(offsets[index]) {
                         if needed==0 {break;}
-                        let available=taken.get(key).copied().unwrap_or(0)/ *per;
+                        let available=taken.get(key).copied().unwrap_or(0).saturating_sub(per_group.get(key).copied().unwrap_or(0))/ *per;
                         if available==0 {offsets[index]+=1;continue;}
                         let selected=available.min(needed);
                         let quantity=selected.checked_mul(*per).ok_or(Error::Overflow)?;
-                        add(&mut per_input,key,quantity)?;
+                        add(&mut per_input,key,quantity)?;add(&mut per_group,key,quantity)?;
                         if let Some(remainder)=self.registry.source_inputs.get(&pattern.id)
                             .and_then(|v|v.get(*slot)).and_then(|input|input.remaining.get(key)) {
                             add(&mut per_output,remainder,selected)?;
@@ -426,11 +434,13 @@ impl<'a,'b> SourcePlanner<'a,'b> {
                         needed-=selected;
                     }
                     if needed!=0 {return Err(Error::InvalidPattern);}
+                    // Repeated template keys share one real inventory balance.
+                    for (key,quantity) in per_group {batch=batch.min(taken.get(&key).copied().unwrap_or(0)/quantity);}
                 }
                 if batch==0 {return Err(Error::InvalidPattern);}
                 for (index,key,quantity) in consumed {
                     let amount=quantity.checked_mul(batch).ok_or(Error::Overflow)?;
-                    take(&mut selections[index].2,&key,amount);
+                    if !take(&mut selections[index].2,&key,amount) {return Err(Error::InvalidPattern);}
                 }
                 for key in pattern.outputs.keys() {
                     let n=self.source_output_count(pattern,key)?;
@@ -464,7 +474,11 @@ impl<'a,'b> SourcePlanner<'a,'b> {
             state.insert(key,n)?;add(&mut outputs,key,n)?;
         }
         self.add_bytes(state,u128::from(times)*1000)?;
-        if inputs.values().any(|n|n%times!=0) || outputs.values().any(|n|n%times!=0) {
+        let mixed=times>1 && selections.iter().any(|(slot,_,taken)|taken.len()>1
+            || self.registry.source_templates.get(&pattern.id).and_then(|templates|templates.get(*slot)).is_some_and(|templates| {
+                templates.iter().enumerate().any(|(index,(key,amount))|templates[..index].iter().any(|(other,n)|key==other && amount!=n))
+            }));
+        if mixed || inputs.values().any(|n|n%times!=0) || outputs.values().any(|n|n%times!=0) {
             // Preserve the selected physical keys per push, batching only
             // contiguous pushes with exactly the same key/remainder shape.
             // Work is proportional to changes in selection, not push count.
@@ -473,7 +487,7 @@ impl<'a,'b> SourcePlanner<'a,'b> {
             for (slot,_,_) in &selections {
                 let primary=self.primary(pattern,*slot);
                 let choices=self.choices(Some((pattern,*slot)),&primary);
-                orders.push(self.ordered_choices(&choices,&primary));
+                orders.push(self.ordered_choices(Some((pattern,*slot)),&choices,&primary));
             }
             let mut offsets=vec![0;selections.len()];
             while remaining_runs>0 {
@@ -482,14 +496,14 @@ impl<'a,'b> SourcePlanner<'a,'b> {
                 let mut consumed=Vec::<(usize,String,u64)>::new();
                 let mut batch=remaining_runs;
                 for (index,(slot,multiplicity,taken)) in selections.iter().enumerate() {
-                    let mut needed=*multiplicity;
+                    let mut needed=*multiplicity;let mut per_group=Inventory::new();
                     for (key,per) in orders[index].iter().skip(offsets[index]) {
                         if needed==0 {break;}
-                        let available=taken.get(key).copied().unwrap_or(0)/ *per;
+                        let available=taken.get(key).copied().unwrap_or(0).saturating_sub(per_group.get(key).copied().unwrap_or(0))/ *per;
                         if available==0 {offsets[index]+=1;continue;}
                         let selected=available.min(needed);
                         let quantity=selected.checked_mul(*per).ok_or(Error::Overflow)?;
-                        add(&mut per_input,key,quantity)?;
+                        add(&mut per_input,key,quantity)?;add(&mut per_group,key,quantity)?;
                         if let Some(remainder)=self.registry.source_inputs.get(&pattern.id)
                             .and_then(|v|v.get(*slot)).and_then(|input|input.remaining.get(key)) {
                             add(&mut per_output,remainder,selected)?;
@@ -499,11 +513,13 @@ impl<'a,'b> SourcePlanner<'a,'b> {
                         needed-=selected;
                     }
                     if needed!=0 {return Err(Error::InvalidPattern);}
+                    // Repeated template keys share one real inventory balance.
+                    for (key,quantity) in per_group {batch=batch.min(taken.get(&key).copied().unwrap_or(0)/quantity);}
                 }
                 if batch==0 {return Err(Error::InvalidPattern);}
                 for (index,key,quantity) in consumed {
                     let amount=quantity.checked_mul(batch).ok_or(Error::Overflow)?;
-                    take(&mut selections[index].2,&key,amount);
+                    if !take(&mut selections[index].2,&key,amount) {return Err(Error::InvalidPattern);}
                 }
                 for key in pattern.outputs.keys() {
                     let n=self.source_output_count(pattern,key)?;
@@ -565,6 +581,75 @@ mod tests {
     fn ingredient(key:&str)->Ingredient {Ingredient{choices:inv(&[(key,1)])}}
     fn pattern(id:&str,out:&str,n:u64,inputs:&[&str])->Pattern {
         Pattern{id:id.into(),inputs:inputs.iter().map(|key|ingredient(key)).collect(),outputs:inv(&[(out,n)])}
+    }
+    #[test]
+    fn source_crafting_distinguishes_condensed_multiplier_from_template_amount() {
+        let metadata=SourceInput{encoded:"oak".into(),primary:"oak".into(),remaining:BTreeMap::new()};
+        let mut registry=Registry::default();
+        registry.register(Pattern{id:"wrapped".into(),inputs:vec![Ingredient{choices:inv(&[("oak",2)])}],outputs:inv(&[("board",4)])}).unwrap();
+        registry.set_source_inputs("wrapped",vec![metadata.clone()]).unwrap();
+        registry.set_source_multipliers("wrapped",vec![2]).unwrap();
+        let plan=registry.plan(&inv(&[("oak",4)]),"board",4).unwrap();
+        assert_eq!(plan.estimated_bytes,25);assert_eq!(plan.reserved,inv(&[("oak",4)]));
+        assert_eq!(plan.steps[0].inputs,inv(&[("oak",4)]));
+        assert_eq!(registry.plan(&inv(&[("oak",3)]),"board",4),Err(Error::Missing("oak".into(),2)));
+        let mut grouped=Registry::default();
+        grouped.register(Pattern{id:"grouped".into(),inputs:vec![Ingredient{choices:inv(&[("oak",2)])},Ingredient{choices:inv(&[("oak",1)])}],outputs:inv(&[("board",4)])}).unwrap();
+        grouped.set_source_inputs("grouped",vec![metadata.clone(),metadata]).unwrap();
+        grouped.set_source_multipliers("grouped",vec![2,1]).unwrap();
+        let plan=grouped.plan(&inv(&[("oak",6)]),"board",4).unwrap();
+        assert_eq!(plan.estimated_bytes,27);assert_eq!(plan.reserved,inv(&[("oak",6)]));assert_eq!(plan.steps[0].inputs,inv(&[("oak",6)]));
+        let mut mixed=Registry::default();
+        mixed.register(Pattern{id:"mixed".into(),inputs:vec![Ingredient{choices:inv(&[("oak",2),("birch",1)])}],outputs:inv(&[("board",4)])}).unwrap();
+        mixed.set_source_inputs("mixed",vec![SourceInput{encoded:"oak".into(),primary:"oak".into(),remaining:BTreeMap::new()}]).unwrap();
+        mixed.set_source_multipliers("mixed",vec![2]).unwrap();
+        let plan=mixed.plan(&inv(&[("oak",2),("birch",1)]),"board",4).unwrap();
+        assert_eq!(plan.estimated_bytes,25);assert_eq!(plan.reserved,inv(&[("oak",2),("birch",1)]));
+        assert!(grouped.set_source_multipliers("grouped",vec![0,1]).is_err());
+        assert!(grouped.set_source_multipliers("grouped",vec![1]).is_err());
+    }
+    #[test]
+    fn duplicate_template_amounts_and_even_mixed_totals_retain_real_pushes() {
+        let meta=SourceInput{encoded:"oak".into(),primary:"oak".into(),remaining:BTreeMap::new()};
+        let mut duplicate=Registry::default();
+        duplicate.register(Pattern{id:"duplicate".into(),inputs:vec![Ingredient{choices:inv(&[("oak",2),("birch",1)])}],outputs:inv(&[("board",4)])}).unwrap();
+        duplicate.set_source_inputs("duplicate",vec![meta.clone()]).unwrap();duplicate.set_source_multipliers("duplicate",vec![2]).unwrap();
+        duplicate.set_source_templates("duplicate",vec![vec![("oak".into(),2),("oak".into(),1),("birch".into(),1)]]).unwrap();
+        let one=duplicate.plan(&inv(&[("oak",3)]),"board",4).unwrap();assert_eq!(one.estimated_bytes,25);assert_eq!(one.reserved,inv(&[("oak",3)]));
+        let two=duplicate.plan(&inv(&[("oak",7)]),"board",8).unwrap();assert_eq!(two.estimated_bytes,34);assert_eq!(two.reserved,inv(&[("oak",7)]));
+        assert_eq!(two.steps.len(),2);assert_eq!(two.steps[0].inputs,inv(&[("oak",4)]));assert_eq!(two.steps[1].inputs,inv(&[("oak",3)]));
+        let mut different=duplicate.clone();different.set_source_templates("duplicate",vec![vec![("oak".into(),2),("birch".into(),1)]]).unwrap();
+        assert!(!duplicate.same_definitions(&different));
+        let mut even=Registry::default();even.register(Pattern{id:"even".into(),inputs:vec![Ingredient{choices:inv(&[("oak",1),("birch",1)])}],outputs:inv(&[("board",4)])}).unwrap();
+        even.set_source_inputs("even",vec![meta]).unwrap();even.set_source_multipliers("even",vec![3]).unwrap();
+        let two=even.plan(&inv(&[("oak",4),("birch",2)]),"board",8).unwrap();assert_eq!(two.estimated_bytes,32);
+        assert_eq!(two.steps.len(),2);assert_eq!(two.steps[0].inputs,inv(&[("oak",3)]));assert_eq!(two.steps[1].inputs,inv(&[("oak",1),("birch",2)]));
+    }
+    #[test]
+    fn duplicate_templates_batch_like_source_per_push_greedy_selection() {
+        for multiplier in 1..=4 {for runs in 1..=5 {
+            let mut registry=Registry::default();
+            registry.register(Pattern{id:"p".into(),inputs:vec![Ingredient{choices:inv(&[("oak",2),("birch",1)])}],outputs:inv(&[("board",4)])}).unwrap();
+            registry.set_source_inputs("p",vec![SourceInput{encoded:"oak".into(),primary:"oak".into(),remaining:BTreeMap::new()}]).unwrap();
+            registry.set_source_multipliers("p",vec![multiplier]).unwrap();
+            registry.set_source_templates("p",vec![vec![("oak".into(),2),("oak".into(),1),("birch".into(),1)]]).unwrap();
+            for oak in 0..=24 {for birch in 0..=8 {
+                let Ok(plan)=registry.plan(&inv(&[("oak",oak),("birch",birch)]),"board",4*runs) else{continue};
+                let mut remaining=plan.reserved.clone();let mut expected=Vec::new();
+                for _ in 0..runs {
+                    let mut need=multiplier;let mut one=Inventory::new();
+                    for (key,amount) in [("oak",2),("oak",1),("birch",1)] {
+                        let selected=(remaining.get(key).copied().unwrap_or(0)/amount).min(need);
+                        if selected>0 {let total=selected*amount;assert!(take(&mut remaining,key,total));add(&mut one,key,total).unwrap();need-=selected;}
+                    }
+                    assert_eq!(need,0,"source plan must support each push: multiplier={multiplier} runs={runs} oak={oak} birch={birch}");expected.push(one);
+                }
+                let mut actual=Vec::new();
+                for step in plan.steps {for _ in 0..step.runs {actual.push(step.inputs.iter().map(|(key,value)|(key.clone(),value/step.runs)).collect::<Inventory>());}}
+                assert_eq!(actual,expected,"multiplier={multiplier} runs={runs} oak={oak} birch={birch}");
+                assert!(remaining.is_empty());
+            }}
+        }}
     }
     #[test]
     fn thousands_of_source_candidate_nodes_keep_their_exact_byte_charge() {

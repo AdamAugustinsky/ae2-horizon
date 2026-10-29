@@ -545,17 +545,23 @@ fn network_stack(
         // CUSTOM_DATA is an NBT compound on the wire. It may contain storage
         // cells' real contents; omitting it silently changes item identity.
         let mut custom_data = d.other("minecraft:custom_data").cloned();
-        // The vanilla wire registry has no AE2 component codecs. Carry all
-        // source-registered AE2 components in one versioned transport-only
-        // envelope, independent of item type. Escape an occupied key even if
-        // no AE2 components are present so arbitrary custom data roundtrips.
+        // Carry source-registered AE2 components and the explicitly listed
+        // native components lacking typed stream support in the existing
+        // versioned Horizon-only envelope. Escape an occupied key even when
+        // the item has no such components, preserving arbitrary custom data.
         #[cfg(feature = "ae2-lab")]
         {
             use horizon_world::nbt::Tag;
             let mut components = horizon_world::nbt::Compound::new();
             for (id, value) in &d.other {
-                if crate::ae2_components::PERSISTENT_IDS.contains(&id.as_str()) {
+                if crate::item_sync::enveloped_component(id) {
                     components.insert(id.as_str().into(), value.clone());
+                }
+            }
+            if d.pot_decorations.is_some() {
+                if let Some(value)=crate::item_data::encode_components(s)
+                    .and_then(|tag|tag.get("minecraft:pot_decorations").cloned()) {
+                    components.insert("minecraft:pot_decorations".into(),value);
                 }
             }
             let key = "horizon:wire_ae2_components";

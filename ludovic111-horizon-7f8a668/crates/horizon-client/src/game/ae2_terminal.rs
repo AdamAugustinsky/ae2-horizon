@@ -4869,8 +4869,35 @@ struct WorkbenchRevision { state:i32, page:usize, keep:bool }
 fn workbench_revision_matches(history:&std::collections::VecDeque<WorkbenchRevision>,state:i32,page:usize,keep:bool)->bool {
     history.iter().rev().find(|revision|revision.state==state).is_some_and(|revision|revision.page==page && revision.keep==keep)
 }
+fn ae2_link_slot_click(dim:&str,pos:(i32,i32,i32),slot:usize,button:i32,input:Input,
+    carried:&mut Option<ItemStack>,link_input:&mut Option<ItemStack>,link_output:&mut Option<ItemStack>) {
+    if input!=Input::Pickup || !(0..=1).contains(&button) || !matches!(slot,1|2) {return;}
+    if slot==1 {
+        if carried.is_none() {*carried=link_input.take();}
+        else if link_input.is_none() && carried.as_ref().is_some_and(|item|item.count==1 && matches!(item.item.as_ref(),"ae2:wireless_terminal"|"ae2:wireless_crafting_terminal")) {
+            *link_input=carried.take();
+        }
+    } else if carried.is_none() {*carried=link_output.take();}
+    if link_output.is_none() {
+        if let Some(mut stack)=link_input.take() {
+            if super::ae2_wireless::link(&mut stack,dim,pos).is_ok() {*link_output=Some(stack);} else {*link_input=Some(stack);}
+        }
+    }
+}
 fn workbench_copy_kept(machine:&horizon_client::ae2_world::Machine)->bool {
     matches!(machine.config.get(&"ae2_workbench_copy_mode".into()),Some(Tag::String(value)) if value.to_string().ok().as_deref()==Some("keep_on_remove"))
+}
+#[derive(Clone,Debug)]
+enum LocalMachineEdit {
+    Priority { target:PriorityTarget, field:horizon_client::ui::EditBox },
+    Stock { edit:StockEdit, field:horizon_client::ui::EditBox },
+}
+/// In-frame menus use the same physical owner and click logic as GuestMachine.
+#[derive(Clone,Debug)]
+pub(super) struct LocalMachineSession {
+    pos:(i32,i32,i32), part:Option<super::ae2_parts::PartAddress>, owner:MachineMenuOwner,
+    dim:String, page:usize, edit:Option<LocalMachineEdit>,
+    link_input:Option<ItemStack>, link_output:Option<ItemStack>,
 }
 pub(super) struct GuestMachine {
     window: i32,
@@ -5593,28 +5620,29 @@ impl Game<'_> {
         if let Some(menu)=host.play.get_mut(&conn).and_then(|p|p.ae2_machine.as_mut()).filter(|m|m.window==window){menu.stock_edit=None;}
         Self::stock_payload(host,conn,window,edit,"close");self.lan_send_ae2_machine(host,conn);
     }
+    /// SetStockAmountMenu.confirm rechecks both the original owner and key.
+    /// Used by the server and in-frame editors after numeric validation.
+    fn ae2_commit_stock_amount(&mut self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>,edit:&StockEdit,amount:i64)->bool {
+        let Some(mut machine)=self.ae2_stock_machine(pos,part,edit.owner) else{return false};
+        if !self.ae2_stock_entry(&machine,edit.slot).is_some_and(|(key,_,_,_,_)|key==edit.key) {return false;}
+        let result=match &edit.key {
+            StockKey::Item(_) => {
+                let mut current=super::ae2_interface::interface_config(&machine).ok().and_then(|v|v.get(edit.slot).cloned()).flatten();
+                if let Some(stack)=current.as_mut(){stack.count=amount as u32;}
+                super::ae2_interface::set_interface_config(&mut machine,edit.slot,current.as_ref())
+            },
+            StockKey::Fluid(key)=>super::ae2_interface::set_interface_fluid_config_amount(&mut machine,edit.slot,(amount>0).then_some((key,amount as u64))),
+        };
+        result.is_ok() && self.ae2_store_interface_menu_machine(pos,part,&machine)
+    }
     fn lan_ae2_stock_click(&mut self,host:&mut super::lan::LanHost,conn:u32,p:&play::ContainerClick)->bool {
         let Some((window,pos,part,edit))=self.stock_session(host,conn) else{self.lan_stock_invalid(host,conn);return true};
         let input=super::lan_crafting::input(p.input);
         if p.slot==9 && input==Input::Pickup {self.lan_stock_close(host,conn,window,&edit);return true;}
         if p.slot==8 && input==Input::Pickup {
             let Some(amount)=super::ae2_number_entry::number_value(&edit.text,edit.unit,0,edit.max,'.') else{self.lan_send_stock(host,conn);return true};
-            let Some(mut machine)=self.ae2_stock_machine(pos,part,edit.owner) else{self.lan_stock_invalid(host,conn);return true};
-            // SetStockAmountMenu.confirm checks key identity, not the prior
-            // amount: concurrent edits to another key are never overwritten.
-            if self.ae2_stock_entry(&machine,edit.slot).is_some_and(|(key,_,_,_,_)|key==edit.key) {
-                let result=match &edit.key {
-                    StockKey::Item(_) => {
-                        let mut current=super::ae2_interface::interface_config(&machine).ok().and_then(|v|v.get(edit.slot).cloned()).flatten();
-                        if let Some(stack)=current.as_mut(){stack.count=amount as u32;}
-                        super::ae2_interface::set_interface_config(&mut machine,edit.slot,current.as_ref())
-                    },
-                    StockKey::Fluid(key)=>super::ae2_interface::set_interface_fluid_config_amount(&mut machine,edit.slot,(amount>0).then_some((key,amount as u64))),
-                };
-                if result.is_ok() {
-                    if let Some(part)=part {let _=self.ae2_store_part_machine(part,&machine);} else if let Some(horizon_client::containers::BlockEntity::Ae2(target))=self.world.block_entities.get_mut(&pos){**target=machine;self.world.modified.insert((pos.0>>4,pos.2>>4));}
-                }
-            }
+            if self.ae2_stock_machine(pos,part,edit.owner).is_none(){self.lan_stock_invalid(host,conn);return true;}
+            self.ae2_commit_stock_amount(pos,part,&edit,amount);
             self.lan_stock_close(host,conn,window,&edit);
             let viewers:Vec<_>=host.play.iter().filter_map(|(&c,p)|p.ae2_machine.as_ref().filter(|m|m.pos==pos && m.part==part && m.owner_dim==self.dim.id() && c!=conn).map(|_|c)).collect();
             for viewer in viewers {self.lan_send_ae2_machine(host,viewer);}return true;
@@ -5893,39 +5921,263 @@ impl Game<'_> {
         self.lan_send_ae2_machine(host, conn);
         true
     }
-    fn lan_send_ae2_machine(&mut self, host: &mut super::lan::LanHost, conn: u32) {
-        if host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref()).is_some_and(|m|m.stock_edit.is_some()){self.lan_send_stock(host,conn);return;}
-        if host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref()).is_some_and(|m|m.priority_edit.is_some()){self.lan_send_priority(host,conn);return;}
-        use horizon_protocol::packets::play::{self, Clientbound as C};
-        let Some((pos, window, part, owner)) = host
-            .play
-            .get(&conn)
-            .and_then(|p| p.ae2_machine.as_ref())
-            .map(|m| (m.pos, m.window, m.part, m.owner))
-        else {
-            return;
+    fn ae2_interface_menu_machine(&self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>)->Option<horizon_client::ae2_world::Machine> {
+        use horizon_client::{ae2_world::MachineKind,containers::BlockEntity};
+        let machine=if let Some(part)=part {self.ae2_part_machine(part).ok().flatten()?} else {
+            let BlockEntity::Ae2(machine)=self.world.block_entities.get(&pos)? else{return None};(**machine).clone()
         };
-        let snapshot=self.ae2_owned_machine_slots(pos,part)
-            .filter(|_|self.ae2_machine_menu_owner(pos,part)==Some(owner));
-        let Some(snapshot) = snapshot else {
-            self.lan_ae2_machine_closed(host, conn, None);
-            host.hub.send_to(
-                conn,
-                &C::ContainerClose(play::ContainerClose { container: window }),
-            );
-            return;
+        (machine.kind==MachineKind::Interface).then_some(machine)
+    }
+    fn ae2_store_interface_menu_machine(&mut self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>,machine:&horizon_client::ae2_world::Machine)->bool {
+        if let Some(part)=part {return self.ae2_store_part_machine(part,machine).is_ok();}
+        if let Some(horizon_client::containers::BlockEntity::Ae2(target))=self.world.block_entities.get_mut(&pos) {
+            if target.kind!=horizon_client::ae2_world::MachineKind::Interface {return false;}
+            **target=machine.clone();self.world.modified.insert((pos.0>>4,pos.2>>4));true
+        }else{false}
+    }
+    /// Shared Interface settings, fake filters and fluid-container actions.
+    /// The caller supplies the authoritative player's actual carried stack.
+    fn ae2_interface_menu_click(&mut self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>,slot:usize,button:i32,input:Input)->bool {
+        let Some(mut machine)=self.ae2_interface_menu_machine(pos,part) else{return false};
+        if input!=Input::Pickup {return false;}
+        if (19..=23).contains(&slot) && matches!(button,0|1) {
+            if super::ae2_interface::interface_setting_click(&mut machine,slot,button) {self.ae2_store_interface_menu_machine(pos,part,&machine);return true;}
+            return false;
+        }
+        if slot<9 && matches!(button,0|1) {
+            let fluid=super::ae2_interface::interface_fluid_config(&machine).is_ok_and(|v|v[slot].is_some())
+                || super::ae2_interface::interface_fluid_stock(&machine).is_ok_and(|v|v[slot].is_some());
+            if !fluid {return false;}
+            if let Some(cursor)=self.carried.clone() {
+                if let Ok(Some(result))=super::ae2_interface::interface_bucket_exchange(&mut machine,slot,&cursor) {
+                    if self.ae2_store_interface_menu_machine(pos,part,&machine){self.carried=Some(result);}
+                }
+            }
+            return true;
+        }
+        if !(9..18).contains(&slot) || !(0..=3).contains(&button) {return false;}
+        let mut cursor=self.carried.clone();
+        if matches!(button,2|3) && cursor.is_none() {return true;}
+        if button==2 {if let Some(item)=cursor.as_mut(){item.count=1;}}
+        let configured=(||->Result<(),String>{
+            let index=slot-9;
+            if let Some(fluid)=encoding_emptying_action(cursor.as_ref(),button) {
+                return super::ae2_interface::set_interface_fluid_config_amount(&mut machine,index,Some((&fluid.key,fluid.amount)));
+            }
+            let mut item=super::ae2_interface::interface_config(&machine)?[index].clone();
+            let mut fluid=super::ae2_interface::interface_fluid_config(&machine)?[index].as_ref().map(|(key,amount)|super::ae2_processing::PatternFluid{key:key.clone(),amount:*amount});
+            let held=super::ae2_encoding::cursor_ghost(cursor.as_ref(),&|id,fluid|fluid||self.res.items().get(id).is_some())?;
+            let max_for=|item:&ItemStack|self.ae2_config_item_max(item);
+            let displayed_max=item.as_ref().map_or(64,&max_for);
+            let item_capacity=held.as_ref().and_then(|(value,_)|if let super::ae2_encoding::WrappedGhost::Item(item)=value {Some(max_for(item))}else{None}).or_else(||item.as_ref().map(&max_for)).unwrap_or(64);
+            super::ae2_encoding::click_ghost(&mut item,&mut fluid,held,button==1,displayed_max,item_capacity,super::ae2_interface::INTERFACE_FLUID_CAPACITY);
+            if let Some(fluid)=fluid {super::ae2_interface::set_interface_fluid_config_amount(&mut machine,index,Some((&fluid.key,fluid.amount)))}
+            else {super::ae2_interface::set_interface_config(&mut machine,index,item.as_ref())}
+        })();
+        if configured.is_ok(){self.ae2_store_interface_menu_machine(pos,part,&machine);}
+        true
+    }
+    /// Open a block machine or the Interface on the clicked cable face.
+    pub(super) fn ae2_open_local_machine(&mut self,pos:(i32,i32,i32),face:Option<[i32;3]>)->bool {
+        if self.remote.is_some(){return false;}
+        let part=if self.ae2_has_machine_menu(pos) {None} else {
+            let Some(face)=face.and_then(|face|match face {
+                [1,0,0]=>Some(0),[-1,0,0]=>Some(1),[0,1,0]=>Some(2),[0,-1,0]=>Some(3),[0,0,1]=>Some(4),[0,0,-1]=>Some(5),_=>None,
+            }) else{return false};
+            let Some(host)=self.ae2_local_address(pos) else{return false};
+            Some(super::ae2_parts::PartAddress{host,face})
         };
-        let Some(g) = host.hub.guests.iter().find(|g| g.conn == conn) else {
-            return;
+        let Some(owner)=self.ae2_machine_menu_owner(pos,part) else{return false};
+        if owner.kind==horizon_client::ae2_world::MachineKind::PatternProvider
+            || part.is_some() && owner.kind!=horizon_client::ae2_world::MachineKind::Interface {return false;}
+        self.container=Some(pos);self.ae2_local_machine=Some(LocalMachineSession{
+            pos,part,owner,dim:self.dim.id().to_owned(),page:0,edit:None,link_input:None,link_output:None,
+        });
+        self.screen=super::Screen::Inventory;self.capture(false);self.right=false;true
+    }
+    pub(super) fn ae2_local_machine_open(&self)->bool {
+        self.remote.is_none() && self.ae2_local_machine.as_ref().is_some_and(|session|self.container==Some(session.pos))
+    }
+    pub(super) fn ae2_local_machine_valid(&self)->bool {
+        self.ae2_local_machine_open() && self.ae2_local_machine.as_ref().is_some_and(|session|
+            session.dim==self.dim.id() && self.ae2_machine_menu_owner(session.pos,session.part)==Some(session.owner)
+                && self.eye_position().is_some_and(|eye|horizon_client::lan::guest::within_block_range(eye,self.reach()+4.0,[session.pos.0,session.pos.1,session.pos.2])))
+    }
+    pub(super) fn ae2_local_machine_close(&mut self)->Vec<ItemStack> {
+        let Some(session)=self.ae2_local_machine.take() else{return Vec::new()};
+        [session.link_input,session.link_output].into_iter().flatten().collect()
+    }
+    pub(super) fn ae2_local_machine_title(&self)->&'static str {
+        use horizon_client::ae2_world::MachineKind as K;
+        let Some(session)=self.ae2_local_machine.as_ref() else{return "AE2 Machine"};
+        if let Some(edit)=session.edit.as_ref(){return match edit {LocalMachineEdit::Priority{..}=>"Priority",LocalMachineEdit::Stock{..}=>"Set Stock Amount"};}
+        match session.owner.kind {
+            K::Drive=>"ME Drive: 10 cell slots",K::Inscriber=>"Inscriber: top, bottom, input, output",
+            K::VibrationChamber=>"Vibration Chamber: fuel",K::Interface if session.part.is_some()=>"ME Interface",
+            _=>"AE2 Machine",
+        }
+    }
+    pub(super) fn ae2_local_machine_editor_open(&self)->bool {
+        self.ae2_local_machine_open() && self.ae2_local_machine.as_ref().is_some_and(|s|s.edit.is_some())
+    }
+    fn ae2_local_machine_field(&self)->Option<&horizon_client::ui::EditBox> {
+        match self.ae2_local_machine.as_ref()?.edit.as_ref()? {LocalMachineEdit::Priority{field,..}|LocalMachineEdit::Stock{field,..}=>Some(field)}
+    }
+    fn ae2_local_machine_field_mut(&mut self)->Option<&mut horizon_client::ui::EditBox> {
+        match self.ae2_local_machine.as_mut()?.edit.as_mut()? {LocalMachineEdit::Priority{field,..}|LocalMachineEdit::Stock{field,..}=>Some(field)}
+    }
+    pub(super) fn ae2_local_machine_editor_focused(&self)->bool {
+        self.ae2_local_machine_editor_open() && self.ae2_local_machine_field().is_some_and(|field|field.focused)
+    }
+    fn ae2_local_machine_apply_priority(&mut self) {
+        if !self.ae2_local_machine_valid(){return;}
+        let Some(LocalMachineEdit::Priority{target,field})=self.ae2_local_machine.as_ref().and_then(|s|s.edit.as_ref()).cloned() else{return};
+        let Some(next)=super::ae2_number_entry::number_value(&field.value,1,i64::from(i32::MIN),i64::MAX,'.').and_then(|v|i32::try_from(v).ok()) else{return};
+        if let Some(old)=self.priority_target_read(target){self.priority_target_set(target,old,next);}
+    }
+    fn ae2_local_machine_confirm_editor(&mut self) {
+        if !self.ae2_local_machine_valid(){return;}
+        let Some(session)=self.ae2_local_machine.clone() else{return};let Some(edit)=session.edit else{return};
+        match edit {
+            LocalMachineEdit::Priority{field,..}=>if !priority_confirmable(&field.value){return},
+            LocalMachineEdit::Stock{edit,field}=>{
+                let Some(amount)=super::ae2_number_entry::number_value(&field.value,edit.unit,0,edit.max,'.') else{return};
+                self.ae2_commit_stock_amount(session.pos,session.part,&edit,amount);
+            }
+        }
+        if let Some(session)=self.ae2_local_machine.as_mut(){session.edit=None;}
+    }
+    pub(super) fn ae2_local_machine_editor_input(&mut self,text:Option<&str>,key:Option<winit::keyboard::KeyCode>) {
+        if !self.ae2_local_machine_valid(){return;}
+        if key==Some(winit::keyboard::KeyCode::Enter){self.ae2_local_machine_confirm_editor();return;}
+        let ctrl=self.has_control_down();let shift=self.has_shift_down();
+        if let Some(field)=self.ae2_local_machine_field_mut(){if !key.is_some_and(|key|field.key(key,ctrl,shift)){if let Some(text)=text{field.insert_text(text);}}}
+        self.ae2_local_machine_apply_priority();
+    }
+    pub(super) fn ae2_local_machine_editor_shortcut(&mut self,shortcut:horizon_client::clipboard::EditShortcut) {
+        if let Some(session)=self.ae2_local_machine.as_mut(){if let Some(edit)=session.edit.as_mut(){
+            let field=match edit {LocalMachineEdit::Priority{field,..}|LocalMachineEdit::Stock{field,..}=>field};field.shortcut(shortcut,&mut self.clipboard);
+        }}
+        self.ae2_local_machine_apply_priority();
+    }
+    pub(super) fn ae2_local_machine_editor_click_field(&mut self,ox:f32,oy:f32,right:bool)->bool {
+        let (mx,my)=self.cursor;let hit=!right && mx>=ox+48.0 && mx<ox+114.0 && my>=oy+55.0 && my<oy+67.0;let shift=self.has_shift_down();
+        // Split the independent atlas and session borrows.
+        let Some(session)=self.ae2_local_machine.as_mut() else{return false};
+        let Some(edit)=session.edit.as_mut() else{return false};
+        let field=match edit {LocalMachineEdit::Priority{field,..}|LocalMachineEdit::Stock{field,..}=>field};field.focused=hit;
+        if hit {field.x=ox+48.0;field.y=oy+55.0;field.width=66.0;field.height=12.0;field.click(&self.gui.atlas,mx,shift,false);}hit
+    }
+    pub(super) fn ae2_local_machine_editor_draw(&self,batch:&mut horizon_client::hud::HudBatch,ox:f32,oy:f32) {
+        if let Some(mut field)=self.ae2_local_machine_field().cloned(){field.x=ox+48.0;field.y=oy+55.0;field.width=66.0;field.height=12.0;field.draw(batch,&self.gui.atlas,None);}
+    }
+    fn ae2_local_machine_return_carried(&mut self) {
+        if let Some(stack)=self.carried.take(){if let Some(rest)=self.give(stack){self.player_drop(rest);}}
+    }
+    fn ae2_local_machine_open_priority(&mut self,session:&LocalMachineSession) {
+        let target=PriorityTarget::Drive{pos:session.pos,identity:session.owner.host};let Some(value)=self.priority_target_read(target) else{return};
+        self.ae2_local_machine_return_carried();let mut field=horizon_client::ui::EditBox::new(0.0,0.0,66.0,12.0);
+        field.max_length=16;field.set_value(&value.to_string());field.highlight=0;field.focused=true;
+        if let Some(session)=self.ae2_local_machine.as_mut(){session.edit=Some(LocalMachineEdit::Priority{target,field});}
+    }
+    fn ae2_local_machine_open_stock(&mut self,session:&LocalMachineSession,index:usize) {
+        let Some(owner)=self.ae2_interface_menu_owner(session.pos,session.part) else{return};
+        let Some(machine)=self.ae2_stock_machine(session.pos,session.part,owner) else{return};
+        let Some((key,amount,max,unit,display))=self.ae2_stock_entry(&machine,index) else{return};
+        self.ae2_local_machine_return_carried();let text=if unit==1 {amount.to_string()}else{
+            let value=format!("{}.{:03}",amount/u64::from(unit),amount%u64::from(unit));value.trim_end_matches('0').trim_end_matches('.').to_owned()
         };
-        let page = host
-            .play
-            .get(&conn)
-            .and_then(|p| p.ae2_machine.as_ref())
-            .map_or(0, |m| m.workbench_page);
+        let mut field=horizon_client::ui::EditBox::new(0.0,0.0,66.0,12.0);field.max_length=16;field.set_value(&text);field.highlight=0;field.focused=true;
+        let edit=StockEdit{slot:index,owner,key,max,unit,text,token:0,display};
+        if let Some(session)=self.ae2_local_machine.as_mut(){session.edit=Some(LocalMachineEdit::Stock{edit,field});}
+    }
+    pub(super) fn ae2_local_machine_slot_view(&self,slot:usize)->Option<ItemStack> {
+        if !self.ae2_local_machine_valid(){return None;}let session=self.ae2_local_machine.as_ref()?;let index=slot.checked_sub(300)?;
+        if let Some(edit)=session.edit.as_ref(){return match (edit,index) {
+            (LocalMachineEdit::Priority{..},0..=3)=>Some(navigation(&format!("Priority +{}; shift uses 1/16/32/64",[1,10,100,1000][index]))),
+            (LocalMachineEdit::Priority{..},4..=7)=>Some(navigation(&format!("Priority -{}; shift uses 1/16/32/64",[1,10,100,1000][index-4]))),
+            (LocalMachineEdit::Priority{..},8)=>Some(navigation("Back to owner")),
+            (LocalMachineEdit::Priority{field,..},9)=>Some(navigation(&format!("Priority: {}",field.value))),
+            (LocalMachineEdit::Stock{..},0..=3)=>Some(navigation(&format!("Stock +{}; shift uses 1/16/32/64",[1,10,100,1000][index]))),
+            (LocalMachineEdit::Stock{..},4..=7)=>Some(navigation(&format!("Stock -{}; shift uses 1/16/32/64",[1,10,100,1000][index-4]))),
+            (LocalMachineEdit::Stock{..},8)=>Some(navigation("Set stock amount")),
+            (LocalMachineEdit::Stock{..},9)=>Some(navigation("Back to Interface")),
+            (LocalMachineEdit::Stock{edit,..},10)=>Some(edit.display.clone()),
+            (LocalMachineEdit::Stock{edit,field},11)=>Some(navigation(&format!("Stock amount: {}{}",field.value,if edit.unit==1000 {" buckets"}else{""}))),
+            _=>None,
+        };}
+        let snapshot=self.ae2_owned_machine_slots(session.pos,session.part)?;
+        self.ae2_machine_menu_items(session.pos,session.part,session.page,&snapshot,session.link_input.as_ref(),session.link_output.as_ref()).get(index).cloned().flatten()
+    }
+    pub(super) fn ae2_local_machine_fake_slot(&self,slot:usize)->bool {
+        if !self.ae2_local_machine_valid(){return false;}let Some(session)=self.ae2_local_machine.as_ref().filter(|s|s.edit.is_none()) else{return false};
+        match session.owner.kind {
+            horizon_client::ae2_world::MachineKind::CellWorkbench=>(305..323).contains(&slot) && session.page*18+(slot-305)<63,
+            horizon_client::ae2_world::MachineKind::Interface=>(309..318).contains(&slot),
+            _=>false,
+        }
+    }
+    pub(super) fn ae2_local_machine_drag(&mut self,slot:usize,single:bool) {
+        if !self.ae2_local_machine_fake_slot(slot) || self.carried.is_none(){return;}
+        let physical=self.carried.clone();if single {if let Some(item)=self.carried.as_mut(){item.count=1;}}
+        self.ae2_local_machine_click(Some(slot),0,Input::Pickup);self.carried=physical;
+    }
+    pub(super) fn ae2_local_machine_click(&mut self,slot:Option<usize>,button:i32,input:Input) {
+        if !self.ae2_local_machine_valid(){self.close_container();self.screen=super::Screen::Playing;self.capture(true);return;}
+        let Some(mut session)=self.ae2_local_machine.clone() else{return};
+        // AEBaseScreen refuses creative cloning of wrapped generic stacks in
+        // both the player inventory and the host's visible slots.
+        if input==Input::Clone && slot.is_some_and(|slot|self.slot_view(slot).is_some_and(|item|item.item.as_ref()=="ae2:wrapped_generic_stack")) {return;}
+        if let Some(edit)=session.edit.clone(){
+            match (edit,slot) {
+                (LocalMachineEdit::Priority{..},Some(308)) if input==Input::Pickup=>if let Some(s)=self.ae2_local_machine.as_mut(){s.edit=None;},
+                (LocalMachineEdit::Stock{..},Some(309)) if input==Input::Pickup=>if let Some(s)=self.ae2_local_machine.as_mut(){s.edit=None;},
+                (LocalMachineEdit::Stock{..},Some(308)) if input==Input::Pickup=>self.ae2_local_machine_confirm_editor(),
+                (LocalMachineEdit::Priority{field,..},Some(index @ 300..=307)) if matches!(input,Input::Pickup|Input::QuickMove)=>{
+                    if let Some(next)=priority_step(&field.value,(index-300) as i16,input==Input::QuickMove){if let Some(field)=self.ae2_local_machine_field_mut(){field.set_value(&next);field.focused=true;}self.ae2_local_machine_apply_priority();}
+                },
+                (LocalMachineEdit::Stock{edit,field},Some(index @ 300..=307)) if matches!(input,Input::Pickup|Input::QuickMove)=>{
+                    let steps=if input==Input::QuickMove {[1i64,16,32,64]}else{[1i64,10,100,1000]};let i=index-300;
+                    let delta=if i<4 {steps[i]}else{-steps[i%4]};
+                    if let Some(next)=super::ae2_number_entry::number_step(&field.value,delta,0,edit.max/i64::from(edit.unit),'.'){if let Some(field)=self.ae2_local_machine_field_mut(){field.set_value(&next);field.focused=true;}}
+                },
+                _=>{}
+            } return;
+        }
+        let (button,input)=if slot.is_some_and(|slot|self.ae2_local_machine_fake_slot(slot)) {
+            // The source screen intercepts fake-slot hotkeys before they can
+            // swap or drop physical player items. A hotbar swap on Workbench's
+            // unlimited config slots is rejected by FakeSlot.mayPickup; the
+            // Interface's registered 64-limit slots use the fake click path.
+            if matches!(input,Input::Swap|Input::Throw) && self.carried.is_some() {return;}
+            if input==Input::Swap && button!=40 && session.owner.kind!=horizon_client::ae2_world::MachineKind::Interface {return;}
+            if input==Input::QuickMove && session.owner.kind!=horizon_client::ae2_world::MachineKind::Interface {(button,Input::Pickup)}
+            else if matches!(input,Input::Pickup|Input::QuickMove) {(button,input)}
+            else {(i32::from(button==1),Input::Pickup)}
+        } else {(button,input)};
+        if session.owner.kind==horizon_client::ae2_world::MachineKind::Drive && slot==Some(326) && input==Input::Pickup {self.ae2_local_machine_open_priority(&session);return;}
+        if session.owner.kind==horizon_client::ae2_world::MachineKind::Interface && slot.is_some_and(|s|(309..318).contains(&s)) && input==Input::QuickMove {
+            self.ae2_local_machine_open_stock(&session,slot.unwrap()-309);return;
+        }
+        if let Some(slot)=slot.filter(|s|(300..324).contains(s)) {
+            if self.ae2_interface_menu_click(session.pos,session.part,slot-300,button,input){return;}
+        }
+        if session.owner.kind==horizon_client::ae2_world::MachineKind::WirelessAccessPoint && slot.is_some_and(|s|matches!(s,301|302)) {
+            ae2_link_slot_click(self.dim.id(),session.pos,slot.unwrap()-300,button,input,&mut self.carried,&mut session.link_input,&mut session.link_output);
+            if let Some(current)=self.ae2_local_machine.as_mut(){current.link_input=session.link_input;current.link_output=session.link_output;}return;
+        }
+        let slot=if session.owner.kind==horizon_client::ae2_world::MachineKind::Interface && slot==Some(318) {Some(309)}else{slot};
+        if let Some(part)=session.part {self.ae2_part_machine_click(part,slot,button,input);}
+        else if !self.ae2_workbench_menu_click(session.pos,&mut session.page,slot,button,input){self.ae2_machine_click(session.pos,slot,button,input);}
+        if let Some(current)=self.ae2_local_machine.as_mut(){current.page=session.page;}
+    }
+    /// The server and in-frame screens use the same virtual layout and
+    /// physical host snapshot; only their player/session transport differs.
+    fn ae2_machine_menu_items(&self,pos:(i32,i32,i32),part:Option<super::ae2_parts::PartAddress>,page:usize,
+        snapshot:&[Option<ItemStack>],link_input:Option<&ItemStack>,link_output:Option<&ItemStack>)->Vec<Option<ItemStack>> {
         let mut items = self
             .ae2_workbench_menu_slots(pos, page)
-            .unwrap_or_else(|| snapshot.clone());
+            .unwrap_or_else(|| snapshot.to_vec());
         items.resize(27, None);
         if part.is_none() {if let Some(condenser)=self.ae2_condenser_menu(pos) {items=condenser;}}
         let displayed_machine = if let Some(part) = part {
@@ -5938,15 +6190,6 @@ impl Game<'_> {
                 _ => None,
             }
         };
-        let fake_slots:Vec<u8>=match displayed_machine.as_ref().map(|machine|machine.kind) {
-            Some(horizon_client::ae2_world::MachineKind::CellWorkbench)=>(0..63usize.saturating_sub(page*18).min(18)).map(|i|(5+i) as u8).collect(),
-            // The Interface config wrapper's registered item capacity is 64;
-            // unlike overstacking fake slots, its hotbar key is a fake click.
-            Some(horizon_client::ae2_world::MachineKind::Interface)=>(9..18).map(|slot|slot|0x80).collect(),
-            _=>Vec::new(),
-        };
-        let provider_return_snapshot=displayed_machine.as_ref().and_then(|machine|provider_return_slots(machine).ok());
-        let workbench_keep=displayed_machine.as_ref().filter(|machine|machine.kind==horizon_client::ae2_world::MachineKind::CellWorkbench).map(workbench_copy_kept);
         if let Some(machine) = displayed_machine {
             if matches!(machine.kind,horizon_client::ae2_world::MachineKind::Drive|horizon_client::ae2_world::MachineKind::PatternProvider) {
                 items[26]=Some(navigation("Priority: click to edit"));
@@ -6021,11 +6264,61 @@ impl Game<'_> {
         }
         if matches!(self.world.block_entities.get(&pos), Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.kind == horizon_client::ae2_world::MachineKind::WirelessAccessPoint)
         {
-            if let Some(menu) = host.play.get(&conn).and_then(|p| p.ae2_machine.as_ref()) {
-                items[1] = menu.link_input.clone();
-                items[2] = menu.link_output.clone();
-            }
+            items[1] = link_input.cloned();
+            items[2] = link_output.cloned();
         }
+        items
+    }
+    fn lan_send_ae2_machine(&mut self, host: &mut super::lan::LanHost, conn: u32) {
+        if host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref()).is_some_and(|m|m.stock_edit.is_some()){self.lan_send_stock(host,conn);return;}
+        if host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref()).is_some_and(|m|m.priority_edit.is_some()){self.lan_send_priority(host,conn);return;}
+        use horizon_protocol::packets::play::{self, Clientbound as C};
+        let Some((pos, window, part, owner)) = host
+            .play
+            .get(&conn)
+            .and_then(|p| p.ae2_machine.as_ref())
+            .map(|m| (m.pos, m.window, m.part, m.owner))
+        else {
+            return;
+        };
+        let snapshot=self.ae2_owned_machine_slots(pos,part)
+            .filter(|_|self.ae2_machine_menu_owner(pos,part)==Some(owner));
+        let Some(snapshot) = snapshot else {
+            self.lan_ae2_machine_closed(host, conn, None);
+            host.hub.send_to(
+                conn,
+                &C::ContainerClose(play::ContainerClose { container: window }),
+            );
+            return;
+        };
+        let Some(g) = host.hub.guests.iter().find(|g| g.conn == conn) else {
+            return;
+        };
+        let page = host
+            .play
+            .get(&conn)
+            .and_then(|p| p.ae2_machine.as_ref())
+            .map_or(0, |m| m.workbench_page);
+        let (link_input,link_output)=host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref())
+            .map(|m|(m.link_input.clone(),m.link_output.clone())).unwrap_or_default();
+        let mut items=self.ae2_machine_menu_items(pos,part,page,&snapshot,link_input.as_ref(),link_output.as_ref());
+        let displayed_machine = if let Some(part) = part {
+            self.ae2_part_machine(part).ok().flatten()
+        } else {
+            match self.world.block_entities.get(&pos) {
+                Some(horizon_client::containers::BlockEntity::Ae2(machine)) => Some((**machine).clone()),
+                _ => None,
+            }
+        };
+        let fake_slots:Vec<u8>=match displayed_machine.as_ref().map(|machine|machine.kind) {
+            Some(horizon_client::ae2_world::MachineKind::CellWorkbench)=>(0..63usize.saturating_sub(page*18).min(18)).map(|i|(5+i) as u8).collect(),
+            // The Interface config wrapper's registered item capacity is 64;
+            // unlike overstacking fake slots, its hotbar key is a fake click.
+            Some(horizon_client::ae2_world::MachineKind::Interface)=>(9..18).map(|slot|slot|0x80).collect(),
+            _=>Vec::new(),
+        };
+        let provider_return_snapshot=displayed_machine.as_ref().and_then(|machine|provider_return_slots(machine).ok());
+        let workbench_keep=displayed_machine.as_ref().filter(|machine|machine.kind==horizon_client::ae2_world::MachineKind::CellWorkbench).map(workbench_copy_kept);
         items.extend((9..36).chain(0..9).map(|i| g.inventory[i].clone()));
         let carried = g.carried.clone();
         Self::lan_ae2_fake_slots(host,conn,window,&fake_slots);
@@ -6185,185 +6478,15 @@ impl Game<'_> {
             for viewer in viewers {self.lan_send_ae2_machine(host,viewer);}
             return true;
         }
-        if (19..=23).contains(&p.slot)
-            && super::lan_crafting::input(p.input) == Input::Pickup
-            && (0..=1).contains(&p.button)
-        {
-            let machine = if let Some(part) = part {
-                self.ae2_part_machine(part).ok().flatten()
-            } else {
-                match self.world.block_entities.get(&pos) {
-                    Some(horizon_client::containers::BlockEntity::Ae2(machine)) => {
-                        Some((**machine).clone())
-                    }
-                    _ => None,
-                }
-            };
-            if let Some(mut machine) =
-                machine.filter(|m| m.kind == horizon_client::ae2_world::MachineKind::Interface)
-            {
-                if super::ae2_interface::interface_setting_click(
-                    &mut machine,
-                    p.slot as usize,
-                    i32::from(p.button),
-                ) {
-                    let saved = if let Some(part) = part {
-                        self.ae2_store_part_machine(part, &machine).is_ok()
-                    } else if let Some(horizon_client::containers::BlockEntity::Ae2(target)) =
-                        self.world.block_entities.get_mut(&pos)
-                    {
-                        **target = machine;
-                        self.world.modified.insert((pos.0 >> 4, pos.2 >> 4));
-                        true
-                    } else {
-                        false
-                    };
-                    if saved {
-                        let viewers: Vec<_> = host
-                            .play
-                            .iter()
-                            .filter_map(|(&c, viewer)| {
-                                (viewer.ae2_machine.as_ref().is_some_and(|m| {
-                                    m.pos == pos && m.part == part && m.owner_dim == self.dim.id()
-                                }) && host
-                                    .hub
-                                    .guests
-                                    .iter()
-                                    .any(|g| g.conn == c && host.hub.here(g)))
-                                .then_some(c)
-                            })
-                            .collect();
-                        for viewer in viewers {
-                            self.lan_send_ae2_machine(host, viewer);
-                        }
-                    }
-                    return true;
-                }
-            }
-        }
-        if (0..9).contains(&p.slot) && super::lan_crafting::input(p.input) == Input::Pickup {
-            let machine = if let Some(part) = part {
-                self.ae2_part_machine(part).ok().flatten()
-            } else {
-                match self.world.block_entities.get(&pos) {
-                    Some(horizon_client::containers::BlockEntity::Ae2(m)) => Some((**m).clone()),
-                    _ => None,
-                }
-            };
-            if let Some(mut machine) =
-                machine.filter(|m| m.kind == horizon_client::ae2_world::MachineKind::Interface)
-            {
-                let index = p.slot as usize;
-                let is_fluid = super::ae2_interface::interface_fluid_config(&machine)
-                    .is_ok_and(|v| v[index].is_some())
-                    || super::ae2_interface::interface_fluid_stock(&machine)
-                        .is_ok_and(|v| v[index].is_some());
-                if is_fluid {
-                    let cursor = host
-                        .hub
-                        .guests
-                        .iter()
-                        .find(|g| g.conn == conn)
-                        .and_then(|g| g.carried.clone());
-                    if let Some(cursor) = cursor {
-                        if let Ok(Some(result)) = super::ae2_interface::interface_bucket_exchange(
-                            &mut machine,
-                            index,
-                            &cursor,
-                        ) {
-                            let stored = if let Some(part) = part {
-                                self.ae2_store_part_machine(part, &machine).is_ok()
-                            } else if let Some(horizon_client::containers::BlockEntity::Ae2(
-                                target,
-                            )) = self.world.block_entities.get_mut(&pos)
-                            {
-                                **target = machine;
-                                self.world.modified.insert((pos.0 >> 4, pos.2 >> 4));
-                                true
-                            } else {
-                                false
-                            };
-                            if stored {
-                                if let Some(guest) =
-                                    host.hub.guests.iter_mut().find(|g| g.conn == conn)
-                                {
-                                    guest.carried = Some(result);
-                                }
-                            }
-                        }
-                    }
-                    self.lan_send_ae2_machine(host, conn);
-                    return true;
-                }
-            }
-        }
-        if (9..18).contains(&p.slot)
-            && super::lan_crafting::input(p.input) == Input::Pickup
-            && (0..=3).contains(&p.button)
-        {
-            let machine = if let Some(part) = part {
-                self.ae2_part_machine(part).ok().flatten()
-            } else {
-                match self.world.block_entities.get(&pos) {
-                    Some(horizon_client::containers::BlockEntity::Ae2(m)) => Some((**m).clone()),
-                    _ => None,
-                }
-            };
-            if let Some(mut machine) =
-                machine.filter(|m| m.kind == horizon_client::ae2_world::MachineKind::Interface)
-            {
-                let mut cursor = host
-                    .hub
-                    .guests
-                    .iter()
-                    .find(|g| g.conn == conn)
-                    .and_then(|g| g.carried.clone());
-                if matches!(p.button,2|3) && cursor.is_none() {self.lan_send_ae2_machine(host,conn);return true;}
-                if p.button==2 {if let Some(item)=cursor.as_mut(){item.count=1;}}
-                let configured=(||->Result<(),String>{
-                    let index=(p.slot-9) as usize;
-                    if let Some(fluid)=encoding_emptying_action(cursor.as_ref(),i32::from(p.button)) {
-                        return super::ae2_interface::set_interface_fluid_config_amount(&mut machine,index,Some((&fluid.key,fluid.amount)));
-                    }
-                    let mut item=super::ae2_interface::interface_config(&machine)?[index].clone();
-                    let mut fluid=super::ae2_interface::interface_fluid_config(&machine)?[index].as_ref().map(|(key,amount)|super::ae2_processing::PatternFluid{key:key.clone(),amount:*amount});
-                    let held=super::ae2_encoding::cursor_ghost(cursor.as_ref(),&|id,fluid|fluid||self.res.items().get(id).is_some())?;
-                    let max_for=|item:&ItemStack|self.ae2_config_item_max(item);
-                    let displayed_max=item.as_ref().map_or(64,&max_for);
-                    let item_capacity=held.as_ref().and_then(|(value,_)|if let super::ae2_encoding::WrappedGhost::Item(item)=value {Some(max_for(item))}else{None}).or_else(||item.as_ref().map(&max_for)).unwrap_or(64);
-                    super::ae2_encoding::click_ghost(&mut item,&mut fluid,held,p.button==1,displayed_max,item_capacity,super::ae2_interface::INTERFACE_FLUID_CAPACITY);
-                    if let Some(fluid)=fluid {super::ae2_interface::set_interface_fluid_config_amount(&mut machine,index,Some((&fluid.key,fluid.amount)))}
-                    else {super::ae2_interface::set_interface_config(&mut machine,index,item.as_ref())}
-                })();
-                if configured.is_ok() {
-                    if let Some(part) = part {
-                        let _ = self.ae2_store_part_machine(part, &machine);
-                    } else if let Some(horizon_client::containers::BlockEntity::Ae2(target)) =
-                        self.world.block_entities.get_mut(&pos)
-                    {
-                        **target = machine;
-                        self.world.modified.insert((pos.0 >> 4, pos.2 >> 4));
-                    }
-                }
-                let viewers: Vec<_> = host
-                    .play
-                    .iter()
-                    .filter_map(|(&c, p)| {
-                        (p.ae2_machine.as_ref().is_some_and(|m| {
-                            m.pos == pos && m.part == part && m.owner_dim == self.dim.id()
-                        }) && host
-                            .hub
-                            .guests
-                            .iter()
-                            .any(|g| g.conn == c && host.hub.here(g)))
-                        .then_some(c)
-                    })
-                    .collect();
-                for viewer in viewers {
-                    self.lan_send_ae2_machine(host, viewer);
-                }
-                return true;
-            }
+        let menu_input=super::lan_crafting::input(p.input);
+        let interface=host.play.get(&conn).and_then(|p|p.ae2_machine.as_ref()).is_some_and(|m|m.owner.kind==horizon_client::ae2_world::MachineKind::Interface);
+        if interface && (0..=23).contains(&p.slot) && self.as_guest(host,conn,|game|
+            game.ae2_interface_menu_click(pos,part,p.slot as usize,i32::from(p.button),menu_input)).unwrap_or(false) {
+            let viewers:Vec<_>=host.play.iter().filter_map(|(&c,p)|
+                (p.ae2_machine.as_ref().is_some_and(|m|m.pos==pos && m.part==part && m.owner_dim==self.dim.id())
+                    && host.hub.guests.iter().any(|g|g.conn==c && host.hub.here(g))).then_some(c)).collect();
+            for viewer in viewers {self.lan_send_ae2_machine(host,viewer);}
+            return true;
         }
         if let Some(part) = part {
             if (p.slot == 18 || p.slot == 19 || p.slot == 20)
@@ -6451,40 +6574,12 @@ impl Game<'_> {
         let wireless_access = matches!(self.world.block_entities.get(&pos), Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.kind == horizon_client::ae2_world::MachineKind::WirelessAccessPoint);
         if wireless_access && (p.slot == 1 || p.slot == 2) {
             let input = super::lan_crafting::input(p.input);
-            if input == Input::Pickup && (0..=1).contains(&p.button) {
-                if let (Some(menu), Some(guest)) = (
-                    host.play
-                        .get_mut(&conn)
-                        .and_then(|p| p.ae2_machine.as_mut()),
-                    host.hub.guests.iter_mut().find(|g| g.conn == conn),
-                ) {
-                    if p.slot == 1 {
-                        if guest.carried.is_none() {
-                            guest.carried = menu.link_input.take();
-                        } else if menu.link_input.is_none()
-                            && guest.carried.as_ref().is_some_and(|s| {
-                                s.count == 1
-                                    && matches!(
-                                        s.item.as_ref(),
-                                        "ae2:wireless_terminal" | "ae2:wireless_crafting_terminal"
-                                    )
-                            })
-                        {
-                            menu.link_input = guest.carried.take();
-                        }
-                    } else if guest.carried.is_none() {
-                        guest.carried = menu.link_output.take();
-                    }
-                    if menu.link_output.is_none() {
-                        if let Some(mut stack) = menu.link_input.take() {
-                            if super::ae2_wireless::link(&mut stack, self.dim.id(), pos).is_ok() {
-                                menu.link_output = Some(stack);
-                            } else {
-                                menu.link_input = Some(stack);
-                            }
-                        }
-                    }
-                }
+            if let (Some(menu), Some(guest)) = (
+                host.play.get_mut(&conn).and_then(|p|p.ae2_machine.as_mut()),
+                host.hub.guests.iter_mut().find(|g|g.conn==conn),
+            ) {
+                ae2_link_slot_click(self.dim.id(),pos,p.slot as usize,i32::from(p.button),input,
+                    &mut guest.carried,&mut menu.link_input,&mut menu.link_output);
             }
             self.lan_send_ae2_machine(host, conn);
             return true;
@@ -6612,7 +6707,7 @@ impl Game<'_> {
     }
     /// Machine screens own their physical slots; replay player-slot gestures
     /// through the native menu so item overrides and creative actions apply.
-    fn ae2_machine_player_menu_click(&mut self,slot:usize,button:i32,input:Input)->bool {
+    pub(super) fn ae2_machine_player_menu_click(&mut self,slot:usize,button:i32,input:Input)->bool {
         use horizon_client::menu::{Kind,Menu};
         if slot>=36 {return false;}
         // AEBaseScreen.slotClicked suppresses creative cloning of every

@@ -215,6 +215,24 @@ public class CraftingTreeOracle {
         }
         check("craft_less_amount",successful,12);check("craft_less_bytes",bytes,34);
         var oak=key("oak");var birch=key("birch");var substituted=new Service();
+        var wrappedAmount=new Service();
+        wrappedAmount.add(pattern("wrapped_two",board,4,new MixedAmountInput(new GenericStack[]{new GenericStack(oak,2)},2)));
+        check("wrapped_two_template_times_multiplier_bytes",plan(wrappedAmount,board,4,Map.of(oak,4L)),25);
+        expectShortage("wrapped_two_three_stock_shortage",wrappedAmount,board,Map.of(oak,3L),"oak:2");
+        var groupedAmounts=new Service();
+        groupedAmounts.add(pattern("wrapped_two_plus_one",board,4,new MixedAmountInput(new GenericStack[]{new GenericStack(oak,2)},3)));
+        check("wrapped_grouped_template_times_condensed_multiplier",plan(groupedAmounts,board,4,Map.of(oak,6L)),27);
+        var wrappedFallback=new Service();
+        wrappedFallback.add(pattern("wrapped_two_with_substitute",board,4,new MixedAmountInput(new GenericStack[]{new GenericStack(oak,2),new GenericStack(birch,1)},2)));
+        check("wrapped_two_split_substitute_bytes",plan(wrappedFallback,board,4,Map.of(oak,2L,birch,1L)),25);
+        var repeatedKey=new Service();
+        repeatedKey.add(pattern("repeated_key",board,4,new MixedAmountInput(new GenericStack[]{new GenericStack(oak,2),new GenericStack(oak,1),new GenericStack(birch,1)},2)));
+        check("wrapped_two_same_key_substitute_bytes",plan(repeatedKey,board,4,Map.of(oak,3L)),25);
+        check("wrapped_two_same_key_two_runs_bytes",plan(repeatedKey,board,8,Map.of(oak,7L)),34);
+        var evenlyMixed=new Service();evenlyMixed.add(pattern("evenly_mixed",board,4,new ChoiceInput(new AEKey[]{oak,birch},3)));
+        check("even_totals_distinct_pushes_bytes",plan(evenlyMixed,board,8,Map.of(oak,4L,birch,2L)),32);
+        var singleOutput=key("single_output");var evenSingle=new Service();evenSingle.add(pattern("even_single",singleOutput,1,new ChoiceInput(new AEKey[]{oak,birch},3)));
+        check("even_single_output_bytes",plan(evenSingle,singleOutput,2,Map.of(oak,4L,birch,2L)),26);
         substituted.add(pattern("substituted",board,4,new ChoiceInput(new AEKey[]{oak,birch},1)));
         check("substitute_split_bytes",plan(substituted,board,8,Map.of(oak,1L,birch,1L)),28);
         check("substitute_split_10000_bytes",plan(substituted,board,40000,Map.of(oak,5001L,birch,4999L)),60016);

@@ -102,21 +102,23 @@ impl Game<'_> {
     /// items. CableBus is handled by its per-face multipart path.
     pub(super) fn ae2_try_wrench_disassemble(&mut self,pos:[i32;3])->bool {
         use horizon_client::{ae2_world::MachineKind,containers::BlockEntity};
-        use horizon_world::nbt::{Compound,Tag};
+        use horizon_world::nbt::Tag;
         if !self.keys.contains(&super::KeyCode::ShiftLeft) || !self.held().is_some_and(|s|self.ae2_wrench_can_disassemble(s)){return false;}
         let key=(pos[0],pos[1],pos[2]);let old=self.world.block(pos[0],pos[1],pos[2]);
         let Some(BlockEntity::Ae2(machine))=self.world.block_entities.get(&key) else{return false};
         if matches!(machine.kind,MachineKind::CableBus|MachineKind::Paint) || self.res.items().get(machine.kind.id()).is_none() || self.res.facts().get(old).name.as_ref()!=machine.kind.id(){return false;}
-        let machine=(**machine).clone();let name=self.world.block_names.get(&key).cloned();
         let max=match machine.kind {MachineKind::EnergyCell=>Some(200_000.0),MachineKind::DenseEnergyCell=>Some(1_600_000.0),_=>None};
         if max.is_some_and(|max|!machine.energy.is_finite() || machine.energy<0.0 || machine.energy>max) {return true;}
+        // A formed CPU must settle its physical job ownership while the old
+        // block entity still exists, before any inventory snapshot/removal.
+        if self.ae2_prepare_cpu_removal(key).is_err(){return true;}
+        let Some(BlockEntity::Ae2(machine))=self.world.block_entities.get(&key) else{return true};
+        let machine=(**machine).clone();let name=self.world.block_names.get(&key).cloned();
         let held=self.held().cloned();let mut drops=self.block_loot_at(pos,old,held.as_ref());
         if let Some(block)=drops.iter_mut().find(|item|item.item.as_ref()==machine.kind.id()) {
-            if let Some(name)=name.as_ref(){block.data_mut().custom_name=Some(name.clone());}
+            block.set_custom_name_component(super::ae2_memory_host::machine_name_component(&machine,name.as_deref()));
             if matches!(machine.kind,MachineKind::EnergyCell|MachineKind::DenseEnergyCell) && machine.energy>0.0 {
-                let mut custom=match block.data().and_then(|data|data.other("minecraft:custom_data")) {Some(Tag::Compound(value))=>value.clone(),_=>Compound::new()};
-                custom.insert("ae2:stored_energy".into(),Tag::Double(machine.energy.to_bits()));
-                block.data_mut().set_other("minecraft:custom_data",Some(Tag::Compound(custom)));
+                block.data_mut().set_other("ae2:stored_energy",Some(Tag::Double(machine.energy.to_bits())));
             }
         } else if matches!(machine.kind,MachineKind::EnergyCell|MachineKind::DenseEnergyCell) && machine.energy>0.0 {
             // Do not destroy stored energy when the block's loot is unavailable.

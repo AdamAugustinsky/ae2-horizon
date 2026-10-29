@@ -23,7 +23,12 @@ const suites = [
   'machine-menu-identity', 'encoding-fake-drag', 'fake-slot-drag-machines',
   'annihilation-container-custody', 'annihilation-container-overflow',
   'provider-condenser-fluid', 'storage-bus-condenser-fluid',
-  'encoding-fake-hotkeys', 'interface-fake-hotkeys', 'processing-large-provider-queue', 'processing-creative-interface', 'crafting-large-job-persistence',
+  'annihilation-machine-containers', 'annihilation-shulker-components', 'annihilation-beehive-components',
+  'spatial-container-metadata', 'wrench-energy-components', 'wrench-cpu-escrow', 'inframe-machine-menus', 'inframe-wireless-access-point',
+  'emitter-fake-gestures', 'client-container-component-wire', 'block-item-state-components',
+  'crafting-break-large-escrow', 'source-nonunit-crafting', 'crafting-even-mixed-pushes', 'processing-mixed-ordered',
+  'pattern-access-owner', 'inframe-bus-menu', 'inframe-emitter-menu',
+  'encoding-fake-hotkeys', 'interface-fake-hotkeys', 'processing-large-provider-queue', 'processing-creative-interface', 'crafting-large-job-persistence', 'source-special-patterns',
 ];
 // Explicitly selectable before-cases, not part of the default passing checkpoint.
 const pending = new Set(['quantum-forced-ready']);

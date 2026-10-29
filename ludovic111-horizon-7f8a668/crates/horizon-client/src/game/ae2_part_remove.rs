@@ -42,7 +42,7 @@ impl Game<'_> {
         if !physical_record_valid(&part){return true}
         let mut single=Machine::new(MachineKind::CableBus);
         single.config.insert("parts".into(),Tag::List(vec![part.clone()]));
-        let items=super::spill::ae2_physical_drops_with_max(&single,&|stack| {
+        let items=super::spill::ae2_physical_part_drops_with_max(&single,&|stack| {
             let default=self.res.items().get(&stack.item).map_or(64,|info|info.max_stack).max(1);
             super::ae2_formation::max_stack(stack,default)
         });

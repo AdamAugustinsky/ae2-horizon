@@ -24,7 +24,7 @@ use std::collections::HashMap;
 /// Source AEItemKey.addDrops creates natural-size stacks until the shared
 /// drop list already contains more than 1000 stacks. Fluids produce no item.
 #[cfg(feature = "ae2-lab")]
-fn append_ae2_key_drops(out:&mut Vec<ItemStack>,prototype:&ItemStack,mut amount:u64,max:&impl Fn(&ItemStack)->u32) {
+pub(super) fn append_ae2_key_drops(out:&mut Vec<ItemStack>,prototype:&ItemStack,mut amount:u64,max:&impl Fn(&ItemStack)->u32) {
     let limit=u64::from(max(prototype).max(1));
     while amount>0 && out.len()<=1000 {
         let count=amount.min(limit);out.push(ItemStack{count:count as u32,..prototype.clone()});amount-=count;
@@ -60,8 +60,19 @@ fn append_provider_custody(out:&mut Vec<ItemStack>,config:&horizon_world::nbt::C
 /// virtual and never stored in these slots. Cable type is not recorded yet.
 #[cfg(feature = "ae2-lab")]
 pub(super) fn ae2_physical_drops_with_max(machine:&horizon_client::ae2_world::Machine,max:&impl Fn(&ItemStack)->u32)->Vec<ItemStack> {
+    ae2_collect_physical_drops(machine,max,false)
+}
+/// Wrench removal adds the selected part item and its contents to one list,
+/// unlike cable-block removal, whose part loot is collected separately.
+#[cfg(feature = "ae2-lab")]
+pub(super) fn ae2_physical_part_drops_with_max(machine:&horizon_client::ae2_world::Machine,max:&impl Fn(&ItemStack)->u32)->Vec<ItemStack> {
+    ae2_collect_physical_drops(machine,max,true)
+}
+#[cfg(feature = "ae2-lab")]
+fn ae2_collect_physical_drops(machine:&horizon_client::ae2_world::Machine,max:&impl Fn(&ItemStack)->u32,wrenched_part:bool)->Vec<ItemStack> {
     use horizon_client::ae2_world::MachineKind;
     let mut out=machine.physical_slots_and_upgrades();
+    let mut additional=Vec::new();
     if matches!(machine.kind,MachineKind::CraftingUnit|MachineKind::CraftingAccelerator|MachineKind::CraftingStorage1k|MachineKind::CraftingStorage4k|MachineKind::CraftingStorage16k|MachineKind::CraftingStorage64k|MachineKind::CraftingStorage256k|MachineKind::CraftingMonitor) {
         let mut counts=std::collections::BTreeMap::<String,(ItemStack,u64)>::new();
         if let Some(Tag::List(entries))=machine.config.get(&"ae2_cpu_escrow".into()) {
@@ -131,7 +142,13 @@ pub(super) fn ae2_physical_drops_with_max(machine:&horizon_client::ae2_world::Ma
         }
     }
     if let Some(Tag::List(parts)) = machine.config.get(&"parts".into()) {
-        for part in parts {
+        // CableBusContainer.addAdditionalDrops iterates Platform.DIRECTIONS_WITH_NULL,
+        // not the insertion order used by the native part storage.
+        let mut ordered:Vec<_>=parts.iter().collect();
+        ordered.sort_by_key(|part|match part.get("face").and_then(|tag|match tag {Tag::String(face)=>face.to_string().ok(),_=>None}).as_deref() {
+            Some("down")=>0,Some("up")=>1,Some("north")=>2,Some("south")=>3,Some("west")=>4,Some("east")=>5,_=>6,
+        });
+        for part in ordered {
             let Some(Tag::String(id)) = part.get("id") else {
                 continue;
             };
@@ -167,23 +184,24 @@ pub(super) fn ae2_physical_drops_with_max(machine:&horizon_client::ae2_world::Ma
                 .filter(|tag| tag.get("count") == Some(&Tag::Int(1)))
                 .and_then(horizon_client::save::item_from_nbt)
                 .filter(|stack| stack.count == 1 && stack.item.as_ref() == id);
-            out.push(saved.unwrap_or_else(|| ItemStack {
+            let part_item=saved.unwrap_or_else(|| ItemStack {
                 item: id.as_str().into(),
                 count: 1,
                 damage: 0,
                 extra: None,
-            }));
+            });
+            if wrenched_part {additional.push(part_item)} else {out.push(part_item)}
             // Interface and provider part machines own physical, slot-tagged
             // inventories separate from virtual filters and fluid return data.
             if matches!(id.as_str(),"ae2:cable_interface"|"ae2:cable_pattern_provider"|"ae2:crafting_terminal"|"ae2:pattern_encoding_terminal") {
                 if let Some(machine)=part.get("machine") {
                     for (key,limit) in [("slots",if id=="ae2:pattern_encoding_terminal" {2} else {9}),("upgrades",if id=="ae2:cable_interface" {1} else {0})] {
                         if let Ok(slots)=super::ae2_parts::strict_part_items(machine.get(key),limit) {
-                            out.extend(slots.into_iter().flatten());
+                            additional.extend(slots.into_iter().flatten());
                         }
                     }
                     if id=="ae2:cable_pattern_provider" {
-                        if let Some(Tag::Compound(config))=machine.get("config") {append_provider_custody(&mut out,config,max);}
+                        if let Some(Tag::Compound(config))=machine.get("config") {append_provider_custody(&mut additional,config,max);}
                     }
                 }
             }
@@ -191,13 +209,13 @@ pub(super) fn ae2_physical_drops_with_max(machine:&horizon_client::ae2_world::Ma
             if matches!(id.as_str(), "ae2:terminal" | "ae2:crafting_terminal" | "ae2:pattern_encoding_terminal") {
                 let tag = part.get("machine").and_then(|m| m.get("config")).and_then(|c| c.get("ae2_view_cells"));
                 if let Ok(cells) = super::ae2_parts::decode_terminal_view_cells(tag) {
-                    out.extend(cells.into_iter().flatten());
+                    additional.extend(cells.into_iter().flatten());
                 }
             }
             // Bus upgrades are real cards, distinct from state_json filters.
             if !matches!(id.as_str(),"ae2:cable_interface"|"ae2:cable_pattern_provider"|"ae2:crafting_terminal"|"ae2:pattern_encoding_terminal") && let Some(Tag::List(upgrades)) = part.get("upgrades") {
                 if let Ok(slots)=horizon_client::ae2_upgrade_inventory::decode(upgrades,5) {
-                    out.extend(slots.into_iter().flatten());
+                    additional.extend(slots.into_iter().flatten());
                 }
             }
         }
@@ -217,6 +235,7 @@ pub(super) fn ae2_physical_drops_with_max(machine:&horizon_client::ae2_world::Ma
             }
         }
     }
+    out.extend(additional);
     out
 }
 #[cfg(all(feature="ae2-lab",test))]
@@ -888,6 +907,24 @@ mod tests {
     }
     #[cfg(feature="ae2-lab")]
     #[test]
+    fn cable_break_additional_limit_follows_source_face_order() {
+        use horizon_client::{ae2_provider_queue::{self,Entry},ae2_world::{Machine,MachineKind}};
+        let make_part=|face:&str,item:&str,amount:u64| {
+            let mut config=Default::default();
+            ae2_provider_queue::write(&mut config,&[Entry::Item{prototype:ItemStack::new(item,1),amount}]).unwrap();
+            Tag::compound([("id",Tag::String("ae2:cable_pattern_provider".into())),
+                ("face",Tag::String(face.into())),("machine",Tag::compound([("config",Tag::Compound(config))]))])
+        };
+        let mut cable=Machine::new(MachineKind::CableBus);
+        // Native persistence order is deliberately opposite the Java side order.
+        cable.config.insert("parts".into(),Tag::List(vec![make_part("south","minecraft:diamond",64),make_part("north","minecraft:stone",999_999)]));
+        let drops=ae2_physical_drops_with_max(&cable,&|_|64);
+        assert_eq!(drops.iter().filter(|stack|stack.item.as_ref()=="ae2:cable_pattern_provider").count(),2);
+        assert_eq!(drops.iter().filter(|stack|stack.item.as_ref()=="minecraft:stone").count(),1001);
+        assert!(!drops.iter().any(|stack|stack.item.as_ref()=="minecraft:diamond"));
+    }
+    #[cfg(feature="ae2-lab")]
+    #[test]
     fn ae2_cpu_drop_limit_uses_a_fresh_list_per_exact_key_and_max_stack() {
         use horizon_client::ae2_world::{Machine,MachineKind};
         let mut cpu=Machine::new(MachineKind::CraftingStorage256k);
@@ -1007,9 +1044,13 @@ mod tests {
             ("id",Tag::String("ae2:cable_pattern_provider".into())),
             ("machine",Tag::compound([("config",Tag::Compound(queue_config))]))
         ])]));
-        let recovered=ae2_physical_drops(&nested);assert_eq!(recovered.len(),1001);
-        assert_eq!(recovered.iter().skip(1).map(|item|u64::from(item.count)).sum::<u64>(),64_000);
+        // Block loot and additional drops use separate source lists, whereas
+        // wrenching a part puts its item and additional drops in one list.
+        let recovered=ae2_physical_drops(&nested);assert_eq!(recovered.len(),1002);
+        assert_eq!(recovered.iter().skip(1).map(|item|u64::from(item.count)).sum::<u64>(),64_064);
         assert!(recovered.iter().skip(1).all(|item|item.same_item_same_components(&queued)));
+        let wrench=ae2_physical_part_drops_with_max(&nested,&|_|64);assert_eq!(wrench.len(),1001);
+        assert_eq!(wrench.iter().skip(1).map(|item|u64::from(item.count)).sum::<u64>(),64_000);
         let mut encoded=ItemStack::new("ae2:crafting_pattern",1);encoded.data_mut().custom_name=Some("physical encoded pattern".into());
         let blank=ItemStack::new("ae2:blank_pattern",3);
         let mut enc_host=Machine::new(MachineKind::CableBus);

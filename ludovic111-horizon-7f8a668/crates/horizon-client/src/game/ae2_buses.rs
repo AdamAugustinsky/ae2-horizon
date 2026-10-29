@@ -2256,43 +2256,38 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
-    /// The host's live vanilla container name is plain text. A saved rich
-    /// name cannot be copied without an identity-aware raw-name association.
-    fn ae2_plane_plain_name_supported(&self,target:(i32,i32,i32))->bool {
-        fn structured_name(tag:Option<&Tag>)->bool {
-            match tag {
-                Some(Tag::Compound(_) | Tag::List(_))=>true,
-                Some(Tag::String(name))=>{
-                    let name=name.to_string_lossy();
-                    name.starts_with('{') || name.starts_with('[')
-                },
-                _=>false,
-            }
-        }
-        let Some(extras)=self.world.chunks.get(&(target.0>>4,target.2>>4)).and_then(|chunk|chunk.saved.as_deref()) else{return true};
-        extras.block_entity_sources.iter().filter(|(pos,_)|*pos==target).all(|(_,tag)|
-            !structured_name(tag.get("CustomName"))
-                && !structured_name(tag.get("components").and_then(|c|c.get("minecraft:custom_name"))))
-    }
-    /// Vanilla chest and furnace removals have modeled physical spill and
-    /// loot-data paths. Other BEs remain guarded until their extra drops and
-    /// component-bearing block loot are modeled.
+    /// Admit modeled block entities whose normal removal and block-loot
+    /// components Horizon can preserve. Unknown saved entity types remain
+    /// guarded until their side effects and loot are understood.
     fn ae2_plane_supported_target(&self,target:(i32,i32,i32))->bool {
         match self.world.block_entities.get(&target) {
-            Some(BlockEntity::Chest(_))=>self.ae2_plane_plain_name_supported(target) && matches!(
-                self.res.facts().get(self.world.block(target.0,target.1,target.2)).name.as_ref(),
-                "minecraft:chest" | "minecraft:trapped_chest"
-            ),
-            Some(BlockEntity::Furnace(_))=>self.ae2_plane_plain_name_supported(target),
+            Some(BlockEntity::Chest(_) | BlockEntity::Furnace(_) | BlockEntity::Brewing(_)
+                | BlockEntity::Crafter(_) | BlockEntity::Beacon(_) | BlockEntity::Ae2(_) | BlockEntity::Campfire(_)
+                | BlockEntity::Jukebox(_) | BlockEntity::Lectern(_) | BlockEntity::Banner(_)
+                | BlockEntity::Sign(_) | BlockEntity::Skull(_)
+                | BlockEntity::Spawner(_) | BlockEntity::TrialSpawner(_) | BlockEntity::Vault(_)
+                | BlockEntity::CommandBlock(_) | BlockEntity::Beehive(_)
+                | BlockEntity::Sculk(_) | BlockEntity::CreakingHeart(_))=>true,
             Some(_)=>false,
-            None=>super::spill::saved_entity(&self.world,[target.0,target.1,target.2]).is_none(),
+            None=>match super::spill::saved_entity(&self.world,[target.0,target.1,target.2]) {
+                None=>true,
+                Some(tag)=>{
+                    let block=&self.res.facts().get(self.world.block(target.0,target.1,target.2)).name;
+                    let id=tag.get("id");
+                    (block.as_ref()=="minecraft:decorated_pot" && id==Some(&Tag::String("minecraft:decorated_pot".into())))
+                        || (block.as_ref()=="minecraft:chiseled_bookshelf" && id==Some(&Tag::String("minecraft:chiseled_bookshelf".into())))
+                        || (block.ends_with("_shelf") && id==Some(&Tag::String("minecraft:shelf".into())))
+                        || (matches!(block.as_ref(),"minecraft:campfire"|"minecraft:soul_campfire") && id==Some(&Tag::String("minecraft:campfire".into())))
+                        || (block.as_ref()=="minecraft:enchanting_table" && id==Some(&Tag::String("minecraft:enchanting_table".into())))
+                }
+            },
         }
     }
     /// Item pickup strategy, source ItemPickupStrategy: select the
     /// appropriate diamond fake tool, evaluate actual loot, preflight network
     /// capacity and energy, destroy without default drops, then insert the
     /// evaluated items; any unexpected overflow becomes a real item entity.
-    /// Live vanilla chests and furnaces preserve their physical contents.
+    /// Modeled block entities preserve their physical contents and block loot.
     fn ae2_plane_pickup_block(
         &mut self,
         pos: (i32, i32, i32),
@@ -2346,24 +2341,89 @@ impl Game<'_> {
             }
         }
         let at=[target.0,target.1,target.2];
-        let mut drops = if let Some(entity)=self.world.block_entities.get(&target).cloned() {
-            self.pending.record(at,&entity,&facts.name,self.world.block_names.get(&target).cloned());
-            let mut drops=self.block_loot_at(at,state,tool.as_ref());
-            for stack in &mut drops {self.pending.attach(at,stack);}
-            self.pending.clear(at);
-            drops
-        } else {
-            self.res.items().block_drops_in(
-                self.pack.assets.registry,
-                state,
-                tool.as_ref(),
-                &mut self.world.random,
-                Some((&mut self.rand_sequences, self.level.seed)),
-            )
-        };
-        // ItemPickupStrategy.obtainBlockDrops filters the empty stacks that
-        // can be produced by a loot table before energy and capacity checks.
+        let entity=self.world.block_entities.get(&target).cloned();
+        let saved=super::spill::saved_entity(&self.world,at);
+        let components=entity.as_ref().and_then(|entity|self.world.block_entities.vanilla_metadata(&target).map(|raw|(entity,raw))).map(|(entity,raw)|{
+            let mut current=save::live_vanilla_block_entity(target,entity,&facts.name,self.world.block_names.get(&target).map(String::as_str),Some(raw));
+            let table=save::text(raw.get("LootTable"));
+            let current_roll=self.world.chunks.get(&(target.0>>4,target.2>>4))
+                .and_then(|chunk|chunk.saved.as_deref())
+                .and_then(|saved|saved.rolled_loot.iter().find(|roll|roll.pos==target));
+            if current_roll.is_some_and(|roll|table.as_deref()==Some(roll.table.as_str())) {
+                self.restore_loot_table(target,&mut current);
+            }
+            let canonical=horizon_client::block_entity_nbt::canonical(&current).unwrap_or(current);
+            horizon_client::block_entity_item::pick(&canonical)
+        }).or_else(||saved.as_ref().map(horizon_client::block_entity_item::pick));
+        if let Some(entity)=entity.as_ref() {
+            self.pending.record(at,entity,&facts.name,self.world.block_names.get(&target).cloned());
+        } else if let Some(tag)=saved.as_ref() {
+            self.pending.record_saved(at,tag);
+        }
+        let mut drops=self.block_loot_at(at,state,tool.as_ref());
+        for stack in &mut drops {self.pending.attach(at,stack);}
+        self.pending.clear(at);
         drops.retain(|stack|stack.count>0 && stack.item.as_ref()!="minecraft:air");
+        if let Some(components)=components.as_ref() {
+            for stack in &mut drops {
+                let shulker=stack.item.ends_with("shulker_box");
+                if shulker || stack.item.as_ref()==facts.name.as_ref() {
+                    if let Some(name)=components.get(&"minecraft:custom_name".into()) {
+                        stack.set_custom_name_component(Some(name.clone()));
+                    }
+                    if shulker {
+                        for key in ["minecraft:lock","minecraft:container_loot"] {
+                            if let Some(value)=components.get(&key.into()) {
+                                stack.data_mut().set_other(key,Some(value.clone()));
+                            }
+                        }
+                        if components.contains_key(&"minecraft:container_loot".into()) {
+                            stack.data_mut().container.clear();
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(BlockEntity::Ae2(machine))=entity.as_ref() {
+            if let Some(block)=drops.iter_mut().find(|item|item.item.as_ref()==facts.name.as_ref()) {
+                let name=self.world.block_names.get(&target).map(String::as_str);
+                block.set_custom_name_component(super::ae2_memory_host::machine_name_component(machine,name));
+                if matches!(machine.kind,MachineKind::EnergyCell|MachineKind::DenseEnergyCell) && machine.energy>0.0 {
+                    block.data_mut().set_other("ae2:stored_energy",Some(Tag::Double(machine.energy.to_bits())));
+                }
+            }
+        }
+        if let Some(BlockEntity::Skull(skull))=entity.as_ref() {
+            for stack in drops.iter_mut().filter(|item|item.item.ends_with("_skull") || item.item.ends_with("_head")) {
+                if let Some(name)=skull.custom_name.as_ref() {
+                    stack.set_custom_name_component(Some(name.clone()));
+                }
+                if stack.item.as_ref()=="minecraft:player_head" {
+                    if let Some(profile)=skull.profile.as_ref() {
+                        stack.data_mut().set_other("minecraft:profile",Some(profile.clone()));
+                    }
+                    if let Some(sound)=skull.note_block_sound.as_ref() {
+                        stack.data_mut().set_other("minecraft:note_block_sound",Some(Tag::String(sound.as_str().into())));
+                    }
+                }
+            }
+        }
+        // The source calls level.destroyBlock directly, not playerDestroy:
+        // Silk Touch copies the resident bees and honey-level loot components.
+        if let Some(BlockEntity::Beehive(hive))=entity.as_ref()
+            && tool.as_ref().is_some_and(|tool|tool.enchantment_level("minecraft:silk_touch")>0) {
+            let bees=hive.to_nbt().into_iter().find_map(|(key,value)|(key=="bees").then_some(value));
+            let honey=self.pack.assets.registry.state(state)
+                .and_then(|state|state.properties.get("honey_level")).cloned();
+            for stack in drops.iter_mut().filter(|item|item.item.as_ref()==facts.name.as_ref()) {
+                if let Some(Tag::List(bees))=bees.as_ref() && !bees.is_empty() {
+                    stack.data_mut().set_other("minecraft:bees",Some(Tag::List(bees.clone())));
+                }
+                if let Some(honey)=honey.as_ref() {
+                    stack.data_mut().set_other("minecraft:block_state",Some(Tag::compound([("honey_level",Tag::String(honey.as_str().into()))])));
+                }
+            }
+        }
         let efficiency = plane.map_or(0, |s| s.enchantment_level("minecraft:efficiency"));
         let unbreaking = plane.map_or(0, |s| s.enchantment_level("minecraft:unbreaking"));
         let other = enchantments
@@ -2400,9 +2460,23 @@ impl Game<'_> {
         if !can_store {
             return Ok(false);
         }
+        self.ae2_prepare_cpu_removal(target)?;
         let block = horizon_core::position::BlockPos::new(target.0, target.1, target.2);
         if !self.with_level(|b, level, ticks| b.destroy_block(level, ticks, block, false)) {
             return Ok(false);
+        }
+        if matches!(entity.as_ref(),Some(BlockEntity::Sculk(_))) {
+            // The host queues sculk removal writes for its own observer;
+            // deliver the target's pre-removal callback before pickup returns.
+            self.sculk_sync_index();
+        }
+        if matches!(entity,Some(BlockEntity::Ae2(_)))
+            && (matches!(self.world.block_entities.get(&target),Some(BlockEntity::Ae2(_)))
+                || super::spill::saved_entity(&self.world,at).is_some())
+        {
+            // AE2 states currently inherit iron block flags, so the native
+            // setBlock path may not call the block-entity removal callback.
+            self.with_level(|_,level,_| {level.remove_entity(block,state,true);});
         }
         // Source breakBlockAndStoreExtraItems captures all item entities in
         // the target block AABB inflated by 0.2, including spilled contents.

@@ -147,7 +147,14 @@ impl Game<'_> {
                 None => self.world.block_names.remove(&key),
             };
         }
-        self.world.block_entities.insert(key, entity);
+        #[cfg(feature = "ae2-lab")]
+        let ae2_import=matches!(self.world.block_entities.get(&key),Some(BlockEntity::Ae2(_)));
+        if let Err(error)=self.world.block_entities.import_placed_in_place(key, entity) {
+            log::warn!("placed block entity import at {key:?}: {error}");
+            #[cfg(feature = "ae2-lab")]
+            if ae2_import {self.ae2_fault_placement_import(format!("placed block entity import at {key:?}: {error}"));}
+            return;
+        }
         #[cfg(feature = "ae2-lab")]
         self.world.block_entities.remember_vanilla_metadata(key,&placed);
         #[cfg(feature = "ae2-lab")]
@@ -160,6 +167,9 @@ impl Game<'_> {
             if let Some(BlockEntity::Ae2(machine))=self.world.block_entities.get_mut(&key) {
                 super::ae2_memory_host::set_machine_name_component(machine,name.as_ref());
             }
+            if self.world.block_entities.refresh_pending_placed_ae2(key,Some(&placed))==Some(false) {
+                self.ae2_fault_placement_import(format!("placed AE2 entity {key:?} escaped before its item data"));
+            }
         }
         #[cfg(feature = "ae2-lab")]
         self.ae2_import_dismantled_energy(key, stack);
@@ -167,7 +177,7 @@ impl Game<'_> {
     /// AE2 energy cells retain stored AE as a physical item component on
     /// disassembly; restore it when that actual item is placed.
     #[cfg(feature = "ae2-lab")]
-    fn ae2_import_dismantled_energy(&mut self,key:(i32,i32,i32),stack:&ItemStack) {
+    pub(super) fn ae2_import_dismantled_energy(&mut self,key:(i32,i32,i32),stack:&ItemStack) {
         use horizon_client::ae2_world::MachineKind;
         let max=match stack.item.as_ref() {"ae2:energy_cell"=>200_000.0,"ae2:dense_energy_cell"=>1_600_000.0,_=>return};
         let energy=stack.data().and_then(|d|d.other("ae2:stored_energy").or_else(||
@@ -180,16 +190,38 @@ impl Game<'_> {
         let mut stored=ae2_machines_core::stored_energy::StoredEnergy::new(0.0,max);
         stored.set_stored(energy);
         let energy=stored.stored();
-        let observed=self.ae2_sync_events();
         let mut changed=false;
         if let Some(BlockEntity::Ae2(machine))=self.world.block_entities.get_mut(&key) {
             if matches!(machine.kind,MachineKind::EnergyCell|MachineKind::DenseEnergyCell) {
                 machine.energy=energy;self.world.modified.insert((key.0>>4,key.2>>4));changed=true;
             }
         }
-        if changed {
-            if observed {if let Some(address)=self.ae2_local_address(key){self.ae2_energy_store_changed(address,None);}}
-            else {self.ae2_live_events.borrow_mut().energy.failure=Some("ordered placement energy event unavailable".into());}
+        if !changed {return;}
+        // Import happens before source onReady. Refresh the same construction
+        // record before any observer sees it, including inside a sandbox.
+        let pending=self.world.block_entities.refresh_pending_placed_ae2(key,None);
+        if pending==Some(false) {self.ae2_fault_placement_import(format!("placed AE2 energy cell {key:?} escaped before import"));}
+        if self.ae2_formation_staging {
+            return;
+        }
+        let observed=self.ae2_sync_events();
+        if observed {
+            // If Added already carried the energy, registration observed it.
+            // Otherwise this is the post-commit notification of an existing node.
+            if pending!=Some(true) {if let Some(address)=self.ae2_local_address(key){self.ae2_energy_store_changed(address,None);}}
+        } else {self.ae2_live_events.borrow_mut().energy.failure=Some("ordered placement energy event unavailable".into());}
+    }
+    /// Publish a committed staged placement's current energy, without writing
+    /// the original item amount again after other callbacks have run.
+    #[cfg(feature = "ae2-lab")]
+    pub(super) fn ae2_publish_placed_energy(&self,key:(i32,i32,i32)) {
+        use horizon_client::ae2_world::MachineKind;
+        if !matches!(self.world.block_entities.get(&key),Some(BlockEntity::Ae2(machine))
+            if matches!(machine.kind,MachineKind::EnergyCell|MachineKind::DenseEnergyCell)) {return;}
+        if self.ae2_sync_events() {
+            if let Some(address)=self.ae2_local_address(key) {self.ae2_energy_store_changed(address,None);}
+        } else {
+            self.ae2_live_events.borrow_mut().energy.failure=Some("ordered placement energy event unavailable".into());
         }
     }
 }

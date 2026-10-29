@@ -3,6 +3,11 @@ import { readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { root, help } from './common';
 const suites = [
+  'formation-quantum-dimensions',
+  'fluid-cell-missing-content', 'source-overfilled-cell', 'io-port-mixed-cell',
+  'mixed-cell-menus', 'terminal-repo-prediction', 'portable-fast-virtual-click', 'terminal-craft-gestures', 'inscriber-menu-filter', 'assembler-menu-filter', 'assembler-forced-pattern-menu',
+  'inframe-portable-hotkeys', 'formation-item-components', 'formation-armor-stand', 'formation-preview-events', 'formation-fluid-source',
+  'formation-fluid-io-custody', 'formation-fluid-nether', 'placement-source-orientation',
   'provider-session', 'crafting-alternatives', 'crafting-remainders', 'crafting-container-reuse',
   'crafting-cpu-capacity', 'crafting-stale-inventory', 'export-bus-crafting-schedule',
   'inscriber-components', 'growth-accelerator-tagged', 'fe-p2p-readback', 'client-settings',
@@ -32,9 +37,21 @@ const suites = [
   'hopper-component-stack-limit', 'client-complete-component-wire', 'cell-rich-item-components', 'inframe-pattern-access',
   'hopper-minecart-component-limit',
   'encoding-fake-hotkeys', 'interface-fake-hotkeys', 'processing-large-provider-queue', 'processing-creative-interface', 'crafting-large-job-persistence', 'source-special-patterns',
+  'chest-fluid-gestures',
+  'crafting-idle-break',
+  'crafting-idle-inventory',
+  'inframe-wireless-session',
+  'portable-fluid-gestures',
+  'portable-fluid-overflow',
+  'portable-menu-lifecycle',
+  'portable-menu-status',
+  'terminal-fluid-gestures',
+  'wireless-menu-lifecycle',
+  'wireless-menu-status',
+  'wireless-power-multiplier',
 ];
 // Explicitly selectable before-cases, not part of the default passing checkpoint.
-const pending = new Set(['quantum-forced-ready']);
+const pending = new Set(['chest-fluid-gestures', 'crafting-idle-break', 'crafting-idle-inventory', 'formation-armor-stand', 'formation-quantum-dimensions', 'inframe-wireless-session', 'portable-fluid-gestures', 'portable-fluid-overflow', 'portable-menu-lifecycle', 'portable-menu-status', 'quantum-forced-ready', 'terminal-craft-gestures', 'terminal-fluid-gestures', 'wireless-menu-lifecycle', 'wireless-menu-status', 'wireless-power-multiplier']);
 if (!help('Usage: bun run scripts/test-world.ts [--build METADATA.json] [--content DIRECTORY] [--in-frame] [SUITE ...]\nRuns only hidden, isolated fixtures, sequentially under a host rendering lease.\nSuites: ' + suites.join(', '))) {
   const args = process.argv.slice(2), selected: string[] = [], env = { ...process.env };
   let inFrame = false;

@@ -20,7 +20,7 @@ try {
   assert.equal((await fixture.ae(`grid part ${iface} south`)).attached,true);
   assert.equal((await fixture.ae(`grid part ${donor} south`)).attached,true);
   await fixture.command('gamemode survival @s'); await fixture.replace('hotbar.0','minecraft:stick');
-  await fixture.replace('hotbar.1','minecraft:iron_ingot',3); await fixture.replace('hotbar.2','ae2:item_storage_cell_1k');
+  await fixture.replace('hotbar.1','ae2:silicon',3); await fixture.replace('hotbar.2','ae2:item_storage_cell_1k');
   await fixture.replace('hotbar.3','minecraft:diamond',3); await fixture.replace('hotbar.4','ae2:item_storage_cell_4k');
   await fixture.replace('hotbar.5','ae2:cell_component_1k'); await fixture.replace('hotbar.6','ae2:item_storage_cell_16k');
   await fixture.replace('weapon.offhand','minecraft:gold_ingot');
@@ -32,7 +32,7 @@ try {
     await fixture.raw(`click-slot ${player}`); await fixture.raw(`click-slot ${dest}`);
     await until(() => fixture.raw('screen'),view => slot(view,dest)?.item===item && !view.carried,`physical ${item} inserted`);
   };
-  await open(inscriber,0); await put(1,302,'minecraft:iron_ingot'); await fixture.raw('click-slot 324');
+  await open(inscriber,0); await put(1,302,'ae2:silicon'); await fixture.raw('click-slot 324');
   assert.match(text(await fixture.command(`data get block ${inscriber} ae2_lab_config`)),/auto_export/);
   await fixture.raw('close'); await fixture.replace('hotbar.1','minecraft:emerald');
   fixture.mark('Inscriber menu transfers the real input and routes a setting');
@@ -73,7 +73,7 @@ try {
   await open(io,20); await put(6,300,'ae2:item_storage_cell_16k'); await fixture.raw('close');
   fixture.mark('Drive, Condenser and IO Port use real owned slots; Drive priority is applied');
   await fixture.restart();
-  assert.match(text(await fixture.command(`data get block ${inscriber}`)),/minecraft:iron_ingot/);
+  assert.match(text(await fixture.command(`data get block ${inscriber}`)),/ae2:silicon/);
   assert.match(text(await fixture.command(`data get block ${bench}`)),/ae2:item_storage_cell_1k/);
   assert.match(text(await fixture.command(`data get block ${iface} ae2_lab_config.parts`)),/minecraft:diamond/);
   assert.match(text(await fixture.command(`data get block ${drive}`)),/ae2:item_storage_cell_4k/);

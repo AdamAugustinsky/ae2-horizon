@@ -132,6 +132,26 @@ fn part_priority(part: &Tag, outer: bool) -> u8 {
     }
 }
 impl Game<'_> {
+    /// A placed BE's construction snapshot escaped before item components
+    /// were imported. Fall back from ordered observers rather than projecting
+    /// stale topology, CPU, provider or power state. Sandboxed placements
+    /// report this to their guard instead of touching live services.
+    pub(super) fn ae2_fault_placement_import(&mut self, reason:String) {
+        if self.ae2_formation_staging {
+            if self.ae2_formation_import_error.is_none() {self.ae2_formation_import_error=Some(reason);}
+            return;
+        }
+        log::warn!("AE2 ordered placement import unavailable: {reason}");
+        let mut live=self.ae2_live_events.borrow_mut();
+        live.poisoned=true;
+        live.failure=Some(reason.clone());
+        live.provider_failure=Some(reason.clone());
+        live.energy.failure=Some(reason.clone());
+        if let Some(observer)=live.provider_shadow.as_mut() {
+            observer.invalidate(reason.clone());
+            observer.invalidate_cpu(reason);
+        }
+    }
     pub(super) fn ae2_next_cpu_break(&self) -> Result<Option<super::ae2_provider_registry::CpuBreakNotice>, String> {
         if !self.ae2_sync_events() { return Err("ordered grid events unavailable".into()); }
         let live=self.ae2_live_events.borrow();

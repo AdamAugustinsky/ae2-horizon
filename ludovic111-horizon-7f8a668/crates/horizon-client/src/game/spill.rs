@@ -252,7 +252,7 @@ pub(super) fn ae2_synthetic_cable_host_drop(block: &str, stack: &ItemStack) -> b
 /// What a broken block's entity gives its own dropped item (`copy_components`
 /// in the block loot tables): a shulker box's contents, a banner's layers, a
 /// container's custom name.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Pending {
     pub(super) shulker: HashMap<[i32; 3], Vec<(u8, ItemStack)>>,
     pub(super) banner: HashMap<[i32; 3], Banner>,
@@ -388,6 +388,7 @@ impl Pending {
 
 /// An item entity to add: where, its motion (None: `new ItemEntity`'s own
 /// random motion) and its pickup delay.
+#[derive(Clone)]
 pub(super) struct Spawn {
     pub(super) stack: ItemStack,
     pub(super) pos: [f64; 3],
@@ -395,7 +396,7 @@ pub(super) struct Spawn {
     pub(super) delay: u32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Spill {
     pub(super) spawns: Vec<Spawn>,
     /// Experience orbs (`ExperienceOrb.award`): where and how much, each

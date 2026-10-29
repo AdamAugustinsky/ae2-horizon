@@ -56,8 +56,11 @@ impl Game<'_> {
         // only a delegating wrapper around BasicCellInventory, whose default
         // preference is false. Keep that source distinction.
         if mount.kind!=MachineKind::Drive{return Ok(false)}
-        let cell=if fluid{self.ae2_read_fluid_cell(&stack)}else{self.ae2_read_item_cell(&stack)};
-        Ok(cell.is_ok_and(|cell|cell.entries().any(|(stored,count)|stored==key&&*count>0)))
+        let cell=self.ae2_read_cell(&stack);
+        Ok(cell.is_ok_and(|cell| {
+            let primary=(cell.config().channel==ae2_cell_core::Channel::Fluid)==fluid;
+            if primary {cell.count(key)>0} else {cell.other_count(key)>0}
+        }))
     }
     pub(super) fn ae2_item_bus_preferred(&mut self,mount:&super::ae2_buses::StorageMount,key:&ItemKey)->Result<bool,String>{
         let mut delegate=mount.clone();delegate.access=ae2_machines_core::Access::ReadWrite;
@@ -79,16 +82,17 @@ impl Game<'_> {
             let wanted=if fluid{super::ae2_storage_devices::CreativeCellKey::Fluid(key.clone())}else{super::ae2_storage_devices::CreativeCellKey::Item(key.clone())};
             return Ok((if keys.contains(&wanted){amount}else{0},None))
         }
-        let cell=if fluid{self.ae2_read_fluid_cell(&stack)}else{self.ae2_read_item_cell(&stack)};
+        let cell=self.ae2_read_cell(&stack);
         let Ok(mut cell)=cell else{return Ok((0,None))};
-        if cell.config().channel!=if fluid{Channel::Fluid}else{Channel::Item}{return Ok((0,None))}
+        let primary=(cell.config().channel==Channel::Fluid)==fluid;
+        if insert && !primary{return Ok((0,None))}
         let action=if simulate{Action::Simulate}else{Action::Modulate};
         let moved=if insert{
             if fluid{cell.insert(key,amount,action)}else{self.ae2_cell_insert(&mut cell,key,amount,action)}
-        }else{cell.extract(key,amount,action)};
+        }else if primary {cell.extract(key,amount,action)}else{cell.extract_other(key,amount,action)};
         let updated=if moved>0&&!simulate{
             let mut updated=stack;
-            if fluid{ae2_fluids::write_fluid_cell(&mut updated,&cell)?;}else{ae2_lab::write_cell(&mut updated,&cell)?;}
+            if cell.config().channel==Channel::Fluid{ae2_fluids::write_fluid_cell(&mut updated,&cell)?;}else{ae2_lab::write_cell(&mut updated,&cell)?;}
             Some(updated)
         }else{None};
         Ok((moved,updated))

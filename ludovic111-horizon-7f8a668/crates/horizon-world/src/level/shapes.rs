@@ -27,6 +27,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         neighbour_pos: BlockPos,
         neighbour: BlockStateId,
     ) -> BlockStateId {
+        self.level.custom_shape_event(pos, state, neighbour_pos);
         if self.level.custom_crank(state) {
             if direction.opposite() == self.b.facing(state) && !self.can_survive(state, pos) {
                 return self.b.default_of(self.b.named.air);

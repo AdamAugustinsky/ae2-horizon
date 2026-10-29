@@ -24,6 +24,12 @@ use horizon_client::ae2_common_config;
 mod ae2_buses;
 #[cfg(feature = "ae2-lab")]
 mod ae2_formation;
+#[cfg(feature="ae2-lab")]
+mod ae2_formation_transaction;
+#[cfg(feature="ae2-lab")]
+mod ae2_formation_placement;
+#[cfg(feature = "ae2-lab")]
+mod ae2_fluid_formation;
 #[cfg(feature = "ae2-lab")]
 mod ae2_bus_ui;
 #[cfg(feature = "ae2-lab")]
@@ -702,6 +708,8 @@ enum GuestUse {
 /// The client world as seen by the vanilla block-behaviour library.
 struct GameLevel<'w> {
     #[cfg(feature="ae2-lab")]
+    formation_fluid: &'w mut ae2_fluid_formation::FluidFormationRuntime,
+    #[cfg(feature="ae2-lab")]
     quantum: &'w mut ae2_quantum::QuantumRuntime,
     #[cfg(feature="ae2-lab")]
     detectors: &'w mut HashMap<(Dim,(i32,i32,i32)),ae2_light_detector::DetectorState>,
@@ -839,7 +847,21 @@ impl GameLevel<'_> {
     }
 }
 impl LevelAccess for GameLevel<'_> {
+    fn custom_shape_event(&mut self, pos: BlockPos, state: BlockStateId, neighbor: BlockPos) {
+        #[cfg(feature="ae2-lab")]
+        if !self.client_side && self.facts.get(state).name.as_ref()=="ae2:cable_bus" {
+            ae2_fluid_formation::clear_facing(self.world, self.facts, self.formation_fluid, pos, neighbor);
+        }
+        #[cfg(not(feature="ae2-lab"))]
+        let _ = (pos, state, neighbor);
+    }
     fn custom_neighbor_event(&mut self, pos: BlockPos, state: BlockStateId, source: Option<BlockPos>) {
+        #[cfg(feature="ae2-lab")]
+        if !self.client_side && self.facts.get(state).name.as_ref()=="ae2:cable_bus" {
+            if let Some(neighbor) = source {
+                ae2_fluid_formation::clear_facing(self.world, self.facts, self.formation_fluid, pos, neighbor);
+            }
+        }
         #[cfg(feature="ae2-lab")]
         if !self.client_side && matches!(self.facts.get(state).name.as_ref(),"ae2:quantum_ring"|"ae2:quantum_link") {
             self.quantum.neighbor_changed(self.world,self.dim,self.facts,(pos.x,pos.y,pos.z),source.map(|p|(p.x,p.y,p.z)));
@@ -883,6 +905,18 @@ impl LevelAccess for GameLevel<'_> {
         }
         #[cfg(not(feature="ae2-lab"))]
         { let _=(pos,side);false }
+    }
+    #[cfg(feature="ae2-lab")]
+    fn custom_placement_state(&self,default:BlockStateId,face:Direction,yaw:f32,pitch:f32,plane:Option<Direction>,water:bool)->Option<BlockStateId> {
+        let state=self.registry.state(default)?;
+        let (facing,spin)=match plane {
+            Some(look)=>ae2_placement::plane_placement(&state.name,look.normal()),
+            None=>ae2_placement::placement(&state.name,yaw,pitch,face.normal()),
+        }?;
+        let mut props=state.properties.clone();props.insert("facing".into(),facing.into());
+        if let Some(spin)=spin {props.insert("spin".into(),spin.to_string());}
+        if props.contains_key("waterlogged") {props.insert("waterlogged".into(),water.to_string());}
+        self.registry.resolve(&horizon_world::chunk::BlockState{name:state.name.clone(),properties:props}).ok()
     }
     fn custom_center_fixture(&self, state: BlockStateId) -> bool {
         #[cfg(feature="ae2-lab")]
@@ -1804,6 +1838,12 @@ struct Game<'a> {
     ae2_me_runtime: std::cell::RefCell<ae2_me_runtime::MeRuntime>,
     #[cfg(feature = "ae2-lab")]
     ae2_quantum_runtime: std::cell::RefCell<ae2_quantum::QuantumRuntime>,
+    #[cfg(feature = "ae2-lab")]
+    ae2_formation_staging: bool,
+    #[cfg(feature="ae2-lab")]
+    ae2_formation_fluid_runtime: ae2_fluid_formation::FluidFormationRuntime,
+    #[cfg(feature = "ae2-lab")]
+    ae2_formation_import_error: Option<String>,
     #[cfg(feature = "ae2-lab")]
     ae2_device_scheduler: std::cell::RefCell<ae2_device_scheduler::DeviceScheduler>,
     #[cfg(feature = "ae2-lab")]
@@ -2918,6 +2958,8 @@ impl Game<'_> {
         };
         let mut level = GameLevel {
             #[cfg(feature="ae2-lab")]
+            formation_fluid: &mut self.ae2_formation_fluid_runtime,
+            #[cfg(feature="ae2-lab")]
             quantum: self.ae2_quantum_runtime.get_mut(),
             #[cfg(feature="ae2-lab")]
             detectors: &mut self.ae2_detectors,
@@ -2955,6 +2997,8 @@ impl Game<'_> {
             client_side: self.remote.is_some(),
         };
         let result = f(self.res.behaviours(), &mut level, &mut self.block_ticks);
+        #[cfg(feature="ae2-lab")]
+        if self.ae2_formation_staging { return result; }
         self.flush_spill();
         #[cfg(feature = "ae2-lab")]
         if self.ae2_has_anchor_owners() {
@@ -3219,6 +3263,10 @@ impl Game<'_> {
     }
     /// Side effects reported by the behaviour library, in vanilla order.
     fn process_level_events(&mut self) -> Result<()> {
+        // Placement previews retain their queue until the world transaction
+        // commits. No sound, spawn, dispenser or LAN effect may escape it.
+        #[cfg(feature="ae2-lab")]
+        if self.ae2_formation_staging {return Ok(());}
         let events = std::mem::take(&mut self.level_events);
         self.lan_record_events(&events);
         dispense_fixture::record_events(&events);
@@ -4365,50 +4413,57 @@ impl Game<'_> {
             item: stack.item.to_string(),
             can_use_game_master_blocks: self.can_use_game_master_blocks(),
         };
-        #[cfg(feature="ae2-lab")]
-        let ae2_replaced_water = [hit.pos,[hit.pos[0]+hit.face[0],hit.pos[1]+hit.face[1],hit.pos[2]+hit.face[2]]].map(|p| {
-            let old=self.world.block(p[0],p[1],p[2]);
-            (p,self.res.facts().get(old).fluid==horizon_client::blocks::Fluid::Water && self.pack.assets.registry.state(old).is_some_and(|s|s.properties.get("level").is_some_and(|v|v=="0")))
-        });
-        let outcome = self.with_level(|b, level, ticks| b.place_block(level, ticks, &ctx));
-        let PlaceOutcome::Placed { pos, state } = outcome else {
-            self.process_level_events()?;
-            // BlockItem.useOn: a consumable that could not be placed is used,
-            // which ItemStack.useOn counts as a use of the item.
-            if self.start_eating(&info) {
-                self.stats.add("used", &stack.item, 1);
+        let place=|game:&mut Self| -> std::result::Result<Option<(BlockPos,BlockStateId)>,String> {
+            let pending=game.with_level(|b,level,ticks|b.begin_block_placement(level,ticks,&ctx));
+            let Some(pending)=pending else {return Ok(None)};
+            let pos=pending.pos;
+            let target=[pos.x,pos.y,pos.z];
+            let state=pending.state;
+            #[cfg(feature="ae2-lab")]
+            let state=game.ae2_apply_item_block_state(target,state,&stack);
+            if let Some(entity)=BlockEntity::for_block(&game.res.facts().get(state).name) {
+                let key=(pos.x,pos.y,pos.z);
+                game.world.block_entities.insert(key,entity);
+                let game_master=game.can_use_game_master_blocks();
+                game.apply_placed_item(target,&stack,game_master);
+                #[cfg(feature="ae2-lab")]
+                {
+                    if let Some(error)=game.ae2_formation_import_error.take() {return Err(error);}
+                    game.ae2_record_node_owner(target);
+                    if game.world.block_entities.refresh_pending_placed_ae2(key,None)==Some(false) {
+                        return Err("placed AE2 owner escaped before import".into());
+                    }
+                }
             }
+            let outcome=game.with_level(|b,level,ticks|b.finish_block_placement(level,ticks,pending));
+            Ok(match outcome {PlaceOutcome::Placed {pos,state}=>Some((pos,state)),_=>None})
+        };
+        #[cfg(feature="ae2-lab")]
+        let placed=self.ae2_with_placement_transaction(place)?;
+        #[cfg(not(feature="ae2-lab"))]
+        let placed=place(self)?;
+        let Some((pos,state))=placed else {
+            self.process_level_events()?;
+            if self.start_eating(&info) {self.stats.add("used",&stack.item,1);}
             return Ok(true);
         };
-        let target = [pos.x, pos.y, pos.z];
+        let target=[pos.x,pos.y,pos.z];
+        let key=(pos.x,pos.y,pos.z);
+        self.mod_block_event(target,state,true);
         #[cfg(feature="ae2-lab")]
-        self.ae2_orient_placed_block(target,hit.face,self.yaw,self.pitch,ae2_replaced_water.iter().any(|(p,water)|*p==target&&*water));
-        #[cfg(feature="ae2-lab")]
-        let state=self.ae2_apply_item_block_state(target,state,&stack);
-        self.mod_block_event(target, state, true);
-        if let Some(entity) = BlockEntity::for_block(&self.res.facts().get(state).name) {
-            let key = (target[0], target[1], target[2]);
-            self.world.block_entities.insert(key, entity);
-            let game_master = self.can_use_game_master_blocks();
-            self.apply_placed_item(target, &stack, game_master);
-            #[cfg(feature="ae2-lab")]
-            self.ae2_record_node_owner(target);
-            #[cfg(feature="ae2-lab")]
+        {
+            self.ae2_publish_placed_energy(key);
             if matches!(self.res.facts().get(state).name.as_ref(),"ae2:quantum_ring"|"ae2:quantum_link") {
                 self.ae2_quantum_block_added(key);
             }
-            // Block.setPlacedBy.
-            match self.world.block_entities.get(&key) {
-                Some(BlockEntity::CommandBlock(_)) => {
-                    let data = stack.data().is_some_and(|d| {
-                        d.other(horizon_client::block_entity_item::BLOCK_ENTITY_DATA)
-                            .is_some()
-                    });
-                    self.command_block_placed(key, !data);
-                }
-                Some(BlockEntity::Sign(sign)) if !sign.waxed => self.open_sign_editor(key, true),
-                _ => {}
-            }
+        }
+        match self.world.block_entities.get(&key) {
+            Some(BlockEntity::CommandBlock(_))=>{
+                let data=stack.data().is_some_and(|d|d.other(horizon_client::block_entity_item::BLOCK_ENTITY_DATA).is_some());
+                self.command_block_placed(key,!data);
+            },
+            Some(BlockEntity::Sign(sign)) if !sign.waxed=>self.open_sign_editor(key,true),
+            _=>{},
         }
         self.swing_arm();
         // BlockItem.place's sound is among the level events;
@@ -5652,6 +5707,8 @@ impl Game<'_> {
     fn quick_craft_accepts(&mut self, slot: usize, ty: i32, dragged: usize) -> bool {
         #[cfg(feature="ae2-lab")]
         if self.ae2_is_fake_slot(slot) {return self.carried.is_some();}
+        #[cfg(feature="ae2-lab")]
+        if self.ae2_is_remote_repo_slot(slot) {return false;}
         #[cfg(feature="ae2-lab")]
         if self.ae2_local_crafting_terminal_open() {
             if !(slot<36 || (327..=335).contains(&slot)) {return false;}
@@ -7498,7 +7555,7 @@ impl Game<'_> {
             // AEBaseScreen intercepts FakeSlot clicks before vanilla's
             // double-click pickup-all behavior.
             #[cfg(feature="ae2-lab")]
-            let double=double && !self.ae2_is_fake_slot(slot);
+            let double=double && !self.ae2_is_fake_slot(slot) && !self.ae2_is_remote_repo_slot(slot);
             if double && self.menu_click(Some(slot), 0, Input::PickupAll) {
                 self.last_inv_click = None;
                 // The double click's own release (`mouseReleased`'s PICKUP_ALL).
@@ -9180,6 +9237,9 @@ impl Game<'_> {
             *self.ae2_live_events.borrow_mut() = Default::default();
             *self.ae2_me_runtime.borrow_mut() = Default::default();
             *self.ae2_quantum_runtime.borrow_mut() = Default::default();
+            self.ae2_formation_staging = false;
+            self.ae2_formation_fluid_runtime = Default::default();
+            self.ae2_formation_import_error = None;
             *self.ae2_device_scheduler.borrow_mut() = Default::default();
             *self.ae2_storage_monitors.borrow_mut() = Default::default();
             self.ae2_processor_ticks = Default::default();
@@ -13784,6 +13844,12 @@ impl<'a> Game<'a> {
             ae2_me_runtime: Default::default(),
             #[cfg(feature = "ae2-lab")]
             ae2_quantum_runtime: Default::default(),
+            #[cfg(feature = "ae2-lab")]
+            ae2_formation_staging: false,
+            #[cfg(feature="ae2-lab")]
+            ae2_formation_fluid_runtime: Default::default(),
+            #[cfg(feature = "ae2-lab")]
+            ae2_formation_import_error: None,
             #[cfg(feature = "ae2-lab")]
             ae2_device_scheduler: Default::default(),
             #[cfg(feature = "ae2-lab")]

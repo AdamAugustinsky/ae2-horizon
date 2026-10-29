@@ -42,10 +42,16 @@ fn candidates(action: Action, inventory: &[Option<ItemStack>]) -> Vec<usize> {
 impl Game<'_> {
     /// Named physical input is examined before vanilla's default-key mapping.
     fn ae2_hotkey_input(&mut self, input: &str, down: bool, repeat: bool) {
-        if !down || repeat || self.screen != Screen::Playing || self.remote.is_none() { return; }
+        if !down || repeat || self.screen != Screen::Playing { return; }
         let actions: Vec<_> = Action::ALL.into_iter().filter(|action| self.settings.keys.get(action.mapping()) == input).collect();
         for action in actions {
-            self.send(Serverbound::CustomPayload(CustomPayload {channel: CHANNEL.into(), data: action.id().as_bytes().to_vec()}));
+            if self.remote.is_some() {
+                self.send(Serverbound::CustomPayload(CustomPayload {channel: CHANNEL.into(), data: action.id().as_bytes().to_vec()}));
+            } else if matches!(action, Action::ItemCell | Action::FluidCell) {
+                for source in candidates(action, &self.inventory) {
+                    if self.ae2_open_local_portable_source(source) { break; }
+                }
+            }
         }
     }
     pub(super) fn ae2_hotkey_key(&mut self, key: KeyCode, down: bool, repeat: bool) {

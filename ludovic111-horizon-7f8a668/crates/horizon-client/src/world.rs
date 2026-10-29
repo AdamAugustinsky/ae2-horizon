@@ -172,6 +172,33 @@ impl Weather {
     }
 }
 impl World {
+    pub fn placement_snapshot(&self) -> Self {
+        Self {
+            random: self.random.clone(),
+            health_rules: self.health_rules.clone(),
+            dirty_sections: self.dirty_sections.clone(),
+            dirty_light: self.dirty_light.clone(),
+            light_edits: self.light_edits.clone(),
+            loaded_entities: self.loaded_entities.clone(),
+            modified: self.modified.clone(),
+            dynamic_shapes: self.dynamic_shapes.clone(),
+            chest_openers: self.chest_openers.clone(),
+            block_names: self.block_names.clone(),
+            watched: self.watched.clone(),
+            watched_writes: self.watched_writes.clone(),
+            inhabited: self.inhabited.clone(),
+            block_log: self.block_log.clone(),
+            light_log: self.light_log.clone(),
+            moving_pistons: self.moving_pistons.clone(),
+            fast_lava: self.fast_lava, revision: self.revision, air: self.air,
+            game_time: self.game_time, day_time: self.day_time, weather: self.weather,
+            chunks: self.chunks.placement_snapshot(),
+            block_entities: self.block_entities.placement_snapshot(),
+            // Derived cache; a shadow edit must not invalidate the live cache.
+            pois: Default::default(),
+        }
+    }
+
     pub fn new(air: BlockStateId, seed: i64) -> Self {
         Self {
             chunks: Default::default(),

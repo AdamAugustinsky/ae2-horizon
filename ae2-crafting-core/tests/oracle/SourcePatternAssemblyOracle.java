@@ -48,11 +48,13 @@ class Recipe {
         if(input.size()!=2)return false;
         var a=input.getItem(0).id();var b=input.getItem(1).id();
         return (a.equals("stone") || a.equals("andesite")) && (b.equals("stone") || b.equals("andesite"))
-                && (special || a.equals("stone") || b.equals("stone"));
+                && (a.equals("stone") || b.equals("stone"));
     }
     ItemStack assemble(CraftingInput input,Object registry){
+        if(input.size()!=2)return ItemStack.EMPTY;
+        if(special)return new ItemStack(input.getItem(0).id().equals("andesite") ? "dynamic" : "diamond");
         if(!matches(input,new Level()))return ItemStack.EMPTY;
-        return new ItemStack(special && input.getItem(0).id().equals("andesite") ? "dynamic" : "diamond");
+        return new ItemStack("diamond");
     }
 }
 class AECraftingPattern {
@@ -98,6 +100,7 @@ public class SourcePatternAssemblyOracle {
         var strict=new AECraftingPattern(false,false);
         check(strict.assemble(positioned("andesite","stone",0),level).equals(ItemStack.EMPTY),"disabled_substitution_rejects_replacement");
         var dynamic=new AECraftingPattern(true,true);
-        check(dynamic.assemble(both,level).equals(new ItemStack("dynamic")),"special_recipe_assembles_combined_live_grid");
+        check(!dynamic.recipe.matches(both,level),"special_recipe_grid_does_not_match");
+        check(dynamic.assemble(both,level).equals(new ItemStack("dynamic")),"special_recipe_assembles_without_matching");
     }
 }

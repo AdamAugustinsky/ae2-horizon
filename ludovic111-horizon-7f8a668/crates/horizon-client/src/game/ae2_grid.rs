@@ -736,8 +736,8 @@ impl Game<'_> {
                             }
                         }
                     }
-                    if let Ok(c) = self.ae2_read_item_cell(stack) {
-                        for (k, v) in c.entries() {
+                    if let Ok(c) = self.ae2_read_cell(stack) {
+                        for (k, v) in c.entries_for(ae2_cell_core::Channel::Item) {
                             let n = total.entry(k.clone()).or_default();
                             *n = n.checked_add(*v).ok_or("network item count overflow")?;
                         }
@@ -955,7 +955,7 @@ impl Game<'_> {
             }
             // FormationPlane's InWorldStorage has the default nonpreferred
             // behavior. Existing placement staging/rollback remains intact.
-            if left>0&&allow_formation{left-=self.ae2_form_simple_blocks(pos,input,left,priority,formation);}
+            if left>0&&allow_formation{left-=self.ae2_form_simple_blocks(pos,input,left,priority,simulate,formation);}
             if left==0{break}
         }
         let moved = wanted - left;

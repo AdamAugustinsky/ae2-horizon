@@ -1872,13 +1872,14 @@ mod recursive {
             cpu: GridAddress,
             key: &ae2_cell_core::ItemKey,
             amount: u64,
+            plan: &mut super::super::ae2_buses::FormationPlan,
         ) -> Result<u64, String> {
             match r.owner {
                 RequestOwner::Interface(owner) => {
                     self.ae2_interface_deliver_fluid(owner, r.slot, cpu, key, amount, false)
                 }
                 RequestOwner::Export(owner) => {
-                    self.ae2_export_deliver_fluid(owner, r.slot, cpu, key, amount, false)
+                    self.ae2_export_deliver_fluid(owner, r.slot, cpu, key, amount, false, plan)
                 }
             }
         }
@@ -2705,7 +2706,7 @@ mod recursive {
                             if u64::from(moved)<amount {remaining.push(Entry::Item{prototype,amount:amount-u64::from(moved)});}
                         }
                         Entry::Fluid{key,amount}=>{
-                            let moved=self.provider_target_fluid_insert(target,face,&key,amount,false);
+                            let moved=self.provider_target_fluid_insert(target,face,&key,amount,false,plan);
                             if moved>amount{return Err("provider target overaccepted fluid".into());}
                             if moved<amount {remaining.push(Entry::Fluid{key,amount:amount-moved});}
                         }
@@ -2718,17 +2719,17 @@ mod recursive {
             })();
             if result.is_err(){restore(self,before);plan.truncate(previous);}result
         }
-        fn provider_target_fluid_insert(&mut self,target:GridAddress,face:horizon_core::geometry::Direction,key:&ae2_cell_core::ItemKey,amount:u64,simulate:bool)->u64 {
+        fn provider_target_fluid_insert(&mut self,target:GridAddress,face:horizon_core::geometry::Direction,key:&ae2_cell_core::ItemKey,amount:u64,simulate:bool,plan:&mut super::super::ae2_buses::FormationPlan)->u64 {
             if matches!(self.ae2_block_entity(target),Some(BlockEntity::Ae2(machine)) if machine.kind==MachineKind::Condenser) {
                 return self.ae2_condenser_me_fluid_insert_at(target,amount,simulate);
             }
-            if let Some(n)=self.ae2_fluid_p2p_fill(target,face,key,amount,simulate) {return n;}
-            if let Some(n)=self.ae2_interface_fluid_move(target,face,key,amount,true,simulate) {return n;}
+            if let Some(n)=self.ae2_fluid_p2p_fill_staged(target,face,key,amount,simulate,plan) {return n;}
+            if let Some(n)=self.ae2_interface_fluid_move_staged(target,face,key,amount,true,simulate,plan) {return n;}
             if let Some(n)=self.ae2_provider_return_fluid_at(target,face,key,amount,simulate) {return n;}
             self.ae2_tank_fill_encoded(target,key,amount,simulate).unwrap_or(0)
         }
         fn recursive_destination(&mut self, spec: &Spec, excluded:Option<&std::collections::BTreeSet<GridAddress>>,
-            effective_patterns:Option<&[String]>) -> Option<GridAddress> {
+            effective_patterns:Option<&[String]>,plan:&mut super::super::ae2_buses::FormationPlan) -> Option<GridAddress> {
             let provider = self.provider_machine(spec.provider)?;
             let stored = match spec.definition.as_ref() {
                 Some(definition) => {
@@ -2835,7 +2836,7 @@ mod recursive {
                         if fluids.iter().any(|(key,amount)|*amount>0 && blocked_fluids.contains(&fluid_name(key))) {return false;}
                     }
                     inputs.iter().flatten().all(|input|self.ae2_item_p2p_insert(*p,face,input,true).unwrap_or_else(||self.ae2_native_item_insert(*p,face,input,input.count,true))>0)
-                        && fluid_inputs.iter().all(|fluid|self.provider_target_fluid_insert(*p,face,&fluid.key,fluid.amount,true)>0)
+                        && fluid_inputs.iter().all(|fluid|self.provider_target_fluid_insert(*p,face,&fluid.key,fluid.amount,true,plan)>0)
                 });
             }
             let stored=&stored;
@@ -3447,8 +3448,8 @@ mod recursive {
                         }
                         for (key, amount) in fluids {
                             // AEFluidKey.addDrops emits no item; unaccepted fluid is voided upstream.
-                            let _ = self.ae2_grid_fluid_capability_encoded(
-                                *address, key, *amount, true, false,
+                            let _ = self.ae2_grid_fluid_capability_staged_encoded(
+                                *address, key, *amount, true, false, &mut plan,
                             );
                         }
                     }
@@ -3635,8 +3636,8 @@ mod recursive {
                 m.config
                     .insert("ae2_provider_injecting".into(), Tag::Byte(1));
                 self.store_provider(owner, &m)?;
-                let accepted =
-                    self.ae2_grid_fluid_insert_uncharged_encoded(address, &key, amount)?;
+                let mut plan = super::super::ae2_buses::FormationPlan::default();
+                let accepted = self.ae2_grid_fluid_insert_uncharged_staged_encoded(address, &key, amount, &mut plan)?;
                 if accepted > amount {
                     return Err("provider fluid return exceeds physical amount".into());
                 }
@@ -3654,6 +3655,7 @@ mod recursive {
                     m.config.remove(&"ae2_provider_injecting".into());
                     self.store_provider(owner, &m)?;
                     self.provider_receive(owner, &fluid_name(&key), accepted);
+                    self.ae2_commit_formation(plan)?;
                 } else {
                     let mut m = self.provider_machine(owner).ok_or("provider disappeared")?;
                     m.config.remove(&"ae2_provider_injecting".into());
@@ -3999,7 +4001,7 @@ mod recursive {
                             if power > 0.0 && self.ae2_take_power(pos, power, true) < power - 0.01 {
                                 exhausted.insert(task.pattern.clone()); break;
                             }
-                            if let Some(at) = self.recursive_destination(&bound, None, Some(&medium.effective_patterns)) {
+                            if let Some(at) = self.recursive_destination(&bound, None, Some(&medium.effective_patterns),formation) {
                                 if !machine_updates.iter().any(|(p, _)| *p == at) && !session.flights.values().any(|p| *p == at) {
                                     if !self.ae2_ordered_provider_contains(pos, &medium, definition, pass)? {return Err("provider membership changed before push".into());}
                                     chosen=Some((index,at,bound,power)); break;
@@ -4007,7 +4009,7 @@ mod recursive {
                             }
                         }
                     } else if session.cpu.task_has_inputs(index) {
-                        if let Some(at) = self.recursive_destination(&spec,rejected_targets.get(&task.pattern),None) {
+                        if let Some(at) = self.recursive_destination(&spec,rejected_targets.get(&task.pattern),None,formation) {
                             if !machine_updates.iter().any(|(p, _)| *p == at) && !session.flights.values().any(|p| *p == at) {
                                 chosen=Some((index,at,spec,0.0));
                             }
@@ -4035,7 +4037,7 @@ mod recursive {
                     for (key,amount) in ordered {
                         if let Some(fluid)=parse_fluid(&key) {
                             let old=next_fluids.get(&fluid).copied().unwrap_or(0);
-                            if old<amount || self.provider_target_fluid_insert(at,face,&fluid,amount,true)==0 {fits=false;break;}
+                            if old<amount || self.provider_target_fluid_insert(at,face,&fluid,amount,true,formation)==0 {fits=false;break;}
                             if old==amount {next_fluids.remove(&fluid);}else{next_fluids.insert(fluid.clone(),old-amount);}
                             offered.push(Entry::Fluid{key:fluid,amount});
                         } else {
@@ -4067,7 +4069,7 @@ mod recursive {
                                 if accepted<count {send.push(Entry::Item{prototype,amount:u64::from(count-accepted)});}
                             }
                             Entry::Fluid{key,amount}=>{
-                                let accepted=self.provider_target_fluid_insert(at,face,&key,amount,false);
+                                let accepted=self.provider_target_fluid_insert(at,face,&key,amount,false,formation);
                                 if accepted>amount{return Err("provider target overaccepted fluid".into());}
                                 if accepted<amount {send.push(Entry::Fluid{key,amount:amount-accepted});}
                             }
@@ -4155,6 +4157,13 @@ mod recursive {
                 let mut data=pattern_data(&template,&output);
                 if let Some((kind,recipe))=&spec.special {if let Tag::Compound(values)=&mut data {values.insert("special_kind".into(),Tag::String(kind.as_str().into()));values.insert("recipe".into(),Tag::String(recipe.as_str().into()));}}
                 if let (Some(recipe), Tag::Compound(values))=(&spec.crafting_recipe, &mut data) { values.insert("crafting_recipe".into(),Tag::String(recipe.as_str().into())); }
+                let definition=match &spec.definition {
+                    Some(encoded)=>item_data::parse_stack(encoded)?,
+                    None=>self.provider_machine(spec.provider).and_then(|provider|provider.slots.get(spec.slot).cloned().flatten()),
+                };
+                if let (Some(definition),Tag::Compound(values))=(definition,&mut data) {
+                    values.insert("definition".into(),horizon_client::save::item_to_nbt(&definition));
+                }
                 updated.config.insert("ae2_assembler_pattern".into(),data);
                 let flight_owner = AssemblerFlightOwner {
                     cpu: cpu_address,
@@ -4215,7 +4224,7 @@ mod recursive {
                             let available = remaining_fluids.get(&key).copied().unwrap_or(0);
                             let give = available.min(remaining);
                             let accepted =
-                                self.ae2_request_deliver_fluid(requester, cpu_address, &key, give)?;
+                                self.ae2_request_deliver_fluid(requester, cpu_address, &key, give, formation)?;
                             if accepted > give {
                                 return Err("requester accepted more fluid than offered".into());
                             }
@@ -4318,7 +4327,7 @@ mod recursive {
                     }
                 }
                 for (key, amount) in remaining_fluids.iter().filter(|(_, amount)| **amount > 0) {
-                    if self.ae2_grid_fluid_insert(pos, key, *amount, false).ok() != Some(*amount) {
+                    if self.ae2_grid_fluid_insert_staged(pos, key, *amount, false, formation).ok() != Some(*amount) {
                         restore(self, backup);
                         return Err("CPU fluid output storage temporarily unavailable".into());
                     }

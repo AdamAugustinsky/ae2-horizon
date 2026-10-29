@@ -750,11 +750,12 @@ impl Game<'_> {
                 let before = self.ae2_snapshot_blocks();
                 let mut updated = machine.clone();
                 let mut stock = fluid_stock.clone();
+                let mut plan = super::ae2_buses::FormationPlan::default();
                 let result = (|| -> Result<(), String> {
                     if remove > 0 {
                         let (key, n) = existing.ok_or("missing fluid stock")?;
-                        let moved =
-                            self.ae2_grid_fluid_insert_encoded(owner.host(), key, remove, false)?;
+                        let moved = self.ae2_grid_fluid_insert_staged_encoded(
+                            owner.host(), key, remove, false, &mut plan)?;
                         if moved > remove {
                             return Err("invalid fluid insertion".into());
                         }
@@ -772,7 +773,7 @@ impl Game<'_> {
                     store_fluids(&mut updated, FLUID_STOCK, &stock);
                     self.interface_store(owner, &updated)?;
                     Ok(())
-                })();
+                })().and_then(|()| self.ae2_commit_formation(plan));
                 if let Err(error) = result {
                     self.ae2_restore_blocks(before);
                     return Err(error);
@@ -1404,6 +1405,20 @@ impl Game<'_> {
         insert: bool,
         simulate: bool,
     ) -> Option<u64> {
+        if !self.ae2_has_interface_face(host, face) { return None; }
+        let before = self.ae2_snapshot_blocks();
+        let mut plan = super::ae2_buses::FormationPlan::default();
+        let result = self.ae2_interface_fluid_move_staged(host, face, key, amount, insert, simulate, &mut plan);
+        if !simulate && result.is_some() && self.ae2_commit_formation(plan).is_err() {
+            self.ae2_restore_blocks(before);
+            return Some(0);
+        }
+        result
+    }
+    pub(super) fn ae2_interface_fluid_move_staged(
+        &mut self, host: GridAddress, face: horizon_core::geometry::Direction, key: &ItemKey,
+        amount: u64, insert: bool, simulate: bool, plan: &mut super::ae2_buses::FormationPlan,
+    ) -> Option<u64> {
         let owner = self.interface_owner_at(host, face)?;
         let mut machine = self.interface_get(owner)?;
         let items = interface_config(&machine).ok()?;
@@ -1412,7 +1427,7 @@ impl Game<'_> {
         let _guard = ForwardGuard::enter(owner)?;
         if items.iter().all(Option::is_none) && config.iter().all(Option::is_none) {
             return Some(
-                self.ae2_grid_fluid_capability_encoded(host, key, amount, insert, simulate)
+                self.ae2_grid_fluid_capability_staged_encoded(host, key, amount, insert, simulate, plan)
                     .unwrap_or(0),
             );
         }

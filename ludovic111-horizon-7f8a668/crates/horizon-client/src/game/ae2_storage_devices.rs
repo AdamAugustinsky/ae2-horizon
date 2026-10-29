@@ -304,27 +304,45 @@ impl Game<'_> {
             };
             while operations > 0 {
                 let key_amount = if mode == "empty" {
-                    cell.entries().next().map(|(k, v)| (k.clone(), *v))
+                    // Source scans all available keys, including foreign-channel
+                    // Missing Content; a blocked first key must not hide a later
+                    // key that the network can accept.
+                    let primary_fluid=is_fluid(&item);
+                    let candidates=cell.entries().map(|(k,v)|(k.clone(),*v,primary_fluid,false))
+                        .chain(cell.other_entries().map(|(k,v)|(k.clone(),*v,!primary_fluid,true)))
+                        .collect::<Vec<_>>();
+                    let mut selected=None;
+                    for (key,amount,key_fluid,other) in candidates {
+                        let accepts=if key_fluid {
+                            self.ae2_grid_fluid_insert(pos,&key,amount,true)? > 0
+                        } else {
+                            let mut stack=ae2_lab::prototype(&key)?;
+                            stack.count=amount.min(u64::from(u32::MAX)) as u32;
+                            self.ae2_grid_insert_simulate(pos,&stack,u64::from(stack.count))? > 0
+                        };
+                        if accepts {selected=Some((key,amount,key_fluid,other));break;}
+                    }
+                    selected
                 } else if is_fluid(&item) {
                     self.ae2_grid_fluids(pos)?.into_iter().find(|(k, n)| {
                         *n > 0 && self.ae2_cell_insert(&mut cell, k, 1, Action::Simulate) > 0
-                    })
+                    }).map(|(key,amount)|(key,amount,true,false))
                 } else {
                     self.ae2_grid_inventory(pos)?.into_iter().find(|(k, n)| {
                         *n > 0 && self.ae2_cell_insert(&mut cell, k, 1, Action::Simulate) > 0
-                    })
+                    }).map(|(key,amount)|(key,amount,false,false))
                 };
-                let Some((key, available)) = key_amount else {
+                let Some((key, available,key_fluid,other)) = key_amount else {
                     break;
                 };
-                let factor = if is_fluid(&item) { 125 } else { 1 };
+                let factor = if key_fluid { 125 } else { 1 };
                 let max = operations.saturating_mul(factor).min(available);
                 let before = self.io_snapshot();
                 let mut formation = super::ae2_buses::FormationPlan::default();
                 let transfer = (|| -> Result<u64, String> {
                     let moved = if mode == "empty" {
-                        if is_fluid(&item) {
-                            self.ae2_grid_fluid_insert(pos, &key, max, false)?
+                        if key_fluid {
+                            self.ae2_grid_fluid_insert_staged(pos, &key, max, false, &mut formation)?
                         } else {
                             let mut stack = ae2_lab::prototype(&key)?;
                             stack.count = max.min(u32::MAX as u64) as u32;
@@ -348,7 +366,7 @@ impl Game<'_> {
                         return Ok(0);
                     }
                     let changed = if mode == "empty" {
-                        cell.extract(&key, moved, Action::Modulate)
+                        if other {cell.extract_other(&key,moved,Action::Modulate)} else {cell.extract(&key, moved, Action::Modulate)}
                     } else {
                         self.ae2_cell_insert(&mut cell, &key, moved, Action::Modulate)
                     };

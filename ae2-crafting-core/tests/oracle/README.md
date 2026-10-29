@@ -63,4 +63,12 @@ The pattern assembly runner extracts `AECraftingPattern.isItemValid` and `assemb
 AE2_REFERENCE=/path/to/ae2-reference bun ae2-crafting-core/tests/oracle/run-pattern-assembly-oracle.ts
 ```
 
-Its minimal positioned-grid and recipe stubs check individual substitutions, two independently valid alternatives whose combined grid no longer matches, the encoded recipe's original output, a shifted frame, strict substitution rejection, and dynamic special-recipe assembly. It does not model Minecraft's complete recipes, fluid containers, remainders, inventory, or world. Source methods are copied only to a temporary directory for compilation.
+Its minimal positioned-grid and recipe stubs check individual substitutions, two independently valid alternatives whose combined grid no longer matches, the encoded recipe's original output, a shifted frame, strict substitution rejection, and dynamic special-recipe assembly without first calling `recipe.matches`. It does not model Minecraft's complete recipes, fluid containers, remainders, inventory, or world. Source methods are copied only to a temporary directory for compilation.
+
+## CPU completion, cancellation and idle custody
+
+```sh
+AE2_REFERENCE=/path/to/ae2-reference bun ae2-crafting-core/tests/oracle/run-cpu-finish-oracle.ts
+```
+
+The runner verifies the pinned revision and extracts the actual `CraftingCpuLogic.finishJob`, `cancel`, `storeItems`, and `tickCraftingLogic` methods into a temporary Java program with minimal storage, cluster and job stubs. Eight checks cover completion notification and job clearing, independent partial item/fluid returns, offline versus active idle retry, cancellation, and a missing grid. These are source-method checks, not a running AE2 world, full network, persistence, or client behavior. The extracted methods are LGPL-3.0-or-later and no compiled files are written into this repository.

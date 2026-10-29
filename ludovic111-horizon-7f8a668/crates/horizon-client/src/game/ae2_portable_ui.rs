@@ -1,7 +1,7 @@
 //! Item-backed portable storage menus. The displayed slots are views; the
 //! authoritative contents and energy remain in the player's actual cell item.
 use super::{Game, Screen, ae2_fluids, ae2_interactions, ae2_lab};
-use ae2_cell_core::{Action, Cell, ItemKey};
+use ae2_cell_core::{Action, Cell, Channel, ItemKey};
 use horizon_client::{items::ItemStack, menu::Input, text::Text};
 use horizon_world::nbt::Tag;
 
@@ -34,6 +34,28 @@ fn write(s: &mut ItemStack, c: &Cell) -> Result<(), String> {
     } else {
         ae2_lab::write_cell(s, c)
     }
+}
+/// MEStorageMenu.isKeyVisible filters item-backed basic-cell views to the
+/// physical cell's key type. Foreign keys remain in the cell for other hosts.
+fn portable_cell_entries(cell:&Cell)->Vec<(ItemKey,u64,Channel)> {
+    let channel=cell.config().channel;
+    cell.entries_for(channel).map(|(key,count)|(key.clone(),*count,channel)).collect()
+}
+type PortableViewKey=(ItemKey,Channel);
+fn portable_view_keys(entries:&[(ItemKey,u64,Channel)],page:usize)->Vec<Option<PortableViewKey>> {
+    let page=page.min(entries.len().saturating_sub(1)/PAGE);
+    (0..PAGE).map(|slot|entries.get(page*PAGE+slot).map(|(key,_,channel)|(key.clone(),*channel))).collect()
+}
+fn portable_view_revision_matches(
+    revisions:&std::collections::VecDeque<(i32,Vec<Option<PortableViewKey>>)>,state:i32,
+    entries:&[(ItemKey,u64,Channel)],page:usize,slot:usize,
+)->bool {
+    let visible=portable_view_keys(entries,page);
+    revisions.iter().rev().find(|(revision,_)|*revision==state)
+        .is_some_and(|(_,shown)|shown.get(slot).zip(visible.get(slot)).is_some_and(|(old,new)|old==new))
+}
+fn portable_extract(cell:&mut Cell,key:&ItemKey,amount:u64,channel:Channel,action:Action)->u64 {
+    if cell.config().channel==channel {cell.extract(key,amount,action)} else {cell.extract_other(key,amount,action)}
 }
 /// Source BasicCellInventory permits empty ordinary cells and rejects populated ones.
 /// Unknown/invalid storage cells fail closed.
@@ -71,16 +93,16 @@ impl Game<'_> {
         *self.stack_in_mut(source) = Some(stack);
         Ok(())
     }
-    fn portable_entries(&self, source: usize) -> Result<Vec<(ItemKey, u64)>, String> {
+    fn portable_entries(&self, source: usize) -> Result<Vec<(ItemKey, u64, Channel)>, String> {
         let cell = self.ae2_read_cell(&self.portable_stack(source)?)?;
-        Ok(cell.entries().map(|(k, n)| (k.clone(), *n)).collect())
+        Ok(portable_cell_entries(&cell))
     }
     fn portable_display(
         &self,
-        source: usize,
+        _source: usize,
         page: usize,
         index: usize,
-        entries: &[(ItemKey, u64)],
+        entries: &[(ItemKey, u64, Channel)],
     ) -> Option<ItemStack> {
         if index == 45 && page > 0 {
             return Some(nav("Previous page"));
@@ -91,9 +113,9 @@ impl Game<'_> {
         if index >= PAGE {
             return None;
         }
-        let (key, n) = entries.get(page * PAGE + index)?;
-        let cell = self.stack_in(source)?;
-        let mut stack = if portable_fluid(cell) {
+        let (key, n, channel) = entries.get(page * PAGE + index)?;
+        let fluid = *channel == Channel::Fluid;
+        let mut stack = if fluid {
             ItemStack::new(
                 ae2_fluids::fluid_bucket(&key.item_id).unwrap_or("minecraft:bucket"),
                 1,
@@ -104,7 +126,7 @@ impl Game<'_> {
             stack.count = (*n).min(u64::from(max)) as u32;
             stack
         };
-        let text = if portable_fluid(cell) {
+        let text = if fluid {
             format!("{}: {} mB", key.item_id, n)
         } else {
             format!("Stored: {n}")
@@ -215,12 +237,12 @@ impl Game<'_> {
         let Some(slot) = slot else { return Ok(()) };
         let mut stack = self.portable_stack(source)?;
         let mut cell = self.ae2_read_cell(&stack)?;
-        let fluid = portable_fluid(&stack);
-        let entries: Vec<_> = cell.entries().map(|(k, n)| (k.clone(), *n)).collect();
+        let fluid = cell.config().channel == Channel::Fluid;
+        let entries = portable_cell_entries(&cell);
         *page = (*page).min(entries.len().saturating_sub(1) / PAGE);
         if (300..354).contains(&slot) {
-            if input == Input::Clone && self.creative && self.carried.is_none() && !fluid {
-                if let Some((key, _)) = entries
+            if input == Input::Clone && self.creative && self.carried.is_none() {
+                if let Some((key, _, Channel::Item)) = entries
                     .get(*page * PAGE + slot - 300)
                     .filter(|_| slot - 300 < PAGE)
                 {
@@ -247,18 +269,17 @@ impl Game<'_> {
             if index >= PAGE {
                 return Ok(());
             }
-            if fluid {
-                if input == Input::QuickMove {
-                    return Ok(());
-                }
-                return self
-                    .portable_fluid_click(source, &mut stack, &mut cell, &entries, *page, index);
+            let selected_fluid=entries.get(*page*PAGE+index).is_some_and(|(_,_,channel)|*channel==Channel::Fluid);
+            let inserting_fluid=fluid && self.carried.as_ref().is_some_and(|held|ae2_fluids::bucket_fluid(&held.item).is_some());
+            if selected_fluid || inserting_fluid {
+                if input == Input::QuickMove { return Ok(()); }
+                return self.portable_fluid_click(source, &mut stack, &mut cell, &entries, *page, index);
             }
             if input == Input::QuickMove {
                 if self.carried.is_some() {
                     return Ok(());
                 }
-                let Some((key, available)) = entries.get(*page * PAGE + index) else {
+                let Some((key, available, Channel::Item)) = entries.get(*page * PAGE + index) else {
                     return Ok(());
                 };
                 let mut item = ae2_lab::prototype(key)?;
@@ -272,7 +293,7 @@ impl Game<'_> {
                 let before = self.inventory.clone();
                 let leftover = self.give(item.clone()).map_or(0, |s| u64::from(s.count));
                 self.inventory = before.clone();
-                let moved = cell.extract(key, requested - leftover, Action::Modulate);
+                let moved = portable_extract(&mut cell,key,requested-leftover,Channel::Item,Action::Modulate);
                 if moved == 0 {
                     return Ok(());
                 }
@@ -287,6 +308,7 @@ impl Game<'_> {
                 return Ok(());
             }
             if let Some(carried) = self.carried.clone() {
+                if fluid {return Ok(());}
                 if !can_store_item(&carried) {
                     return Err("nonempty storage cells cannot be inserted".into());
                 }
@@ -313,7 +335,7 @@ impl Game<'_> {
                     ..carried
                 });
                 *self.stack_in_mut(source) = Some(stack);
-            } else if let Some((key, available)) = entries.get(*page * PAGE + index) {
+            } else if let Some((key, available, Channel::Item)) = entries.get(*page * PAGE + index) {
                 let mut item = ae2_lab::prototype(key)?;
                 let max = self.res.items().stack_max(&item);
                 let available = u64::from(max).min(*available);
@@ -323,7 +345,7 @@ impl Game<'_> {
                     available
                 };
                 let limit = self.portable_transfer_cost(&stack, requested, 1.0)?;
-                let got = cell.extract(key, limit, Action::Modulate);
+                let got = portable_extract(&mut cell,key,limit,Channel::Item,Action::Modulate);
                 if got == 0 {
                     return Ok(());
                 }
@@ -426,7 +448,7 @@ impl Game<'_> {
         source: usize,
         stack: &mut ItemStack,
         cell: &mut Cell,
-        entries: &[(ItemKey, u64)],
+        entries: &[(ItemKey, u64, Channel)],
         page: usize,
         index: usize,
     ) -> Result<(), String> {
@@ -442,9 +464,9 @@ impl Game<'_> {
             if bucket.item.as_ref() != "minecraft:bucket" {
                 return Err("use an empty bucket".into());
             }
-            let (key, amount) = entries
+            let (key, amount, Channel::Fluid) = entries
                 .get(page * PAGE + index)
-                .ok_or("fluid entry unavailable")?;
+                .ok_or("fluid entry unavailable")? else { return Err("fluid entry unavailable".into()); };
             if *amount < 1000 || !key.components.is_empty() {
                 return Err("fluid cannot fill a vanilla bucket".into());
             }
@@ -458,9 +480,9 @@ impl Game<'_> {
             return Err("portable cell lacks power".into());
         }
         let moved = if insert {
-            cell.insert(&key, 1000, Action::Simulate)
+            if cell.config().channel!=Channel::Fluid {0} else {cell.insert(&key,1000,Action::Simulate)}
         } else {
-            cell.extract(&key, 1000, Action::Simulate)
+            portable_extract(cell,&key,1000,Channel::Fluid,Action::Simulate)
         };
         if moved != 1000 {
             return Err("portable cell cannot transfer a full bucket".into());
@@ -486,7 +508,7 @@ impl Game<'_> {
         let committed = if insert {
             cell.insert(&key, 1000, Action::Modulate)
         } else {
-            cell.extract(&key, 1000, Action::Modulate)
+            portable_extract(cell,&key,1000,Channel::Fluid,Action::Modulate)
         };
         if committed != 1000 {
             self.inventory = before_inventory;
@@ -503,13 +525,13 @@ impl Game<'_> {
         Ok(())
     }
     pub(super) fn ae2_try_open_portable(&mut self) -> bool {
-        if self.remote.is_some()
-            || self.lan_acting.is_some()
-            || self.keys.contains(&super::KeyCode::ShiftLeft)
-        {
-            return false;
-        }
-        let source = self.held_slot();
+        if self.keys.contains(&super::KeyCode::ShiftLeft) { return false; }
+        self.ae2_open_local_portable_source(self.held_slot())
+    }
+    /// Inventory hotkeys keep their actual source slot, even when the cell is
+    /// not selected. The same owned item backs the local portable menu.
+    pub(super) fn ae2_open_local_portable_source(&mut self, source: usize) -> bool {
+        if self.remote.is_some() || self.lan_acting.is_some() || (source >= 36 && source != super::shield::OFFHAND_SLOT) { return false; }
         if self.portable_stack(source).is_err() {
             return false;
         }
@@ -585,6 +607,7 @@ pub(super) struct GuestPortable {
     page: usize,
     idle: u8,
     snapshot: ItemStack,
+    revisions: std::collections::VecDeque<(i32,Vec<Option<PortableViewKey>>)>,
     drag: PortableDrag,
 }
 impl Game<'_> {
@@ -653,6 +676,7 @@ impl Game<'_> {
             page: 0,
             idle: 0,
             snapshot,
+            revisions: std::collections::VecDeque::new(),
             drag: PortableDrag::default(),
         });
         self.lan_send_ae2_portable(host, conn);
@@ -675,10 +699,11 @@ impl Game<'_> {
                 let views = (0..54)
                     .map(|i| g.portable_display(source, page, i, &entries))
                     .collect::<Vec<_>>();
-                Some((stack, views))
+                let keys=portable_view_keys(&entries,page);
+                Some((stack, views, keys))
             })
             .flatten();
-        let Some((snapshot, mut items)) = rendered else {
+        let Some((snapshot, mut items, keys)) = rendered else {
             let window = host
                 .play
                 .get(&conn)
@@ -705,7 +730,11 @@ impl Game<'_> {
         };
         menu.snapshot = snapshot;
         menu.state = (menu.state + 1) & 0x7fff;
+        menu.revisions.push_back((menu.state,keys));
+        while menu.revisions.len()>64 {menu.revisions.pop_front();}
         let (window, state) = (menu.window, menu.state);
+        let repo_slots:Vec<u8>=(0..PAGE as u8).collect();
+        Self::lan_ae2_repo_slots(host,conn,window,&repo_slots);
         let items = items.iter().map(|s| host.hub.stack(s)).collect();
         let carried = host.hub.stack(&carried);
         host.hub.send_to(
@@ -724,7 +753,7 @@ impl Game<'_> {
         conn: u32,
         p: &horizon_protocol::packets::play::ContainerClick,
     ) -> bool {
-        let Some((window, state, source, page, snapshot, drag)) = host
+        let Some((window, source, page, snapshot, drag)) = host
             .play
             .get(&conn)
             .and_then(|p| p.ae2_portable.as_ref())
@@ -732,7 +761,6 @@ impl Game<'_> {
             .map(|v| {
                 (
                     v.window,
-                    v.state,
                     v.source,
                     v.page,
                     v.snapshot.clone(),
@@ -752,14 +780,19 @@ impl Game<'_> {
             self.lan_ae2_portable_closed(host, conn, None);
             return true;
         }
-        let valid = self
+        let current = self
             .as_guest(host, conn, |g| {
-                g.portable_stack(source).ok().is_some_and(|s| s == snapshot)
+                Some((g.portable_stack(source).ok()?,g.portable_entries(source).ok()?))
             })
-            .unwrap_or(false);
-        // Virtual key views need revision protection; player and control
-        // slots are fixed and can apply safely to current server state.
-        if !valid || (p.state != state && (0..45).contains(&p.slot)) {
+            .flatten();
+        // Keep the original item-owner check. A source MEInteraction carries
+        // the displayed key independently of unrelated inventory revisions,
+        // so accept an ordered virtual click only while that key is unchanged.
+        let valid=current.as_ref().is_some_and(|(stack,_)|stack==&snapshot);
+        let same_key=current.as_ref().is_some_and(|(_,entries)|
+            host.play.get(&conn).and_then(|p|p.ae2_portable.as_ref()).is_some_and(|menu|
+                portable_view_revision_matches(&menu.revisions,p.state,entries,page,p.slot as usize)));
+        if !valid || ((0..45).contains(&p.slot) && !same_key) {
             self.lan_send_ae2_portable(host, conn);
             return true;
         }
@@ -855,5 +888,36 @@ impl Game<'_> {
             self.guest_carried_back(host, gi);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod mixed_portable_tests {
+    use super::*;
+    #[test]
+    fn queued_portable_click_requires_the_same_visible_key() {
+        let water=ItemKey{item_id:"minecraft:water".into(),components:vec![]};
+        let lava=ItemKey{item_id:"minecraft:lava".into(),components:vec![]};
+        let old=vec![(water.clone(),2000,Channel::Fluid)];
+        let mut history=std::collections::VecDeque::new();history.push_back((3,portable_view_keys(&old,0)));
+        assert!(portable_view_revision_matches(&history,3,&[(water,1000,Channel::Fluid)],0,0));
+        assert!(!portable_view_revision_matches(&history,3,&[(lava,1000,Channel::Fluid)],0,0));
+        assert!(portable_view_revision_matches(&history,3,&old,0,1));
+        assert!(!portable_view_revision_matches(&history,4,&old,0,0));
+    }
+    #[test]
+    fn portable_view_filters_foreign_keys_without_losing_them() {
+        let mut stack=ItemStack::new("ae2:portable_fluid_cell_1k",1);
+        let item=Tag::compound([("#t",Tag::String("ae2:i".into())),("id",Tag::String("minecraft:diamond".into())),("#",Tag::Long(3))]);
+        let fluid=Tag::compound([("#t",Tag::String("ae2:f".into())),("id",Tag::String("minecraft:water".into())),("#",Tag::Long(1000))]);
+        stack.data_mut().set_other("ae2:storage_cell_inv",Some(Tag::List(vec![item,fluid])));
+        let mut cell=read(&stack).unwrap();let entries=portable_cell_entries(&cell);
+        assert_eq!(entries.len(),1);
+        let (key,amount,channel)=&entries[0];
+        assert_eq!((*amount,*channel),(1000,Channel::Fluid));let key=key.clone();
+        assert_eq!(portable_extract(&mut cell,&key,1000,Channel::Fluid,Action::Modulate),1000);
+        write(&mut stack,&cell).unwrap();let restored=read(&stack).unwrap();
+        assert_eq!(restored.entries_for(Channel::Item).map(|(_,amount)|*amount).sum::<u64>(),3);
+        assert_eq!(restored.entries_for(Channel::Fluid).map(|(_,amount)|*amount).sum::<u64>(),0);
     }
 }

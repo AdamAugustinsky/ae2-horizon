@@ -784,6 +784,7 @@ impl TransferHost for FluidHost<'_, '_> {
         }
         let before = self.game.ae2_snapshot_blocks();
         let key = ae2_cell_core::ItemKey::from(key);
+        let mut formation = FormationPlan::default();
         let result =
             (|| -> Result<u64, String> {
                 match direction {
@@ -797,8 +798,8 @@ impl TransferHost for FluidHost<'_, '_> {
                             .ae2_fluid_p2p_drain(address, self.face, &key, limit, true)
                         {
                             Some(n) => n,
-                            None => match self.game.ae2_interface_fluid_move(
-                                address, self.face, &key, limit, false, true,
+                            None => match self.game.ae2_interface_fluid_move_staged(
+                                address, self.face, &key, limit, false, true, &mut formation,
                             ) {
                                 Some(n) => n,
                                 None => self
@@ -808,14 +809,14 @@ impl TransferHost for FluidHost<'_, '_> {
                         };
                         let moved = self
                             .game
-                            .ae2_grid_fluid_insert(self.cable, &key, available, false)?;
+                            .ae2_grid_fluid_insert_staged(self.cable, &key, available, false, &mut formation)?;
                         let actual = match self
                             .game
                             .ae2_fluid_p2p_drain(address, self.face, &key, moved, false)
                         {
                             Some(n) => n,
-                            None => match self.game.ae2_interface_fluid_move(
-                                address, self.face, &key, moved, false, false,
+                            None => match self.game.ae2_interface_fluid_move_staged(
+                                address, self.face, &key, moved, false, false, &mut formation,
                             ) {
                                 Some(n) => n,
                                 None => self
@@ -835,11 +836,11 @@ impl TransferHost for FluidHost<'_, '_> {
                             .ok_or("invalid fluid target")?;
                         let room = match self
                             .game
-                            .ae2_fluid_p2p_fill(address, self.face, &key, limit, true)
+                            .ae2_fluid_p2p_fill_staged(address, self.face, &key, limit, true, &mut formation)
                         {
                             Some(n) => n,
-                            None => match self.game.ae2_interface_fluid_move(
-                                address, self.face, &key, limit, true, true,
+                            None => match self.game.ae2_interface_fluid_move_staged(
+                                address, self.face, &key, limit, true, true, &mut formation,
                             ) {
                                 Some(n) => n,
                                 None => match self.game.ae2_provider_return_fluid_at(
@@ -857,11 +858,11 @@ impl TransferHost for FluidHost<'_, '_> {
                             .ae2_grid_fluid_extract(self.cable, &key, room, false)?;
                         let actual = match self
                             .game
-                            .ae2_fluid_p2p_fill(address, self.face, &key, moved, false)
+                            .ae2_fluid_p2p_fill_staged(address, self.face, &key, moved, false, &mut formation)
                         {
                             Some(n) => n,
-                            None => match self.game.ae2_interface_fluid_move(
-                                address, self.face, &key, moved, true, false,
+                            None => match self.game.ae2_interface_fluid_move_staged(
+                                address, self.face, &key, moved, true, false, &mut formation,
                             ) {
                                 Some(n) => n,
                                 None => match self.game.ae2_provider_return_fluid_at(
@@ -880,7 +881,7 @@ impl TransferHost for FluidHost<'_, '_> {
                         Ok(moved)
                     }
                 }
-            })();
+            })().and_then(|moved| self.game.ae2_commit_formation(formation).map(|()| moved));
         if result.is_err() {
             self.game.ae2_restore_blocks(before);
         }
@@ -1101,6 +1102,7 @@ impl Game<'_> {
         key: &ae2_cell_core::ItemKey,
         amount: u64,
         simulate: bool,
+        plan: &mut FormationPlan,
     ) -> Result<u64, String> {
         if !self.ae2_export_craft_link_valid(owner, slot, cpu, key, true) {
             return Ok(0);
@@ -1108,10 +1110,10 @@ impl Game<'_> {
         let Some((target, face)) = self.export_craft_target(owner) else {
             return Ok(0);
         };
-        if let Some(n) = self.ae2_fluid_p2p_fill(target, face, key, amount, simulate) {
+        if let Some(n) = self.ae2_fluid_p2p_fill_staged(target, face, key, amount, simulate, plan) {
             return Ok(n);
         }
-        if let Some(n) = self.ae2_interface_fluid_move(target, face, key, amount, true, simulate) {
+        if let Some(n) = self.ae2_interface_fluid_move_staged(target, face, key, amount, true, simulate, plan) {
             return Ok(n);
         }
         if let Some(n) = self.ae2_provider_return_fluid_at(target, face, key, amount, simulate) {
@@ -2587,36 +2589,23 @@ impl Game<'_> {
         }
         priorities.into_iter().rev().collect()
     }
-    /// Stage physical entity placement, or the existing conservative simple
-    /// block-placement strategy, without changing the world during preview.
-    pub(super) fn ae2_form_simple_blocks(
-        &mut self,
-        anchor: super::ae2_global::GridAddress,
-        stack: &ItemStack,
-        limit: u64,
-        priority: i32,
-        plan: &mut FormationPlan,
-    ) -> u64 {
-        use horizon_world::level::LevelAccess;
-        if limit == 0 { return 0; }
-        let block_state = (stack.damage == 0 && stack.data().is_none())
-            .then(|| self.pack.assets.registry.default_state(&stack.item)).flatten()
-            .filter(|state| {
-                let facts = self.res.facts().get(*state);
-                facts.full_collision && !facts.block_entity && facts.item.as_ref() == stack.item.as_ref()
-            });
+    /// Shared physical Formation targets. Current native placement execution
+    /// is scoped to the active dimension; never synthesize unloaded worlds.
+    pub(super) fn ae2_formation_targets(
+        &self, anchor:super::ae2_global::GridAddress,key:&ae2_cell_core::ItemKey,fluid:bool,priority:i32,
+    )->Vec<super::ae2_formation::PlaneTarget> {
         let network = self.ae2_network();
         let Ok(analysis) = network.analyze() else {
-            return 0;
+            return Vec::new();
         };
         let Some(status) = analysis
             .nodes
             .get(&anchor.network_pos())
             .filter(|s| s.online)
         else {
-            return 0;
+            return Vec::new();
         };
-        let mut targets = std::collections::BTreeMap::new();
+        let mut targets = Vec::new();
         for node in &analysis.components[status.component].positions {
             let Some(address) = super::ae2_global::GridAddress::from_network(*node) else {
                 continue;
@@ -2649,17 +2638,16 @@ impl Game<'_> {
                     continue;
                 };
                 let slots = (18 + usize::from(config.capacity_cards) * 9).min(config.config.len());
-                let candidate = match ae2_lab::key(stack) {
-                    Ok(key) => Key::from(&key),
-                    Err(_) => continue,
-                };
+                let candidate=Key::from(key);
                 let filters: Vec<_> = config.config[..slots].iter().flatten().collect();
                 if !filters.is_empty() {
                     let mode = str_field(data, "fuzzy_mode").unwrap_or_else(|| "ignore_all".into());
                     let matched = filters.iter().any(|filter| {
                         if config.fuzzy {
-                            let max = self.res.items().get(&filter.id).map_or(0, |i| i.max_damage);
-                            fuzzy_key_match(filter, &candidate, &mode, max)
+                            if fluid { filter.id==candidate.id } else {
+                                let max = self.res.items().get(&filter.id).map_or(0, |i| i.max_damage);
+                                fuzzy_key_match(filter, &candidate, &mode, max)
+                            }
                         } else {
                             **filter == candidate
                         }
@@ -2690,132 +2678,68 @@ impl Game<'_> {
                 }
                 if let Some(t) = target(cable, &face) {
                     let entity = matches!(data.get(&"formation_entity".into()), Some(Tag::Byte(1)));
-                    targets.entry(t).or_insert((cable, entity));
+                    let Some(identity)=network.part_identities.get(&(*node,side)).copied() else {continue};
+                    let player_owner=match part.get("ae2_node_owner_uuid") {Some(Tag::IntArray(words))=>words.as_slice().try_into().ok(),_=>None};
+                    targets.push(super::ae2_formation::PlaneTarget {
+                        owner:super::ae2_formation::PlaneOwner {address,identity,face:side},
+                        host:cable,target:t,entity,player_owner,
+                    });
                 }
             }
         }
-        let mut placed = 0u64;
-        for (target, (host, entity)) in targets {
-            if placed >= limit {
-                break;
-            }
-            if !self.world.loaded(target.0, target.2) || plan.block_at(self.dim, target) {
-                continue;
-            }
-            let old = self.world.block(target.0, target.1, target.2);
-            if entity {
-                if !self.res.facts().get(old).replaceable { continue; }
-                let area = ae2_formation::area(target);
-                let Ok(actual) = self.ae2_count_entities_in_box(area) else { continue };
-                let accepted = ae2_formation::accepted(
-                    actual.saturating_add(plan.entities_in(self.dim, area)),
+        targets
+    }
+    /// Source SIMULATE is optimistic. MODULATE stages actual native item use
+    /// against all prior placements, preserving components and secondary writes.
+    pub(super) fn ae2_form_simple_blocks(
+        &mut self,anchor:super::ae2_global::GridAddress,stack:&ItemStack,
+        limit:u64,priority:i32,simulate:bool,plan:&mut FormationPlan,
+    )->u64 {
+        if limit==0 {return 0;}
+        let Ok(key)=ae2_lab::key(stack) else {return 0};
+        let mut placed=0;
+        for target in self.ae2_formation_targets(anchor,&key,false,priority) {
+            if placed>=limit {break;}
+            let pos=target.target;
+            if !self.world.loaded(pos.0,pos.2) {continue;}
+            let old=self.world.block(pos.0,pos.1,pos.2);
+            if simulate && (self.ae2_item_cached_blocked(target.owner) || !self.res.facts().get(old).replaceable) {self.ae2_item_update_blocked(target.owner,pos);continue;}
+            if target.entity {
+                let Ok(Some((old,actual)))=self.ae2_preview_formation_entity(plan,&target) else {continue};
+                let area=ae2_formation::area(pos);
+                let accepted=ae2_formation::accepted(actual.saturating_add(plan.entities_in(self.dim,area)),
                     horizon_client::ae2_common_config::formation_entity_limit(),
-                    (limit - placed).min(u64::from(stack.count)),
-                    ae2_formation::max_stack(stack, self.res.items().get(&stack.item).map_or(64, |i| i.max_stack)),
-                );
-                if accepted == 0 { continue; }
-                let direction = [target.0-host.0, target.1-host.1, target.2-host.2];
-                // AE2 uses its own offset RNG; cloning avoids changing the
-                // world RNG during simulation or a transaction that rolls back.
-                let mut rng = self.world.random.clone();
-                for _ in 0..plan.len().saturating_mul(3) { rng.next_float(); }
-                let position = ae2_formation::spawn_position(host, direction,
-                    [rng.next_float(), rng.next_float(), rng.next_float()]);
-                let mut spawned = stack.clone();
-                spawned.count = accepted;
-                plan.actions.push(FormationAction::Entity {
-                    dim:self.dim, target, old, position, direction, stack:spawned,
-                });
-                placed += u64::from(accepted);
-                continue;
+                    (limit-placed).min(u64::from(stack.count)),
+                    ae2_formation::max_stack(stack,self.res.items().get(&stack.item).map_or(64,|i|i.max_stack)));
+                if accepted==0 {continue;}
+                let direction=[pos.0-target.host.0,pos.1-target.host.1,pos.2-target.host.2];
+                let mut rng=self.world.random.clone();
+                for _ in 0..plan.len().saturating_mul(3) {rng.next_float();}
+                let position=ae2_formation::spawn_position(target.host,direction,[rng.next_float(),rng.next_float(),rng.next_float()]);
+                let mut spawned=stack.clone();spawned.count=accepted;
+                plan.actions.push(FormationAction::Entity {dim:self.dim,target:pos,old,position,direction,stack:spawned,plane:target.owner});
+                placed+=u64::from(accepted);
+            } else if simulate {
+                // AE2 checks replaceability here, without calling Item.useOn.
+                plan.actions.push(FormationAction::Reservation {dim:self.dim,pos});
+                placed+=1;
+            } else {
+                let mut physical=stack.clone();physical.count=1;
+                match self.ae2_preview_formation_block(plan,&target,&physical) {
+                    Ok(Some(old))=>{
+                        plan.actions.push(FormationAction::Place {dim:self.dim,pos,old,stack:physical,plane:target.owner,player_owner:target.player_owner});
+                        placed+=1;
+                    },
+                    Ok(None)=>{},
+                    Err(error)=>{log::debug!("AE2 Formation item preview rejected: {error}");},
+                }
+                self.ae2_item_update_blocked(target.owner,pos);
             }
-            let Some(block_state) = block_state else { continue };
-            if !matches!(
-                self.res.facts().get(old).name.as_ref(),
-                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-            ) {
-                continue;
-            }
-            let at = horizon_core::position::BlockPos::new(target.0, target.1, target.2);
-            if !self.with_level(|_, level, _| level.is_unobstructed(at, block_state)) {
-                continue;
-            }
-            plan.actions.push(FormationAction::Block {dim:self.dim, pos:target, old, new:block_state});
-            placed += 1;
         }
         placed
     }
-    /// Validate all reservations, then write raw states as a batch. Neighbor
-    /// notifications run only after every write succeeded; no plan mutates the
-    /// world during preview or while other inventory steps may still fail.
-    pub(super) fn ae2_commit_formation(&mut self, plan: FormationPlan) -> Result<(), String> {
-        use horizon_world::level::LevelAccess;
-        if plan.actions.is_empty() {
-            return Ok(());
-        }
-        for (i, action) in plan.actions.iter().enumerate() {
-            let (dim,pos,old) = match action {
-                FormationAction::Block {dim,pos,old,..} => (*dim,*pos,*old),
-                FormationAction::Entity {dim,target,old,..} => (*dim,*target,*old),
-                FormationAction::ContainerChanged { address, incarnation } => {
-                    let (dimension, local)=self.ae2_address_parts(*address).ok_or("invalid changed container address")?;
-                    if self.ae2_world_for(dimension).and_then(|world|world.block_entities.incarnation(&local)) != Some(*incarnation) {
-                        return Err("changed container owner replaced before commit".into());
-                    }
-                    continue;
-                },
-            };
-            if dim != self.dim || !self.world.loaded(pos.0,pos.2) || self.world.block(pos.0,pos.1,pos.2) != old {
-                return Err("formation target changed".into());
-            }
-            match action {
-                FormationAction::Block {new,..} => {
-                    let at = horizon_core::position::BlockPos::new(pos.0,pos.1,pos.2);
-                    if !self.with_level(|_,level,_| level.is_unobstructed(at,*new)) {
-                        return Err("formation target obstructed".into());
-                    }
-                }
-                FormationAction::Entity {..} => {
-                    if !self.res.facts().get(old).replaceable { return Err("formation target no longer replaceable".into()); }
-                    let area = ae2_formation::area(pos);
-                    let actual = self.ae2_count_entities_in_box(area)?;
-                    let reserved = plan.actions[..i].iter().filter(|a| match a {
-                        FormationAction::Entity {dim,position,..} if *dim == self.dim =>
-                            ae2_formation::entity_intersects(*position, area),
-                        _ => false,
-                    }).count();
-                    if ae2_formation::accepted(actual.saturating_add(reserved),
-                        horizon_client::ae2_common_config::formation_entity_limit(), 1, 1) == 0 {
-                        return Err("formation entity limit reached".into());
-                    }
-                }
-                FormationAction::ContainerChanged { .. } => unreachable!(),
-            }
-        }
-        let mut applied: Vec<((i32, i32, i32), horizon_world::registry::BlockStateId)> = Vec::new();
-        for action in &plan.actions {
-            let FormationAction::Block {pos,old,new,..} = action else { continue };
-            if self.world.set(pos.0, pos.1, pos.2, *new).is_err() {
-                for (p, previous) in applied.into_iter().rev() {
-                    let _ = self.world.set(p.0, p.1, p.2, previous);
-                }
-                return Err("formation write failed".into());
-            }
-            applied.push((*pos, *old));
-        }
-        for action in plan.actions {
-            match action {
-                FormationAction::Block {pos,new,..} => {
-                    let at = horizon_core::position::BlockPos::new(pos.0,pos.1,pos.2);
-                    self.with_level(|b,level,ticks| b.update_neighbors_at(level,ticks,at,b.block(new)));
-                }
-                FormationAction::Entity {position,direction,stack,..} => {
-                    self.spawn_item(stack,position,direction.map(|v| f64::from(v)*0.1),0);
-                }
-                FormationAction::ContainerChanged {address,..} => self.ae2_native_notify(&[address]),
-            }
-        }
-        let _ = self.process_level_events();
-        Ok(())
+    pub(super) fn ae2_commit_formation(&mut self,plan:FormationPlan)->Result<(),String> {
+        self.ae2_execute_formation_plan(plan)
     }
+
 }

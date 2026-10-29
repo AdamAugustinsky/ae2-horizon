@@ -208,7 +208,17 @@ mod tests {
         enclosing.insert(&key(&outer_stack).unwrap(), 1, Action::Modulate);
         let mut bad = ItemStack::new(CELL_ITEM, 1);
         write_cell(&mut bad, &enclosing).unwrap();
-        assert!(read_cell(&bad).is_err());
+        // BasicCellInventory.innerInsert rejects a nonempty nested cell, but
+        // loadCellItems retains one already present in source data. The
+        // legacy-only decoder still rejects the same invalid physical entry.
+        assert!(!horizon_client::ae2_cell_codec::can_store_item(&outer_stack));
+        let loaded=read_cell(&bad).unwrap();assert_eq!(loaded.total_items(),1);
+        let nested=prototype(loaded.entries().next().unwrap().0).unwrap();
+        assert!(nested.same_item_same_components(&outer_stack));
+        assert!(!nested_cell_empty(&nested));
+        let mut legacy=bad;
+        legacy.data_mut().set_other("ae2:storage_cell_inv",None);
+        assert!(read_cell(&legacy).is_err());
     }
     #[test]
     fn corrupt_or_overcapacity_cell_is_rejected_instead_of_creating_items() {

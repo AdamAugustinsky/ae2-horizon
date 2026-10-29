@@ -71,7 +71,7 @@ pub fn nested_cell_empty(stack: &ItemStack) -> bool {
     if stack.item.starts_with("ae2:fluid_storage_cell_")
         || stack.item.starts_with("ae2:portable_fluid_cell_")
     {
-        return read_fluid_cell(stack).is_ok_and(|cell| cell.entries().next().is_none());
+        return read_fluid_cell(stack).is_ok_and(|cell| cell.total_items()==0);
     }
     let Some(mut config) = cell_config(&stack.item) else {
         return false;
@@ -104,8 +104,8 @@ pub fn read_cell_checked(stack: &ItemStack, known: &dyn Fn(&str, bool) -> bool) 
     }
     let mut config = cell_config(&stack.item).ok_or("unsupported cell tier")?;
     apply_cell_settings_checked(stack, &mut config, known)?;
-    if let Some(entries)=source_cell_entries(stack,false,known)? {
-        return Cell::from_entries(config,entries).map_err(|e|format!("invalid source cell capacity: {e:?}"));
+    if let Some((entries,other))=source_cell_entries(stack,false,known)? {
+        return Cell::from_source_entries_with_other(config,entries,other).map_err(|e|format!("invalid source cell contents: {e:?}"));
     }
     let Some(tag) = stack
         .data()
@@ -242,8 +242,8 @@ pub fn read_fluid_cell_checked(stack: &ItemStack, known: &dyn Fn(&str, bool) -> 
     let mut config =
         fluid_config(&stack.item).ok_or("offhand is not a supported fluid storage cell")?;
     apply_cell_settings_checked(stack, &mut config, known)?;
-    if let Some(entries)=source_cell_entries(stack,true,known)? {
-        return Cell::from_entries(config,entries).map_err(|e|format!("invalid source fluid cell capacity: {e:?}"));
+    if let Some((entries,other))=source_cell_entries(stack,true,known)? {
+        return Cell::from_source_entries_with_other(config,entries,other).map_err(|e|format!("invalid source fluid cell contents: {e:?}"));
     }
     let custom = match stack.data().and_then(|d| d.other(COMPONENT)) {
         None => return Ok(Cell::new(config)),
@@ -335,25 +335,24 @@ pub fn write_fluid_cell(stack: &mut ItemStack, cell: &Cell) -> Result<(), String
     Ok(())
 }
 
-fn source_cell_entries(stack:&ItemStack,fluid:bool,known:&dyn Fn(&str,bool)->bool)->Result<Option<Vec<(ItemKey,u64)>>,String> {
+fn source_cell_entries(stack:&ItemStack,fluid:bool,known:&dyn Fn(&str,bool)->bool)->Result<Option<(Vec<(ItemKey,u64)>,Vec<(ItemKey,u64)>)>,String> {
     let Some(source)=stack.data().and_then(|data|data.other("ae2:storage_cell_inv")) else{return Ok(None);};
     let Tag::List(entries)=source else{return Err("invalid source cell inventory".into());};
-    if entries.len()>Cell::MAX_TYPES{return Err("source cell exceeds its type limit".into());}
-    let mut result=Vec::with_capacity(entries.len());let mut seen=BTreeSet::new();
+    let mut result=Vec::with_capacity(entries.len());let mut other=Vec::new();let mut seen=BTreeSet::new();
     for entry in entries {
         let value=crate::ae2_generic_stack::decode_tolerant_checked(entry,known)?.ok_or("empty source cell entry")?;
-        // A damaged or foreign-channel source payload must remain on the item
-        // rather than being converted into an empty physical cell.
-        if value.fluid!=fluid{return Err("source cell contains another key type".into());}
         let amount=u64::try_from(value.amount).ok().filter(|n|*n>0).ok_or("invalid source cell amount")?;
-        if !seen.insert(value.key.clone()){return Err("duplicate source cell key".into());}
-        if !fluid && !can_store_item(&prototype(&value.key)?){return Err("invalid source nested cell".into());}
-        result.push((value.key,amount));
+        if !seen.insert((value.fluid,value.key.clone())){return Err("duplicate source cell key".into());}
+        // The source applies cell blacklists only to insertions, not while
+        // loading already-persisted keys for display and extraction.
+        if value.fluid==fluid {result.push((value.key,amount));} else {other.push((value.key,amount));}
     }
-    Ok(Some(result))
+    Ok(Some((result,other)))
 }
 fn encode_source_cell(cell:&Cell,fluid:bool)->Result<Vec<Tag>,String> {
-    let entries=cell.entries().map(|(key,amount)|{
+    let entries=cell.entries().map(|(key,amount)|(key,amount,fluid))
+        .chain(cell.other_entries().map(|(key,amount)|(key,amount,!fluid)))
+        .map(|(key,amount,fluid)|{
         let amount=i64::try_from(*amount).map_err(|_|"source cell amount overflow")?;
         crate::ae2_generic_stack::encode(&crate::ae2_generic_stack::GenericStack{key:key.clone(),fluid,amount})
     }).collect::<Result<Vec<_>,String>>()?;
@@ -708,6 +707,50 @@ pub fn can_store_item(stack: &ItemStack) -> bool {
 mod tests {
     use super::*;
     use ae2_cell_core::Action;
+    #[test]
+    fn overfilled_source_cell_is_not_hidden_and_can_be_extracted() {
+        let source=Tag::compound([("#t",Tag::String("ae2:i".into())),("id",Tag::String("minecraft:stone".into())),("#",Tag::Long(9000))]);
+        let mut stack=ItemStack::new("ae2:item_storage_cell_1k",1);
+        stack.data_mut().set_other("ae2:storage_cell_inv",Some(Tag::List(vec![source])));
+        let mut cell=read_cell(&stack).unwrap();let key=key(&ItemStack::new("minecraft:stone",1)).unwrap();
+        assert_eq!(cell.count(&key),9000);assert_eq!(cell.remaining_items(),0);
+        assert_eq!(cell.extract(&key,4,Action::Modulate),4);write_cell(&mut stack,&cell).unwrap();
+        assert_eq!(read_cell(&save::item_from_nbt(&save::item_to_nbt(&stack)).unwrap()).unwrap().count(&key),8996);
+    }
+    #[test]
+    fn source_fluid_cell_preserves_and_extracts_foreign_missing_content() {
+        let water=Tag::compound([("#t",Tag::String("ae2:f".into())),("id",Tag::String("minecraft:water".into())),("#",Tag::Long(1000))]);
+        let missing=Tag::compound([("#t",Tag::String("ae2:i".into())),("id",Tag::String("removed:ore".into())),("#",Tag::Long(12))]);
+        let mut stack=ItemStack::new("ae2:fluid_storage_cell_1k",1);
+        stack.data_mut().set_other("ae2:storage_cell_inv",Some(Tag::List(vec![water.clone(),missing])));
+        let known=|id:&str, fluid:bool| fluid || id!="removed:ore";
+        let mut cell=read_fluid_cell_checked(&stack,&known).unwrap();
+        let water_key=fluid_key("minecraft:water");assert_eq!(cell.count(&water_key),1000);
+        let (key,amount)=cell.other_entries().next().unwrap();let key=key.clone();
+        assert_eq!((key.item_id.as_str(),*amount),("ae2:missing_content",12));
+        assert_eq!(cell.extract_other(&key,5,Action::Simulate),5);assert_eq!(cell.other_count(&key),12);
+        assert_eq!(cell.extract_other(&key,5,Action::Modulate),5);write_fluid_cell(&mut stack,&cell).unwrap();
+        let restored=save::item_from_nbt(&save::item_to_nbt(&stack)).unwrap();
+        let cell=read_fluid_cell_checked(&restored,&known).unwrap();
+        assert_eq!(cell.count(&water_key),1000);
+        let (remaining_key,remaining)=cell.other_entries().next().unwrap();
+        assert_eq!((remaining_key.item_id.as_str(),*remaining),("ae2:missing_content",7));
+        let Tag::List(encoded)=restored.data().unwrap().other("ae2:storage_cell_inv").unwrap() else{panic!()};
+        assert!(encoded.contains(&water));assert!(encoded.iter().any(|entry|entry.get("id")==Some(&Tag::String("removed:ore".into())) && entry.get("#")==Some(&Tag::Long(7))));
+    }
+    #[test]
+    fn source_item_cell_preserves_a_foreign_fluid_key() {
+        let stone=Tag::compound([("#t",Tag::String("ae2:i".into())),("id",Tag::String("minecraft:stone".into())),("#",Tag::Long(10))]);
+        let water=Tag::compound([("#t",Tag::String("ae2:f".into())),("id",Tag::String("minecraft:water".into())),("#",Tag::Long(1000))]);
+        let mut stack=ItemStack::new("ae2:item_storage_cell_1k",1);
+        stack.data_mut().set_other("ae2:storage_cell_inv",Some(Tag::List(vec![stone,water])));
+        let mut cell=read_cell(&stack).unwrap();let water_key=fluid_key("minecraft:water");
+        let stone_key=key(&ItemStack::new("minecraft:stone",1)).unwrap();
+        assert_eq!(cell.count(&stone_key),10);assert_eq!(cell.other_count(&water_key),1000);
+        assert_eq!(cell.extract_other(&water_key,250,Action::Modulate),250);write_cell(&mut stack,&cell).unwrap();
+        let cell=read_cell(&save::item_from_nbt(&save::item_to_nbt(&stack)).unwrap()).unwrap();
+        assert_eq!(cell.count(&stone_key),10);assert_eq!(cell.other_count(&water_key),750);
+    }
     #[test]
     fn unknown_source_item_becomes_lossless_missing_content_at_registry_boundary() {
         let original=Tag::compound([("#t",Tag::String("ae2:i".into())),("id",Tag::String("removed:ore".into())),("#",Tag::Long(12))]);

@@ -5,6 +5,7 @@ use ae2_cell_core::ItemKey;
 use horizon_client::containers::BlockEntity;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use super::ae2_buses::FormationPlan;
 type Pos = (i32, i32, i32);
 type TankChange=(super::ae2_global::GridAddress,horizon_client::ae2_world::Machine,ae2_network_core::NodeIdentity);
 const BUCKET_MB: u64 = 1000;
@@ -33,11 +34,8 @@ impl Game<'_> {
                         }
                     }
                 }
-                if !item.item.starts_with("ae2:fluid_storage_cell_") {
-                    continue;
-                }
-                let cell = self.ae2_read_fluid_cell(item)?;
-                for (key, amount) in cell.entries() {
+                let Ok(cell) = self.ae2_read_cell(item) else { continue; };
+                for (key, amount) in cell.entries_for(ae2_cell_core::Channel::Fluid) {
                     let total = totals.entry(key.clone()).or_default();
                     *total = total.checked_add(*amount).ok_or("fluid amount overflow")?;
                 }
@@ -87,6 +85,16 @@ impl Game<'_> {
     ) -> Result<u64, String> {
         self.ae2_grid_fluid_move(pos, key, amount, simulate, true, false)
     }
+    pub(super) fn ae2_grid_fluid_insert_staged(
+        &mut self, pos: Pos, key: &ItemKey, amount: u64, simulate: bool, plan: &mut FormationPlan,
+    ) -> Result<u64, String> {
+        self.ae2_grid_fluid_insert_staged_encoded(self.ae2_local_address(pos).ok_or("invalid AE2 anchor")?, key, amount, simulate, plan)
+    }
+    pub(super) fn ae2_grid_fluid_insert_staged_encoded(
+        &mut self, pos: super::ae2_global::GridAddress, key: &ItemKey, amount: u64, simulate: bool, plan: &mut FormationPlan,
+    ) -> Result<u64, String> {
+        self.ae2_grid_fluid_move_staged(pos, key, amount, simulate, true, false, true, plan)
+    }
     pub(super) fn ae2_grid_fluid_extract(
         &mut self,
         pos: Pos,
@@ -119,19 +127,16 @@ impl Game<'_> {
         insert: bool,
         require_full: bool,
     ) -> Result<u64, String> {
-        // Crafting output reception is mutating; snapshot the actual loaded
-        // block entities and dirty set so simulation and all errors restore it.
         let before = self.ae2_snapshot_blocks();
-        let result =
-            self.ae2_grid_fluid_move_inner(pos, key, amount, simulate, insert, require_full, true);
-        if simulate || result.is_err() {
+        let mut plan = FormationPlan::default();
+        let result = self.ae2_grid_fluid_move_staged(pos, key, amount, simulate, insert, require_full, true, &mut plan);
+        let result = if simulate { result } else { result.and_then(|n| self.ae2_commit_formation(plan).map(|()| n)) };
+        if result.is_err() {
             self.ae2_restore_blocks(before);
         }
         result
     }
     /// Machine-owned MEStorage fluid insertion, without StorageHelper power.
-    /// No fluid formation plan exists yet; caller snapshots the physical source
-    /// and all loaded block entities for its own multi-step transaction.
     pub(super) fn ae2_grid_fluid_insert_uncharged_encoded(
         &mut self,
         pos: super::ae2_global::GridAddress,
@@ -139,11 +144,18 @@ impl Game<'_> {
         amount: u64,
     ) -> Result<u64, String> {
         let before = self.ae2_snapshot_blocks();
-        let result = self.ae2_grid_fluid_move_inner(pos, key, amount, false, true, false, false);
+        let mut plan=FormationPlan::default();
+        let result = self.ae2_grid_fluid_insert_uncharged_staged_encoded(pos,key,amount,&mut plan)
+            .and_then(|n| self.ae2_commit_formation(plan).map(|()| n));
         if result.is_err() {
             self.ae2_restore_blocks(before);
         }
         result
+    }
+    pub(super) fn ae2_grid_fluid_insert_uncharged_staged_encoded(
+        &mut self, pos: super::ae2_global::GridAddress, key: &ItemKey, amount: u64, plan: &mut FormationPlan,
+    ) -> Result<u64, String> {
+        self.ae2_grid_fluid_move_staged(pos,key,amount,false,true,false,false,plan)
     }
     pub(super) fn ae2_grid_fluid_capability_encoded(
         &mut self,
@@ -154,10 +166,32 @@ impl Game<'_> {
         simulate: bool,
     ) -> Result<u64, String> {
         let before = self.ae2_snapshot_blocks();
-        let result =
-            self.ae2_grid_fluid_move_inner(pos, key, amount, simulate, insert, false, false);
+        let mut plan=FormationPlan::default();
+        let result = self.ae2_grid_fluid_capability_staged_encoded(pos,key,amount,insert,simulate,&mut plan);
+        let result = if simulate {result} else {result.and_then(|n| self.ae2_commit_formation(plan).map(|()| n))};
+        if result.is_err() {
+            self.ae2_restore_blocks(before);
+        }
+        result
+    }
+    pub(super) fn ae2_grid_fluid_capability_staged_encoded(
+        &mut self, pos: super::ae2_global::GridAddress, key: &ItemKey, amount: u64,
+        insert: bool, simulate: bool, plan: &mut FormationPlan,
+    ) -> Result<u64, String> {
+        self.ae2_grid_fluid_move_staged(pos,key,amount,simulate,insert,false,false,plan)
+    }
+    fn ae2_grid_fluid_move_staged(
+        &mut self, pos: super::ae2_global::GridAddress, key: &ItemKey, amount: u64,
+        simulate: bool, insert: bool, require_full: bool, charge_power: bool, plan: &mut FormationPlan,
+    ) -> Result<u64, String> {
+        // Crafting reception and delegated storages may mutate before the
+        // operation completes. Restore them and the plan on simulation/error.
+        let before=self.ae2_snapshot_blocks();
+        let savepoint=plan.len();
+        let result=self.ae2_grid_fluid_move_inner(pos,key,amount,simulate,insert,require_full,charge_power,plan);
         if simulate || result.is_err() {
             self.ae2_restore_blocks(before);
+            plan.truncate(savepoint);
         }
         result
     }
@@ -170,6 +204,7 @@ impl Game<'_> {
         insert: bool,
         require_full: bool,
         charge_power: bool,
+        plan: &mut FormationPlan,
     ) -> Result<u64, String> {
         let cells = self.ae2_cell_mounts_encoded(pos)?;
         let mut left = if charge_power {
@@ -189,13 +224,14 @@ impl Game<'_> {
         let mut changes=Vec::new();let mut tank_changes:Vec<TankChange>=Vec::new();
         let mounts=self.ae2_fluid_storage_mounts_encoded(pos);
         let mut priorities=std::collections::BTreeSet::new();priorities.extend(mounts.iter().map(|mount|mount.priority));priorities.extend(cells.iter().map(|mount|mount.priority));
+        if insert { priorities.extend(self.ae2_formation_priorities(pos)); }
         let priorities:Vec<_>=if insert{priorities.into_iter().rev().collect()}else{priorities.into_iter().collect()};
         for priority in priorities{
             let mut late_buses=Vec::new();let mut late_cells=Vec::new();
             for mount in mounts.iter().filter(|mount|mount.priority==priority){
                 if left==0{break}
-                if insert&&!self.ae2_fluid_bus_preferred(mount,key)?{late_buses.push(mount);continue}
-                let (accepted,change)=self.ae2_fluid_mount_change(mount,key,left,insert,simulate)?;left-=accepted;
+                if insert&&!self.ae2_fluid_bus_preferred(mount,key,plan)?{late_buses.push(mount);continue}
+                let (accepted,change)=self.ae2_fluid_mount_change(mount,key,left,insert,simulate,plan)?;left-=accepted;
                 if let Some(change)=change{tank_changes.push(change);}
             }
             for mount in cells.iter().filter(|mount|mount.priority==priority){
@@ -206,7 +242,7 @@ impl Game<'_> {
             }
             for mount in late_buses{
                 if left==0{break}
-                let (accepted,change)=self.ae2_fluid_mount_change(mount,key,left,insert,simulate)?;left-=accepted;
+                let (accepted,change)=self.ae2_fluid_mount_change(mount,key,left,insert,simulate,plan)?;left-=accepted;
                 if let Some(change)=change{tank_changes.push(change);}
             }
             for mount in late_cells{
@@ -214,6 +250,7 @@ impl Game<'_> {
                 let (accepted,updated)=self.ae2_cell_storage_change(mount,key,left,true,insert,simulate)?;left-=accepted;
                 if let Some(updated)=updated{changes.push((mount.address,mount.slot,updated));}
             }
+            if insert && left>0 { left-=self.ae2_form_fluids(pos,key,left,priority,plan)?; }
             if left==0{break}
         }
         let moved = wanted - left;
@@ -259,15 +296,15 @@ impl Game<'_> {
         }
         Ok(moved)
     }
-    fn ae2_fluid_bus_preferred(&mut self,mount:&super::ae2_buses::StorageMount,key:&ItemKey)->Result<bool,String>{
+    fn ae2_fluid_bus_preferred(&mut self,mount:&super::ae2_buses::StorageMount,key:&ItemKey,plan:&mut FormationPlan)->Result<bool,String>{
         let mut delegate=mount.clone();delegate.access=ae2_machines_core::Access::ReadWrite;
         if !mount.inverted&&!mount.filter.is_empty()&&delegate.allows(&ae2_machines_core::Key::from(key),false){return Ok(true)}
         delegate.filter_on_extract=false;
-        Ok(self.ae2_fluid_mount_change(&delegate,key,1,false,true)?.0>0)
+        Ok(self.ae2_fluid_mount_change(&delegate,key,1,false,true,plan)?.0>0)
     }
     /// Keep the existing interface and tank transaction rules behind one
     /// storage operation while priority/preferred passes choose its order.
-    fn ae2_fluid_mount_change(&mut self,mount:&super::ae2_buses::StorageMount,key:&ItemKey,amount:u64,insert:bool,simulate:bool)->Result<(u64,Option<TankChange>),String>{
+    fn ae2_fluid_mount_change(&mut self,mount:&super::ae2_buses::StorageMount,key:&ItemKey,amount:u64,insert:bool,simulate:bool,plan:&mut FormationPlan)->Result<(u64,Option<TankChange>),String>{
         if matches!(self.ae2_block_entity(mount.target),Some(BlockEntity::Ae2(machine)) if machine.kind==horizon_client::ae2_world::MachineKind::Condenser) {
             if !mount.allows(&ae2_machines_core::Key::from(key),!insert){return Ok((0,None))}
             let moved=if insert {self.ae2_condenser_me_fluid_insert_at(mount.target,amount,simulate)}else{0};
@@ -275,7 +312,7 @@ impl Game<'_> {
             Ok((if insert&&mount.void_overflow{amount}else{moved},None))
         }else if self.ae2_has_interface_face(mount.target,mount.face){
             if !mount.allows(&ae2_machines_core::Key::from(key),!insert)||!self.ae2_interface_mount_allowed(mount.target,mount.face,insert){return Ok((0,None))}
-            let moved=self.ae2_interface_fluid_move(mount.target,mount.face,key,amount,insert,simulate).unwrap_or(0);
+            let moved=self.ae2_interface_fluid_move_staged(mount.target,mount.face,key,amount,insert,simulate,plan).unwrap_or(0);
             Ok((if insert&&mount.void_overflow{amount}else{moved},None))
         }else{self.stage_fluid_mount(mount,key,amount,insert)}
     }

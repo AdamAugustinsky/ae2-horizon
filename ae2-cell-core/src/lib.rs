@@ -222,6 +222,9 @@ pub enum RestoreError {
 pub struct Cell {
     config: CellConfig,
     items: BTreeMap<ItemKey, u64>,
+    /// Stored keys outside the cell's insertion channel remain distinct even
+    /// if their host key bytes happen to equal a key in the primary channel.
+    other_items: BTreeMap<ItemKey, u64>,
     total_items: u64,
 }
 impl Cell {
@@ -237,6 +240,7 @@ impl Cell {
         Self {
             config,
             items: BTreeMap::new(),
+            other_items: BTreeMap::new(),
             total_items: 0,
         }
     }
@@ -246,28 +250,57 @@ impl Cell {
         config: CellConfig,
         entries: impl IntoIterator<Item = (ItemKey, u64)>,
     ) -> Result<Self, RestoreError> {
+        Self::from_entries_with_other(config, entries, std::iter::empty())
+    }
+    /// Restore both source key channels in one physical cell. The other
+    /// channel can be extracted but cannot be inserted by this cell type.
+    pub fn from_entries_with_other(
+        config: CellConfig,
+        entries: impl IntoIterator<Item = (ItemKey, u64)>,
+        other_entries: impl IntoIterator<Item = (ItemKey, u64)>,
+    ) -> Result<Self, RestoreError> {
+        Self::restore_entries(config, entries, other_entries, true)
+    }
+    /// Source BasicCellInventory loads existing entries even if they exceed
+    /// the cell's present type/byte limits. Extraction must remain possible.
+    pub fn from_source_entries_with_other(
+        config: CellConfig,
+        entries: impl IntoIterator<Item = (ItemKey, u64)>,
+        other_entries: impl IntoIterator<Item = (ItemKey, u64)>,
+    ) -> Result<Self, RestoreError> {
+        Self::restore_entries(config, entries, other_entries, false)
+    }
+    fn restore_entries(
+        config: CellConfig,
+        entries: impl IntoIterator<Item = (ItemKey, u64)>,
+        other_entries: impl IntoIterator<Item = (ItemKey, u64)>,
+        strict: bool,
+    ) -> Result<Self, RestoreError> {
         let mut cell = Self::new(config);
-        for (key, amount) in entries {
+        let tagged = entries.into_iter().map(|(key,amount)|(false,key,amount))
+            .chain(other_entries.into_iter().map(|(key,amount)|(true,key,amount)));
+        for (other, key, amount) in tagged {
             if amount == 0 {
                 return Err(RestoreError::ZeroAmount);
             }
-            if cell.items.contains_key(&key) {
+            let items = if other { &mut cell.other_items } else { &mut cell.items };
+            if items.contains_key(&key) {
                 return Err(RestoreError::DuplicateKey);
             }
             cell.total_items = cell
                 .total_items
                 .checked_add(amount)
                 .ok_or(RestoreError::Overflow)?;
-            cell.items.insert(key, amount);
-            if cell.items.len() > cell.config.max_types() {
+            items.insert(key, amount);
+            if strict && cell.stored_types() > cell.config.max_types() {
                 return Err(RestoreError::TooManyTypes);
             }
         }
         // Avoid overflow in ceil division for arbitrary corrupted input.
         let a = cell.config.amount_per_byte();
         let payload = cell.total_items / a + u64::from(cell.total_items % a != 0);
-        let overhead = cell.items.len() as u64 * cell.config.bytes_per_type();
-        if payload > cell.config.total_bytes().saturating_sub(overhead) {
+        let overhead = cell.stored_types() as u64 * cell.config.bytes_per_type();
+        if strict && payload > cell.config.total_bytes().saturating_sub(overhead) {
             return Err(RestoreError::OverCapacity);
         }
         Ok(cell)
@@ -281,11 +314,23 @@ impl Cell {
     pub fn count(&self, key: &ItemKey) -> u64 {
         self.items.get(key).copied().unwrap_or(0)
     }
+    pub fn other_entries(&self) -> impl Iterator<Item = (&ItemKey, &u64)> {
+        self.other_items.iter()
+    }
+    pub fn entries_for(&self, channel: Channel) -> impl Iterator<Item = (&ItemKey, &u64)> {
+        if self.config.channel==channel {self.items.iter()} else {self.other_items.iter()}
+    }
+    pub fn other_count(&self, key: &ItemKey) -> u64 {
+        self.other_items.get(key).copied().unwrap_or(0)
+    }
+    pub fn stored_types(&self) -> usize {
+        self.items.len() + self.other_items.len()
+    }
     pub fn total_items(&self) -> u64 {
         self.total_items
     }
     pub fn used_bytes(&self) -> u64 {
-        self.items.len() as u64 * self.config.bytes_per_type()
+        self.stored_types() as u64 * self.config.bytes_per_type()
             + self.total_items.div_ceil(self.config.amount_per_byte())
     }
     fn unused(&self) -> u64 {
@@ -293,13 +338,14 @@ impl Cell {
         (a - self.total_items % a) % a
     }
     pub fn remaining_items(&self) -> u64 {
+        if self.used_bytes()>self.config.total_bytes() {return 0;}
         (self.config.total_bytes() - self.used_bytes()) * self.config.amount_per_byte()
             + self.unused()
     }
     pub fn can_hold_new_type(&self) -> bool {
-        let free = self.config.total_bytes() - self.used_bytes();
+        let free = self.config.total_bytes().saturating_sub(self.used_bytes());
         let per = self.config.bytes_per_type();
-        self.items.len() < self.config.max_types()
+        self.stored_types() < self.config.max_types()
             && (free > per || (free == per && self.unused() > 0))
     }
     /// Return accepted amount. With void enabled this may exceed actual stored amount.
@@ -359,6 +405,18 @@ impl Cell {
         }
         extracted
     }
+    /// `BasicCellInventory.extract` permits already-stored keys regardless
+    /// of channel; only insertion checks the physical cell's channel.
+    pub fn extract_other(&mut self, key: &ItemKey, amount: u64, action: Action) -> u64 {
+        let current = self.other_count(key);
+        let extracted = amount.min(current);
+        if extracted > 0 && action == Action::Modulate {
+            if extracted == current { self.other_items.remove(key); }
+            else { self.other_items.insert(key.clone(), current - extracted); }
+            self.total_items -= extracted;
+        }
+        extracted
+    }
 }
 
 /// Ordered collection of cells. Ordering is supplied by the host; this does not
@@ -402,6 +460,42 @@ impl CellBank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_foreign_channel_is_extractable_and_shares_physical_capacity() {
+        let key=ItemKey{item_id:"same:id".into(),components:vec![1,2]};
+        let config=CellConfig::fluid(Tier::K1);
+        let expected=2*config.bytes_per_type()+1012_u64.div_ceil(config.amount_per_byte());
+        let mut cell=Cell::from_entries_with_other(config,[(key.clone(),1000)],[(key.clone(),12)]).unwrap();
+        assert_eq!(cell.count(&key),1000);assert_eq!(cell.other_count(&key),12);
+        assert_eq!(cell.stored_types(),2);assert_eq!(cell.total_items(),1012);assert_eq!(cell.used_bytes(),expected);
+        assert_eq!(cell.extract_other(&key,5,Action::Simulate),5);assert_eq!(cell.other_count(&key),12);
+        assert_eq!(cell.extract_other(&key,5,Action::Modulate),5);assert_eq!(cell.other_count(&key),7);
+        assert_eq!(cell.count(&key),1000);assert_eq!(cell.total_items(),1007);
+        assert_eq!(cell.extract_other(&key,7,Action::Modulate),7);assert_eq!(cell.stored_types(),1);
+    }
+    #[test]
+    fn source_foreign_keys_count_toward_the_shared_type_limit() {
+        let primary=(0..9).map(|index|(key(index),1)).collect::<Vec<_>>();
+        let other=(9..18).map(|index|(key(index),1)).collect::<Vec<_>>();
+        let mut cell=Cell::from_entries_with_other(CellConfig::fluid(Tier::K1),primary,other).unwrap();
+        assert_eq!(cell.stored_types(),18);assert!(!cell.can_hold_new_type());
+        assert_eq!(cell.insert(&key(99),1,Action::Modulate),0);
+        assert_eq!(cell.extract_other(&key(9),1,Action::Modulate),1);
+        assert!(cell.can_hold_new_type());assert_eq!(cell.insert(&key(99),1,Action::Modulate),1);
+    }
+    #[test]
+    fn overfilled_source_cell_keeps_contents_extractable_without_free_space() {
+        let config=CellConfig::fluid(Tier::K1);
+        let entries=(0..20).map(|index|(key(index),1)).collect::<Vec<_>>();
+        assert_eq!(Cell::from_entries(config.clone(),entries.clone()).unwrap_err(),RestoreError::TooManyTypes);
+        let mut cell=Cell::from_source_entries_with_other(config,entries,std::iter::empty()).unwrap();
+        assert_eq!(cell.stored_types(),20);assert!(!cell.can_hold_new_type());
+        assert_eq!(cell.extract(&key(0),1,Action::Modulate),1);assert_eq!(cell.stored_types(),19);
+        let config=CellConfig::item(Tier::K1);
+        let oversized=Cell::from_source_entries_with_other(config,[(key(0),9000)],std::iter::empty()).unwrap();
+        assert_eq!(oversized.remaining_items(),0);assert!(!oversized.can_hold_new_type());
+        assert_eq!(oversized.count(&key(0)),9000);
+    }
     fn key(id: usize) -> ItemKey {
         ItemKey {
             item_id: format!("test:{id}"),

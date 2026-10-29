@@ -176,6 +176,8 @@ pub(super) struct Remote {
     #[cfg(feature = "ae2-lab")]
     ae2_fake_slots: Vec<(i16,bool)>,
     #[cfg(feature = "ae2-lab")]
+    ae2_repo_slots: Vec<i16>,
+    #[cfg(feature = "ae2-lab")]
     ae2_priority_search_backup: Option<horizon_client::ui::EditBox>,
     #[cfg(feature = "ae2-lab")]
     ae2_energy_screen: bool,
@@ -517,6 +519,8 @@ impl Game<'_> {
             ae2_base_screen: false,
             #[cfg(feature = "ae2-lab")]
             ae2_fake_slots: Vec::new(),
+            #[cfg(feature = "ae2-lab")]
+            ae2_repo_slots: Vec::new(),
             #[cfg(feature = "ae2-lab")]
             ae2_priority_search_backup: None,
             #[cfg(feature = "ae2-lab")]
@@ -1737,6 +1741,17 @@ impl Game<'_> {
                         let window=i32::from_be_bytes(*bytes);
                         if let Some(r)=self.remote.as_mut().filter(|r|r.menu.as_ref().is_some_and(|m|m.0==window)) {
                             r.ae2_fake_slots=p.data[4..].iter().map(|slot|(i16::from(*slot & 0x7f),*slot & 0x80!=0)).collect();
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "ae2-lab")]
+            C::CustomPayload(p) if p.channel == "ae2:repo_slots" => {
+                if (4..=58).contains(&p.data.len()) && p.data[4..].iter().all(|slot|*slot<54) {
+                    if let Ok(bytes)=<&[u8;4]>::try_from(&p.data[..4]) {
+                        let window=i32::from_be_bytes(*bytes);
+                        if let Some(r)=self.remote.as_mut().filter(|r|r.menu.as_ref().is_some_and(|m|m.0==window)) {
+                            r.ae2_repo_slots=p.data[4..].iter().map(|slot|i16::from(*slot)).collect();
                         }
                     }
                 }
@@ -5292,6 +5307,18 @@ impl Game<'_> {
             }
         }
         #[cfg(feature="ae2-lab")]
+        if let [(Some(slot),button,input)]=ops {
+            if *input!=Input::QuickCraft && self.ae2_is_remote_repo_slot(*slot) {
+                // Source RepoSlot is client-only: its click is a network
+                // interaction and never mutates a physical client slot.
+                let (window,menu)=self.remote_menu();
+                if let Some(wire)=Self::menu_slot_index(&menu,*slot) {
+                    self.send_clicks(window,vec![(wire as i16,*button,*input,Vec::new(),self.carried.clone())],false);
+                    return true;
+                }
+            }
+        }
+        #[cfg(feature="ae2-lab")]
         if let [(Some(slot),_,Input::Clone)]=ops {
             let ae2=self.remote.as_ref().is_some_and(|r|r.ae2_base_screen || r.ae2_terminal_screen || r.ae2_bus_screen
                 || r.ae2_network_tool_screen || r.ae2_network_status_screen || r.ae2_anchor_screen || r.ae2_pattern_access_screen || r.ae2_craft_screen!=0);
@@ -5423,6 +5450,13 @@ impl Game<'_> {
             )
         });
         self.send_clicks(container, sent,true);
+    }
+    #[cfg(feature="ae2-lab")]
+    pub(super) fn ae2_is_remote_repo_slot(&self,slot:usize)->bool {
+        let Some(remote)=self.remote.as_ref() else{return false;};
+        if remote.ae2_priority_screen || remote.ae2_energy_screen || remote.ae2_craft_screen!=0 {return false;}
+        let Some((_,menu))=remote.menu.as_ref() else{return false;};
+        Self::menu_slot_index(menu,slot).is_some_and(|wire|remote.ae2_repo_slots.contains(&(wire as i16)))
     }
     #[cfg(feature="ae2-lab")]
     fn ae2_is_remote_fake_slot(&self,slot:usize)->bool {
@@ -5689,6 +5723,7 @@ impl Game<'_> {
                 r.ae2_stock_spec = None;
                 r.ae2_base_screen = false;
                 r.ae2_fake_slots.clear();
+                r.ae2_repo_slots.clear();
                 r.ae2_priority_search_backup = None;
                 r.ae2_energy_screen = false;
                 r.ae2_energy_token = None;
@@ -5926,6 +5961,7 @@ impl Game<'_> {
                 r.ae2_stock_spec=None;
                 r.ae2_base_screen=false;
                 r.ae2_fake_slots.clear();
+                r.ae2_repo_slots.clear();
                 r.ae2_priority_search_backup=None;
                 r.ae2_energy_screen=false;
                 r.ae2_energy_token=None;

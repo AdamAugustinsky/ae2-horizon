@@ -962,7 +962,7 @@ impl Game<'_> {
         }.get(spin).copied()?;
         Some(if face==up {vec![0]} else if face==up.opposite(){vec![1]} else{vec![2,3]})
     }
-    fn ae2_inscriber_accepts(&self,m:&horizon_client::ae2_world::Machine,slot:usize,stack:&ItemStack)->bool {
+    pub(in crate::game) fn ae2_inscriber_accepts(&self,m:&horizon_client::ae2_world::Machine,slot:usize,stack:&ItemStack)->bool {
         if slot>=3 || m.slots.len()!=4 {return false}
         if slot<2 && stack.item.as_ref()=="ae2:name_press" {return true}
         let mut inputs=m.slots[..3].to_vec();inputs[slot]=Some(stack.clone());
@@ -1004,31 +1004,49 @@ impl Game<'_> {
 // The Assembler exposes its nine physical recipe inputs and output, never its
 // pattern slot or fluid/CPU escrow. A physical installed pattern is required.
 impl Game<'_> {
-    fn ae2_assembler_accepts(&self,m:&horizon_client::ae2_world::Machine,slot:usize,stack:&ItemStack)->bool {
-        if slot>=9||m.slots.len()!=11{return false}
-        let Some(pattern)=m.slots[10].as_ref() else{return false};
-        if let Some(special)=super::super::ae2_processing::ae2_decode_special_pattern(pattern) {
-            let Some(mut physical)=super::super::ae2_processing::special_assembler_grid(&special.kind,&special.grid) else{return false};
-            if super::super::ae2_processing::special_recipe_result(self.res.stations(),&special.kind,&special.recipe,&special.grid)!=Some(special.output.clone()){return false}
-            let Some(expected)=physical[slot].as_ref() else{return false};
-            if expected.same_item_same_components(stack){return true}
-            if !special.substitutes{return false}
-            let mut proposed=stack.clone();proposed.count=1;physical[slot]=Some(proposed);
-            let Some(logical)=super::super::ae2_processing::special_logical_grid(&special.kind,&physical) else{return false};
-            return super::super::ae2_processing::special_recipe_result(self.res.stations(),&special.kind,&special.recipe,&logical)==Some(special.output);
+    pub(in crate::game) fn ae2_assembler_pattern_valid(&self,pattern:&ItemStack)->bool {
+        super::super::ae2_processing::assembler_pattern_valid(pattern,self.res.items(),self.res.recipes(),self.res.stations())
+    }
+    /// The menu uses the active forced definition when a Provider owns the
+    /// plan. Older snapshots lack that metadata and remain exact-only.
+    pub(in crate::game) fn ae2_assembler_menu_accepts(&self,m:&horizon_client::ae2_world::Machine,slot:usize,stack:&ItemStack)->bool {
+        if slot>=9 || m.slots.len()!=11 || stack.count==0{return false;}
+        if let Some(snapshot)=m.config.get(&"ae2_assembler_pattern".into()) {
+            if let Some(definition)=snapshot.get("definition") {
+                return horizon_client::save::item_from_nbt(definition).is_some_and(|pattern|
+                    super::super::ae2_processing::assembler_pattern_accepts(&pattern,slot,stack,self.res.items(),self.res.recipes(),self.res.stations()));
+            }
+            return horizon_client::save::decode_items(snapshot.get("grid"),9).get(slot).and_then(Option::as_ref)
+                .is_some_and(|expected|expected.same_item_same_components(stack));
         }
-        let Some((mut grid,output))=super::super::ae2_processing::decode_pattern(pattern) else{return false};
-        if !self.res.recipes().find(&grid,3).is_some_and(|(_,result)|result==output){return false}
-        let Some(expected)=grid[slot].as_ref() else{return false};
-        if expected.same_item_same_components(stack){return true}
-        let substitutes=matches!(pattern.data().and_then(|d|d.other("minecraft:custom_data")).and_then(|t|t.get("ae2_lab_pattern")).and_then(|t|t.get("substitutes")),Some(Tag::Byte(1)));
-        if !substitutes{return false}
-        let mut proposed=stack.clone();proposed.count=1;grid[slot]=Some(proposed);
-        self.res.recipes().find(&grid,3).is_some_and(|(_,result)|result==output)
+        self.ae2_assembler_accepts(m,slot,stack)
+    }
+    pub(in crate::game) fn ae2_assembler_menu_slot_enabled(&self,m:&horizon_client::ae2_world::Machine,slot:usize)->bool {
+        if slot>=9 || m.slots.len()!=11{return false;}
+        if m.slots[slot].as_ref().is_some_and(|stack|stack.count>0){return true;}
+        if let Some(snapshot)=m.config.get(&"ae2_assembler_pattern".into()) {
+            if let Some(definition)=snapshot.get("definition") {
+                return horizon_client::save::item_from_nbt(definition).is_some_and(|pattern|
+                    super::super::ae2_processing::assembler_pattern_slot_enabled(&pattern,slot,self.res.items(),self.res.recipes(),self.res.stations()));
+            }
+            return horizon_client::save::decode_items(snapshot.get("grid"),9).get(slot).is_some_and(Option::is_some);
+        }
+        m.slots[10].as_ref().is_some_and(|pattern|
+            super::super::ae2_processing::assembler_pattern_slot_enabled(pattern,slot,self.res.items(),self.res.recipes(),self.res.stations()))
+    }
+    pub(in crate::game) fn ae2_assembler_accepts(&self,m:&horizon_client::ae2_world::Machine,slot:usize,stack:&ItemStack)->bool {
+        if slot>=9 || m.slots.len()!=11 {return false;}
+        let Some(pattern)=m.slots[10].as_ref() else{return false;};
+        // CraftingGridFilter requires an installed pattern, but validates
+        // against myPlan, which can still be a provider-forced definition.
+        if m.config.contains_key(&"ae2_assembler_pattern".into()) {
+            return self.ae2_assembler_menu_accepts(m,slot,stack);
+        }
+        super::super::ae2_processing::assembler_pattern_accepts(pattern,slot,stack,self.res.items(),self.res.recipes(),self.res.stations())
     }
     fn ae2_assembler_insert(&mut self,address:GridAddress,stack:&ItemStack,limit:u32,simulate:bool)->Option<u32>{
         let BlockEntity::Ae2(m)=self.ae2_block_entity(address)? else{return None};if m.kind!=MachineKind::MolecularAssembler{return None}if m.slots.len()!=11{return Some(0)}
-        let old=m.slots.clone();let mut staged=old.clone();let mut left=limit.min(stack.count);let max=self.res.items().stack_max(stack).min(64);
+        let old=m.slots.clone();let mut staged=old.clone();let mut left=limit.min(stack.count);let max=1;
         for slot in 0..9{if left==0{break}if !self.ae2_assembler_accepts(m,slot,stack){continue}let moved=match staged[slot].as_ref(){None=>left.min(max),Some(s) if s.same_item_same_components(stack)=>left.min(max.saturating_sub(s.count)),_=>0};if moved==0{continue}
             if let Some(s)=staged[slot].as_mut(){s.count+=moved}else{let mut s=stack.clone();s.count=moved;horizon_client::ae2_stack_identity::detach_if_tracked(&mut s);staged[slot]=Some(s)}left-=moved;
         }

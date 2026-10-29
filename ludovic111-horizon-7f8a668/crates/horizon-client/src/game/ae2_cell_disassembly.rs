@@ -36,7 +36,7 @@ fn prepare(
     } else {
         codec::read_cell(stack)?
     };
-    if cell.entries().next().is_some() {
+    if cell.total_items()!=0 {
         return Ok(Prepared::Filled);
     }
     let upgrades = Inventory::read(stack)?;

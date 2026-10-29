@@ -5,14 +5,41 @@ use horizon_client::items::ItemStack;
 use horizon_core::geometry::{Aabb, Vec3};
 use horizon_world::registry::BlockStateId;
 
+#[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord)]
+pub(super) struct PlaneOwner {
+    pub address: super::ae2_global::GridAddress,
+    pub identity: ae2_network_core::NodeIdentity,
+    pub face: u8,
+}
+impl PlaneOwner {
+    pub fn direction(self) -> horizon_core::geometry::Direction {
+        use horizon_core::geometry::Direction::*;
+        match self.face {0=>East,1=>West,2=>Up,3=>Down,4=>South,_=>North}
+    }
+}
+#[derive(Clone,Copy,Debug)]
+pub(super) struct PlaneTarget {
+    pub owner:PlaneOwner,
+    pub host:(i32,i32,i32),
+    pub target:(i32,i32,i32),
+    pub entity:bool,
+    pub player_owner:Option<[i32;4]>,
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(super) enum FluidPreview {Blocked,CannotPlace,CanPlace(BlockStateId)}
+
 pub(super) enum FormationAction {
-    Block { dim: Dim, pos: (i32, i32, i32), old: BlockStateId, new: BlockStateId },
+    /// Optimistic source SIMULATE reservation; must never be committed.
+    Reservation {dim:Dim,pos:(i32,i32,i32)},
+    Place {dim:Dim,pos:(i32,i32,i32),old:BlockStateId,stack:ItemStack,plane:PlaneOwner,player_owner:Option<[i32;4]>},
+    Fluid {dim:Dim,pos:(i32,i32,i32),old:BlockStateId,fluid:horizon_world::fluid::FluidKind,plane:PlaneOwner},
     /// Container writes have already been staged under the enclosing block
     /// snapshot; notify comparators only once that transaction commits.
     ContainerChanged { address: super::ae2_global::GridAddress, incarnation: u64 },
     Entity {
         dim: Dim, target: (i32, i32, i32), old: BlockStateId,
-        position: [f64; 3], direction: [i32; 3], stack: ItemStack,
+        position: [f64; 3], direction: [i32; 3], stack: ItemStack, plane:PlaneOwner,
     },
 }
 #[derive(Default)]
@@ -21,7 +48,7 @@ impl FormationPlan {
     pub(super) fn len(&self) -> usize { self.actions.len() }
     pub(super) fn truncate(&mut self, n: usize) { self.actions.truncate(n); }
     pub(super) fn block_at(&self, dim: Dim, pos: (i32, i32, i32)) -> bool {
-        self.actions.iter().any(|action| matches!(action, FormationAction::Block { dim: d, pos: p, .. } if *d == dim && *p == pos))
+        self.actions.iter().any(|action| matches!(action, FormationAction::Place {dim:d,pos:p,..} | FormationAction::Fluid {dim:d,pos:p,..} | FormationAction::Reservation {dim:d,pos:p} if *d == dim && *p == pos))
     }
     pub(super) fn entities_in(&self, dim: Dim, bounds: Aabb) -> usize {
         self.actions.iter().filter(|action| matches!(action, FormationAction::Entity { dim: d, position, .. }
@@ -84,7 +111,7 @@ mod tests {
             if dir[1] == -1 { assert_eq!(p[1], -0.25); }
         }
         let mut plan=FormationPlan::default();
-        plan.actions.push(FormationAction::Entity { dim:Dim::Overworld, target:(1,0,0), old:BlockStateId(0), position:[1.15,0.0,0.5], direction:[1,0,0], stack:ItemStack::new("minecraft:diamond",1) });
+        plan.actions.push(FormationAction::Entity { dim:Dim::Overworld, target:(1,0,0), old:BlockStateId(0), position:[1.15,0.0,0.5], direction:[1,0,0], plane:PlaneOwner{address:super::super::ae2_global::GridAddress::from_local(Dim::Overworld,(0,0,0)).unwrap(),identity:ae2_network_core::NodeIdentity{host:1,part:Some([1,0,0,0]),outer:false},face:0}, stack:ItemStack::new("minecraft:diamond",1) });
         assert_eq!(plan.entities_in(Dim::Overworld,area((1,0,0))),1);
         assert_eq!(plan.len(),1);
         plan.truncate(0);

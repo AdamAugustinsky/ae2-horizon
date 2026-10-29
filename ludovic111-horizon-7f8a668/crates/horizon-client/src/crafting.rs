@@ -1510,6 +1510,20 @@ impl Recipes {
         let (found, result) = self.find(grid, size)?;
         (found.strip_prefix("minecraft:").unwrap_or(found) == name).then_some(result)
     }
+    /// Assemble a named modeled special recipe without first calling matches.
+    /// AE2's substituted `AECraftingPattern.assemble` uses this source path.
+    /// Custom mod recipes handled outside `crafting` retain their existing
+    /// conservative matching adapter until they expose direct assembly.
+    pub fn assemble_named_special_unchecked(&self, id:&str, grid:&[Option<ItemStack>], size:usize)->Option<ItemStack> {
+        let name=id.strip_prefix("minecraft:").unwrap_or(id);
+        if let Some((_,recipe))=self.crafting.iter().find(|(n,_)|n==name) {
+            let Recipe::Special(special)=recipe else{return None;};
+            let input=Input::of(grid,size)?;
+            let context=Context{recipes:self,map_scale:&|_|None};
+            return special.assemble(&context,&input);
+        }
+        self.assemble_named(id,grid,size)
+    }
     /// `RecipeManager.getRecipeFor(CRAFTING, ...)` with a lookup for the scale
     /// of a filled map (map extending reads the map's saved data).
     pub fn find_with(
@@ -1940,6 +1954,19 @@ mod tests {
             curses: HashSet::new(),
             cook_index: Default::default(),
         }
+    }
+    #[test]
+    fn named_special_assembly_does_not_require_recipe_matches() {
+        let mut recipes=cooking_book();
+        recipes.crafting.push(("rocket".into(),Recipe::Special(Special::FireworkRocket {
+            shell:ingredient(&["minecraft:paper"]),fuel:ingredient(&["minecraft:gunpowder"]),
+            star:ingredient(&["minecraft:firework_star"]),
+            result:Template::parse(&serde_json::json!({"id":"minecraft:firework_rocket","count":3})).unwrap(),
+        })));
+        let mut grid=vec![None;9];grid[0]=Some(ItemStack::new("minecraft:gunpowder",1));grid[1]=Some(ItemStack::new("minecraft:dirt",1));
+        assert!(recipes.assemble_named("minecraft:rocket",&grid,3).is_none());
+        let result=recipes.assemble_named_special_unchecked("minecraft:rocket",&grid,3).unwrap();
+        assert_eq!(result.item.as_ref(),"minecraft:firework_rocket");assert_eq!(result.count,3);
     }
     #[test]
     fn cook_finds_the_first_recipe_the_scan_finds() {

@@ -33,6 +33,7 @@ impl Game<'_> {
         amount: u64,
         simulate: bool,
         guard: &mut Guard,
+        plan: &mut crate::game::ae2_buses::FormationPlan,
     ) -> Option<u64> {
         let port = self.ae2_p2p_port(address, face, "ae2:fluid_p2p_tunnel")?;
         if port.output || amount == 0 {
@@ -60,10 +61,10 @@ impl Game<'_> {
             };
             let face = direction(output.face ^ 1);
             let accepted = self
-                .ae2_fluid_p2p_fill_inner(target, face, key, offered, simulate, guard)
+                .ae2_fluid_p2p_fill_inner(target, face, key, offered, simulate, guard, plan)
                 .unwrap_or_else(|| {
                     if matches!(self.ae2_block_entity(target),Some(horizon_client::containers::BlockEntity::Ae2(machine)) if machine.kind==horizon_client::ae2_world::MachineKind::Condenser) {return self.ae2_condenser_fill_at(target,offered,simulate);}
-                    self.ae2_interface_fluid_move(target, face, key, offered, true, simulate)
+                    self.ae2_interface_fluid_move_staged(target, face, key, offered, true, simulate, plan)
                         .or_else(|| {
                             self.ae2_provider_return_fluid_at(target, face, key, offered, simulate)
                         })
@@ -170,7 +171,23 @@ impl Game<'_> {
         amount: u64,
         simulate: bool,
     ) -> Option<u64> {
-        self.ae2_fluid_p2p_fill_inner(address, face, key, amount, simulate, &mut Guard::new())
+        let before = self.ae2_snapshot_blocks();
+        let mut plan = crate::game::ae2_buses::FormationPlan::default();
+        let result = self.ae2_fluid_p2p_fill_staged(address, face, key, amount, simulate, &mut plan);
+        if !simulate && result.is_some() && self.ae2_commit_formation(plan).is_err() {
+            self.ae2_restore_blocks(before);
+            return Some(0);
+        }
+        result
+    }
+    pub(in crate::game) fn ae2_fluid_p2p_fill_staged(
+        &mut self, address: GridAddress, face: Direction, key: &ItemKey, amount: u64, simulate: bool,
+        plan: &mut crate::game::ae2_buses::FormationPlan,
+    ) -> Option<u64> {
+        let savepoint = plan.len();
+        let result = self.ae2_fluid_p2p_fill_inner(address, face, key, amount, simulate, &mut Guard::new(), plan);
+        if simulate { plan.truncate(savepoint); }
+        result
     }
     pub(in crate::game) fn ae2_fluid_p2p_entries(
         &self,

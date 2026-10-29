@@ -56,9 +56,8 @@ fn parse(text: &str) -> Result<ClientSettings, String> {
 #[derive(Debug)]
 pub(super) struct CellPreview {
     pub upgrades: Vec<horizon_client::items::ItemStack>,
-    pub entries: Vec<(ae2_cell_core::ItemKey,u64)>,
+    pub entries: Vec<(ae2_cell_core::ItemKey,u64,ae2_cell_core::Channel)>,
     pub has_more: bool,
-    pub fluid: bool,
 }
 pub(super) fn cell_preview(stack:&horizon_client::items::ItemStack, settings:ClientSettings) -> Option<CellPreview> {
     use ae2_cell_core::{Channel,FilterMode};
@@ -73,18 +72,22 @@ pub(super) fn cell_preview(stack:&horizon_client::items::ItemStack, settings:Cli
         let max=ae2_upgrade_inventory::capacity(id)?;
         ae2_upgrade_inventory::decode(cards,max).ok()?.into_iter().flatten().collect()
     } else {Vec::new()};
-    let mut entries:Vec<_>=if settings.show_cell_content {cell.entries().map(|(key,n)|(key.clone(),*n)).collect()}else{Vec::new()};
+    let mut entries=Vec::new();
     if settings.show_cell_content {
+        for channel in [Channel::Item,Channel::Fluid] {
+            entries.extend(cell.entries_for(channel).map(|(key,n)|(key.clone(),*n,channel)));
+        }
         if let Some(filter)=cell.config().filter.as_ref().filter(|f|f.mode==FilterMode::Whitelist) {
+            let channel=cell.config().channel;
             for key in &filter.keys {
-                if !entries.iter().any(|(existing,_)|existing==key) {entries.push((key.clone(),0));}
+                if !entries.iter().any(|(existing,_,kind)|existing==key && *kind==channel) {entries.push((key.clone(),0,channel));}
             }
         }
         entries.sort_by(|a,b|b.1.cmp(&a.1));
     }
     let has_more=entries.len()>settings.max_cell_content_shown;
     entries.truncate(settings.max_cell_content_shown);
-    Some(CellPreview {upgrades,entries,has_more,fluid:cell.config().channel==Channel::Fluid})
+    Some(CellPreview {upgrades,entries,has_more})
 }
 
 pub(super) fn settings() -> ClientSettings {
@@ -111,6 +114,19 @@ mod tests {
         assert!(parse("[tooltips]\nmaxCellContentShown = 33").is_err());
     }
     #[test]
+    fn preview_keeps_each_mixed_content_channel() {
+        use ae2_cell_core::Channel;
+        use horizon_client::items::ItemStack;
+        use horizon_world::nbt::Tag;
+        let mut stack=ItemStack::new("ae2:item_storage_cell_1k",1);
+        let item=Tag::compound([("#t",Tag::String("ae2:i".into())),("id",Tag::String("minecraft:diamond".into())),("#",Tag::Long(3))]);
+        let fluid=Tag::compound([("#t",Tag::String("ae2:f".into())),("id",Tag::String("minecraft:water".into())),("#",Tag::Long(1000))]);
+        stack.data_mut().set_other("ae2:storage_cell_inv",Some(Tag::List(vec![item,fluid])));
+        let preview=cell_preview(&stack,ClientSettings::default()).unwrap();
+        assert!(preview.entries.iter().any(|(key,n,channel)|key.item_id=="minecraft:diamond" && *n==3 && *channel==Channel::Item));
+        assert!(preview.entries.iter().any(|(key,n,channel)|key.item_id=="minecraft:water" && *n==1000 && *channel==Channel::Fluid));
+    }
+    #[test]
     fn preview_limits_and_switches_preserve_actual_cell_contents() {
         use ae2_cell_core::Action;
         use horizon_client::{ae2_cell_codec,items::ItemStack};
@@ -122,7 +138,7 @@ mod tests {
         }
         ae2_cell_codec::write_cell(&mut stack,&cell).unwrap();
         let preview=cell_preview(&stack,ClientSettings {max_cell_content_shown:2,..ClientSettings::default()}).unwrap();
-        assert_eq!(preview.entries.iter().map(|(key,n)|(key.item_id.as_str(),*n)).collect::<Vec<_>>(),vec![("minecraft:iron_ingot",7),("minecraft:gold_ingot",4)]);
+        assert_eq!(preview.entries.iter().map(|(key,n,_)|(key.item_id.as_str(),*n)).collect::<Vec<_>>(),vec![("minecraft:iron_ingot",7),("minecraft:gold_ingot",4)]);
         assert!(preview.has_more);
         let hidden=cell_preview(&stack,ClientSettings {show_cell_content:false,..ClientSettings::default()}).unwrap();
         assert!(hidden.entries.is_empty() && !hidden.has_more);

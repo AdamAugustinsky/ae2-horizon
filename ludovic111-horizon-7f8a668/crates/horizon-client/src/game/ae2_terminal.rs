@@ -339,7 +339,7 @@ impl Game<'_> {
         limit: u64,
         insert: bool,
     ) -> Result<u64, String> {
-        use ae2_cell_core::Action;
+        use ae2_cell_core::{Action,Channel};
         use horizon_client::containers::BlockEntity;
         let Some(BlockEntity::Ae2(m)) = self.world.block_entities.get(&pos) else {
             return Err("missing ME chest".into());
@@ -361,18 +361,17 @@ impl Game<'_> {
             })
         });
         let is_fluid = fluid.is_some();
-        let mut cell = if creative.is_some() {
-            None
-        } else if is_fluid {
-            Some(self.ae2_read_fluid_cell(&stack)?)
-        } else {
-            Some(self.ae2_read_item_cell(&stack)?)
-        };
+        let channel = if is_fluid { Channel::Fluid } else { Channel::Item };
+        let mut cell = if creative.is_some() { None } else { Some(self.ae2_read_cell(&stack)?) };
+        // The physical cell only accepts its own channel. A foreign-channel
+        // key restored from source data is nevertheless recoverable.
+        if insert && cell.as_ref().is_some_and(|cell|cell.config().channel!=channel) {return Ok(0);}
         let possible = if let Some(cell) = cell.as_mut() {
             if insert {
                 self.ae2_cell_insert(cell, physical_key, limit, Action::Simulate)
             } else {
-                cell.extract(physical_key, limit, Action::Simulate)
+                if cell.config().channel==channel {cell.extract(physical_key,limit,Action::Simulate)}
+                else {cell.extract_other(physical_key,limit,Action::Simulate)}
             }
         } else if creative_accepts {
             limit
@@ -396,13 +395,14 @@ impl Game<'_> {
             if insert {
                 self.ae2_cell_insert(cell, physical_key, amount, Action::Modulate)
             } else {
-                cell.extract(physical_key, amount, Action::Modulate)
+                if cell.config().channel==channel {cell.extract(physical_key,amount,Action::Modulate)}
+                else {cell.extract_other(physical_key,amount,Action::Modulate)}
             }
         } else {
             amount
         };
         if let Some(cell) = cell.as_ref() {
-            if is_fluid {
+            if cell.config().channel==Channel::Fluid {
                 super::ae2_fluids::write_fluid_cell(&mut stack, cell)?;
             } else {
                 ae2_lab::write_cell(&mut stack, cell)?;
@@ -480,16 +480,11 @@ impl Game<'_> {
                     })
                     .collect());
             }
-            if stack.item.starts_with("ae2:fluid_storage_cell_") {
-                return Ok(self.ae2_read_fluid_cell(stack)?
-                    .entries()
-                    .map(|(k, n)| (fluid_marker(k), *n))
-                    .collect());
-            }
-            return Ok(self.ae2_read_item_cell(stack)?
-                .entries()
-                .map(|(k, n)| (k.clone(), *n))
-                .collect());
+            use ae2_cell_core::Channel;
+            let cell=self.ae2_read_cell(stack)?;
+            let mut entries:Vec<_>=cell.entries_for(Channel::Item).map(|(k,n)|(k.clone(),*n)).collect();
+            entries.extend(cell.entries_for(Channel::Fluid).map(|(k,n)|(fluid_marker(k),*n)));
+            return Ok(entries);
         }
         let mut entries = self.ae2_grid_inventory(pos)?;
         entries.extend(self.ae2_grid_fluids(pos)?.into_iter().map(|(key,amount)|(fluid_marker(&key),amount)));
@@ -1326,7 +1321,9 @@ impl Game<'_> {
             }
             if self.ae2_local_chest(pos) {
                 let selected = entries.get(self.ae2_terminal_page * page_size + index);
-                let supports_fluid = matches!(self.world.block_entities.get(&pos), Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.slots.first().and_then(Option::as_ref).is_some_and(|stack| stack.item.starts_with("ae2:fluid_storage_cell_") || self.ae2_creative_cell_keys(stack).is_ok_and(|keys| keys.iter().any(|key| matches!(key, super::ae2_storage_devices::CreativeCellKey::Fluid(_))))));
+                let supports_fluid = matches!(self.world.block_entities.get(&pos), Some(horizon_client::containers::BlockEntity::Ae2(m)) if m.slots.first().and_then(Option::as_ref).is_some_and(|stack|
+                    self.ae2_read_cell(stack).is_ok_and(|cell|cell.config().channel==ae2_cell_core::Channel::Fluid || cell.entries_for(ae2_cell_core::Channel::Fluid).next().is_some())
+                    || self.ae2_creative_cell_keys(stack).is_ok_and(|keys| keys.iter().any(|key| matches!(key, super::ae2_storage_devices::CreativeCellKey::Fluid(_))))));
                 if input == Input::Pickup && supports_fluid {
                     if let Some(cursor) = self
                         .carried
@@ -1718,6 +1715,22 @@ pub(super) struct GuestTerminal {
     fluid_outputs: Vec<Option<super::ae2_processing::PatternFluid>>,
     snapshot: Vec<(ae2_cell_core::ItemKey, u64)>,
     displayed_snapshot: Vec<(ae2_cell_core::ItemKey, u64)>,
+    // A source MEInteractionPacket identifies a displayed key, not a vanilla
+    // inventory state ID. Retain bounded per-slot identities for queued clicks.
+    storage_revisions: std::collections::VecDeque<(i32,Vec<Option<ae2_cell_core::ItemKey>>)>,
+}
+fn terminal_view_keys(entries:&[(ae2_cell_core::ItemKey,u64)],page:usize,page_size:usize)->Vec<Option<ae2_cell_core::ItemKey>> {
+    let page=page.min(entries.len().saturating_sub(1)/page_size);
+    (0..page_size).map(|slot|entries.get(page*page_size+slot)
+        .filter(|(key,_)|!key.item_id.is_empty()).map(|(key,_)|key.clone())).collect()
+}
+fn terminal_view_revision_matches(
+    revisions:&std::collections::VecDeque<(i32,Vec<Option<ae2_cell_core::ItemKey>>)>,
+    state:i32,current:&[(ae2_cell_core::ItemKey,u64)],page:usize,page_size:usize,slot:usize,
+)->bool {
+    let visible=terminal_view_keys(current,page,page_size);
+    revisions.iter().rev().find(|(revision,_)|*revision==state)
+        .is_some_and(|(_,shown)|shown.get(slot).zip(visible.get(slot)).is_some_and(|(old,new)|old==new))
 }
 fn encoding_revision_matches(
     revisions:&std::collections::VecDeque<(i32,Option<horizon_client::ae2_world::Machine>,usize)>,
@@ -2025,6 +2038,7 @@ impl Game<'_> {
             fluid_outputs: vec![None; 27],
             snapshot: Vec::new(),
             displayed_snapshot: Vec::new(),
+            storage_revisions: std::collections::VecDeque::new(),
         });
         if !self.lan_load_encoding_state(host,conn) && encoding_part.is_some() {self.lan_ae2_terminal_closed(host,conn,None);return false;}
         if encoding_part.is_some() {
@@ -2481,6 +2495,10 @@ impl Game<'_> {
         t.snapshot = snapshot;
         t.displayed_snapshot = displayed;
         t.state = (t.state + 1) & 0x7fff;
+        if !t.encoding && !t.craft_amount_edit && !t.search_edit && !t.key_type_edit {
+            t.storage_revisions.push_back((t.state,terminal_view_keys(&t.displayed_snapshot,page,page_size)));
+            while t.storage_revisions.len()>64 {t.storage_revisions.pop_front();}
+        }
         if t.chest_identity.is_some() {
             t.chest_revisions.push_back((t.state,ChestTerminalSettings{sort:t.sort_mode,view:t.filter_mode,descending:t.sort_descending}));
             while t.chest_revisions.len()>64 {t.chest_revisions.pop_front();}
@@ -2490,6 +2508,10 @@ impl Game<'_> {
             while t.encoding_revisions.len()>64 {t.encoding_revisions.pop_front();}
         }
         let (window, state) = (t.window, t.state);
+        let repo_slots:Vec<u8>=if !t.encoding && !t.craft_amount_edit && !t.search_edit && !t.key_type_edit {
+            (0..page_size as u8).collect()
+        } else {Vec::new()};
+        Self::lan_ae2_repo_slots(host,conn,window,&repo_slots);
         let packet = C::ContainerSetContent(play::ContainerSetContent {
             container: window,
             state,
@@ -4113,7 +4135,9 @@ impl Game<'_> {
         // physical matrix, player and control slots use current server state.
         let virtual_key_click = host.play.get(&conn).and_then(|p|p.ae2_terminal.as_ref()).is_some_and(|t|
             !t.encoding && !t.craft_amount_edit && !t.search_edit && p.slot>=0 && (p.slot as usize)<page_size);
-        if virtual_key_click && (!matches_snapshot || host.play.get(&conn).and_then(|x|x.ae2_terminal.as_ref()).is_none_or(|t|t.state!=p.state)) {
+        let same_key=host.play.get(&conn).and_then(|x|x.ae2_terminal.as_ref()).is_some_and(|t|
+            terminal_view_revision_matches(&t.storage_revisions,p.state,&t.displayed_snapshot,page,page_size,p.slot as usize));
+        if virtual_key_click && (!matches_snapshot || !same_key) {
             self.lan_send_ae2_terminal(host, conn);
             return true;
         }
@@ -5474,6 +5498,12 @@ impl Game<'_> {
         let mut data=window.to_be_bytes().to_vec();data.extend_from_slice(slots);
         host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload{channel:"ae2:fake_slots".into(),data}));
     }
+    /// Source repository entries are client-only slots, not physical menu
+    /// slots. Publish the current mode's exact wire indices to the client.
+    pub(super) fn lan_ae2_repo_slots(host:&mut super::lan::LanHost,conn:u32,window:i32,slots:&[u8]) {
+        let mut data=window.to_be_bytes().to_vec();data.extend_from_slice(slots);
+        host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload{channel:"ae2:repo_slots".into(),data}));
+    }
     /// Tell the local renderer this generic container is an AE2 base screen.
     pub(super) fn lan_mark_ae2_base_screen(host:&mut super::lan::LanHost,conn:u32,window:i32) {
         host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload{channel:"ae2:base_screen".into(),data:window.to_be_bytes().to_vec()}));
@@ -5759,7 +5789,7 @@ impl Game<'_> {
                     .burn_time(self.res.items(), item, false)
                     > 0
             }
-            K::Inscriber => slot != 3,
+            K::Inscriber => self.ae2_inscriber_accepts(m,slot,item),
             K::Charger => true,
             K::QuantumLink => {
                 slot == 0 && item.count > 0 && super::ae2_quantum::frequency(item).is_some()
@@ -5788,7 +5818,13 @@ impl Game<'_> {
             }
             K::WirelessAccessPoint => slot == 0 && item.item.as_ref() == "ae2:wireless_booster",
             K::PatternProvider => super::ae2_pattern_access::encoded_pattern_item(item),
-            K::Interface | K::MolecularAssembler => true,
+            K::Interface => true,
+            K::MolecularAssembler => match slot {
+                0..=8 => self.ae2_assembler_menu_slot_enabled(m,slot) && self.ae2_assembler_menu_accepts(m,slot,item),
+                9 => false,
+                10 => {let mut candidate=item.clone();candidate.count=1;self.ae2_assembler_pattern_valid(&candidate)},
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -7214,6 +7250,19 @@ impl Game<'_> {
 #[cfg(test)]
 mod terminal_filter_tests {
     use super::*;
+    #[test]
+    fn queued_virtual_click_keeps_displayed_key_across_unrelated_revisions() {
+        let water=fluid_marker(&ae2_cell_core::ItemKey{item_id:"minecraft:water".into(),components:vec![]});
+        let iron=ae2_cell_core::ItemKey{item_id:"minecraft:iron_ingot".into(),components:vec![]};
+        let displayed=vec![(iron.clone(),2),(water.clone(),2000)];
+        let mut history=std::collections::VecDeque::new();
+        history.push_back((7,terminal_view_keys(&displayed,0,45)));
+        assert!(terminal_view_revision_matches(&history,7,&[(iron.clone(),1),(water.clone(),1000)],0,45,1));
+        assert!(terminal_view_revision_matches(&history,7,&displayed,0,45,10));
+        assert!(!terminal_view_revision_matches(&history,7,&[(water,2000),(iron,2)],0,45,1));
+        assert!(!terminal_view_revision_matches(&history,8,&displayed,0,45,1));
+        assert!(!terminal_view_revision_matches(&history,7,&displayed,0,45,45));
+    }
     #[test]
     fn pinned_row_ignores_search_keeps_slots_stable_and_repeats_on_pages() {
         let key=|id:&str|ae2_cell_core::ItemKey{item_id:id.into(),components:Vec::new()};

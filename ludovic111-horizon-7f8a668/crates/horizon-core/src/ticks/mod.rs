@@ -353,7 +353,7 @@ impl std::fmt::Display for TickError {
 }
 impl std::error::Error for TickError {}
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct LevelTicks {
     chunks: HashMap<i64, ChunkTicks>,
     deadlines: DeadlineIndex,

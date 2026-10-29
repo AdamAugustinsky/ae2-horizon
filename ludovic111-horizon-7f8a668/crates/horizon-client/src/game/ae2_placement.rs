@@ -2,7 +2,7 @@
 use super::Game;
 use horizon_world::chunk::BlockState;
 
-fn placement(
+pub(super) fn placement(
     name: &str,
     yaw: f32,
     pitch: f32,
@@ -23,10 +23,11 @@ fn placement(
         return Some((facing, None));
     }
     if matches!(name, "ae2:sky_stone_chest" | "ae2:smooth_sky_stone_chest") {
-        let facing=match horizontal {"north"=>"south","south"=>"north","east"=>"west",_=>"east"};
-        return Some((facing,None));
+        // `horizontal` is already opposite the player's looking direction,
+        // as required by HorizontalFacingStrategy.getStateForPlacement.
+        return Some((horizontal,None));
     }
-    if !matches!(name, "ae2:drive" | "ae2:charger" | "ae2:inscriber" | "ae2:vibration_chamber" | "ae2:io_port" | "ae2:spatial_io_port" | "ae2:cell_workbench" | "ae2:chest") {
+    if !matches!(name, "ae2:drive" | "ae2:charger" | "ae2:inscriber" | "ae2:vibration_chamber" | "ae2:io_port" | "ae2:spatial_io_port" | "ae2:cell_workbench" | "ae2:chest" | "ae2:crafting_monitor") {
         return None;
     }
     let opposite = match horizontal {
@@ -54,6 +55,17 @@ fn placement(
         facing,
         Some(dirs.iter().position(|v| *v == up).unwrap_or(0) as u8),
     ))
+}
+/// ItemPlacementStrategy.PlaneDirectionalPlaceContext overrides horizontal
+/// direction to NORTH for vertical planes. Platform.configurePlayer sets
+/// pitch to 90 for both vertical directions; the clicked face opposes look.
+pub(super) fn plane_placement(name: &str, look: [i32; 3]) -> Option<(&'static str, Option<u8>)> {
+    let (yaw, pitch) = match look {
+        [0,0,1] => (0.0,0.0), [-1,0,0] => (90.0,0.0),
+        [0,0,-1] => (180.0,0.0), [1,0,0] => (270.0,0.0),
+        [0,1,0] | [0,-1,0] => (180.0,90.0), _ => return None,
+    };
+    placement(name, yaw, pitch, [-look[0],-look[1],-look[2]])
 }
 /// Source BlockOrientation.rotateClockwiseAround: facing and up both rotate
 /// a quarter turn around the clicked face, then are encoded as facing/spin.
@@ -160,7 +172,7 @@ impl Game<'_> {
             let Ok(id)=self.pack.assets.registry.resolve(&BlockState{name:state.name.clone(),properties:props}) else{return false};
             return self.level_set(pos,id).is_ok();
         }
-        if !matches!(state.name.as_str(),"ae2:drive"|"ae2:charger"|"ae2:inscriber"|"ae2:wireless_access_point"|"ae2:crystal_resonance_generator"|"ae2:sky_stone_chest"|"ae2:smooth_sky_stone_chest"|"ae2:growth_accelerator"|"ae2:vibration_chamber"|"ae2:io_port"|"ae2:spatial_io_port"|"ae2:cell_workbench"|"ae2:chest"|"ae2:spatial_anchor"){return false;}
+        if !matches!(state.name.as_str(),"ae2:drive"|"ae2:charger"|"ae2:inscriber"|"ae2:wireless_access_point"|"ae2:crystal_resonance_generator"|"ae2:sky_stone_chest"|"ae2:smooth_sky_stone_chest"|"ae2:growth_accelerator"|"ae2:vibration_chamber"|"ae2:io_port"|"ae2:spatial_io_port"|"ae2:cell_workbench"|"ae2:chest"|"ae2:spatial_anchor"|"ae2:crafting_monitor"){return false;}
         let Some(facing)=state.properties.get("facing") else{return false};
         let spin=state.properties.get("spin").and_then(|s|s.parse().ok()).unwrap_or(0);
         let Some((front,new_spin))=wrench_rotation(facing,spin,face) else{return false};
@@ -180,11 +192,20 @@ impl Game<'_> {
         pitch: f32,
         waterlogged: bool,
     ) {
+        self.ae2_orient_placed_block_using(pos,waterlogged,|name|placement(name,yaw,pitch,face));
+    }
+    pub(super) fn ae2_orient_placed_block_from_plane(&mut self, pos:[i32;3], look:[i32;3], waterlogged:bool) {
+        self.ae2_orient_placed_block_using(pos,waterlogged,|name|plane_placement(name,look));
+    }
+    fn ae2_orient_placed_block_using(
+        &mut self, pos:[i32;3], waterlogged:bool,
+        orientation:impl FnOnce(&str)->Option<(&'static str,Option<u8>)>,
+    ) {
         let old = self.world.block(pos[0], pos[1], pos[2]);
         let Some(state) = self.pack.assets.registry.state(old) else {
             return;
         };
-        let Some((facing, spin)) = placement(&state.name, yaw, pitch, face) else {
+        let Some((facing, spin)) = orientation(&state.name) else {
             return;
         };
         let mut props = state.properties.clone();
@@ -224,6 +245,13 @@ mod tests {
     }
     #[test]
     fn source_placement_uses_player_facing_pitch_and_clicked_face() {
+        for (yaw, facing) in [(0.0,"north"),(90.0,"east"),(180.0,"south"),(270.0,"west")] {
+            for name in ["ae2:sky_stone_chest", "ae2:smooth_sky_stone_chest"] {
+                assert_eq!(placement(name, yaw, 80.0, [0,1,0]), Some((facing,None)));
+            }
+            assert_eq!(placement("ae2:crafting_monitor",yaw,0.0,[0,1,0]),Some((facing,Some(0))));
+        }
+        assert_eq!(placement("ae2:crafting_monitor",90.0,75.0,[0,1,0]),Some(("up",Some(3))));
         assert_eq!(
             placement("ae2:drive", 0.0, 0.0, [0, 1, 0]),
             Some(("north", Some(0)))
@@ -240,5 +268,21 @@ mod tests {
             placement("ae2:wireless_access_point", 0.0, 0.0, [1, 0, 0]),
             Some(("east", None))
         );
+    }
+    #[test]
+    fn source_plane_context_uses_the_six_look_directions() {
+        for (look, facing, clicked) in [
+            ([0,0,1],"north","north"), ([0,0,-1],"south","south"),
+            ([1,0,0],"west","west"), ([-1,0,0],"east","east"),
+            ([0,1,0],"up","down"), ([0,-1,0],"up","up"),
+        ] {
+            for item in ["ae2:drive","ae2:crafting_monitor"] {
+                assert_eq!(plane_placement(item,look),Some((facing,Some(0))));
+            }
+            let sky = if look[1] != 0 { "south" } else { facing };
+            assert_eq!(plane_placement("ae2:sky_stone_chest",look),Some((sky,None)));
+            assert_eq!(plane_placement("ae2:wireless_access_point",look),Some((clicked,None)));
+        }
+        assert_eq!(plane_placement("ae2:drive",[0,0,0]),None);
     }
 }

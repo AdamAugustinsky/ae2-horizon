@@ -139,7 +139,7 @@ pub use data::{BlockData, ItemBinding, ItemKind, Named, Props, PushReaction, Sta
 pub use falling::Landing;
 pub use interact::{InteractionResult, PlayerContext, PlayerEffect};
 pub use pistons::{BlockEventData, MovingPiston};
-pub use place::{PlaceContext, PlaceOutcome};
+pub use place::{PlaceContext, PlaceOutcome, PendingPlacement};
 pub use states::{BlockId, PropKey, StateTable};
 pub use tick::{Precipitation, PrecipitationKind};
 pub use ticks::Ticks;
@@ -291,6 +291,9 @@ pub enum LevelEvent {
 
 /// The world as seen by block behaviour. Implemented by the game and tests.
 pub trait LevelAccess {
+    /// Host custom block orientation, resolved during getStateForPlacement.
+    /// Returning None keeps the vanilla block-class implementation.
+    fn custom_placement_state(&self,_default:BlockStateId,_face:Direction,_yaw:f32,_pitch:f32,_plane:Option<Direction>,_water:bool)->Option<BlockStateId> {None}
     /// Whether this state uses a six-way, center-supported fixture placement.
     fn custom_center_fixture(&self, _state: BlockStateId) -> bool { false }
     /// Optional host-provided, side-sensitive crank capability.
@@ -302,6 +305,8 @@ pub trait LevelAccess {
     /// Observe the actual source position when the queued neighbor updater
     /// retained it. Direct legacy calls may not supply one.
     fn custom_neighbor_event(&mut self, _pos: BlockPos, _state: BlockStateId, _source: Option<BlockPos>) {}
+    /// Observe the neighbor direction of an actual updateShape callback.
+    fn custom_shape_event(&mut self, _pos: BlockPos, _state: BlockStateId, _neighbor: BlockPos) {}
     /// `Level.isClientSide`: this level is a client's copy (false on a
     /// server, a host or the test harness).
     fn is_client_side(&self) -> bool {

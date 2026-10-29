@@ -17,13 +17,15 @@ world fixture.
 The mixed-channel cell oracle runs `bun ae2-cell-core/tests/oracle/run-mixed-cell-oracle.ts`
 with `AE2_REFERENCE` set to the pinned reference checkout. It extracts the
 actual `BasicCellInventory.getCellItems`, `loadCellItems`, `getAvailableStacks`,
-`extract`, `saveChanges` and capacity-accounting methods into a small Java
+`extract`, `innerInsert`, `saveChanges`, `persist` and capacity-accounting methods into a small Java
 stub. It checks that stored item and fluid keys are both exposed, a simulated
 foreign-channel extraction is nonmutating, committed extraction preserves the
 other key and remainder, and an overfilled 1K cell remains extractable. It also
 checks duplicate-key last-write behavior, the source's initial list accounting
-and post-mutation map recount, and zero/negative entry behavior; the native
-cell decoder does not yet support those cases.
+and post-mutation map recount, including an overfilled cell whose zero-accepted
+insert still triggers a recount. After persistence, positive duplicate contents
+agree between the mounted and reloaded views, while zero/negative entries can
+make those views differ. The native cell decoder does not yet support those cases.
 The stub models only the key, counter, primitive-map and save hooks used by
 those methods; it is not an AE2 game instance. Compilation occurs in a
 system temporary directory.

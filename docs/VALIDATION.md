@@ -1,19 +1,19 @@
 # Native validation checkpoint
 
-The latest completed host gate recorded here is Wave 16c on macOS / Apple M3 Pro. The source target is AE2 19.2.18 at `db17504a86128fdf3dae31f5fb7a112a646e0b93`; the engine target is Horizon / Minecraft 26.3 at `7f8a6680a88f36a3c4a499f821862c447b72ce3f`.
+The latest completed host gate recorded here is Wave 17g on macOS / Apple M3 Pro. The source target is AE2 19.2.18 at `db17504a86128fdf3dae31f5fb7a112a646e0b93`; the engine target is Horizon / Minecraft 26.3 at `7f8a6680a88f36a3c4a499f821862c447b72ce3f`.
 
 This is bounded evidence, not certification of full AE2, Java-world or ATM10 compatibility. Later working-tree changes need their own gate. The parity ledgers distinguish implementation, named tests and remaining work.
 
 ## Reproducible inputs
 
-- Client binary SHA-256: `3411bc9a7a66a9a818220416e89897aa8061bd59fb59f32e7d0486fa9c9dc784`.
-- Frozen source archive SHA-256: `2397719e8c8402c0dddeaad83dbc3901e99fa4bbb5c0069cdd35888a27d4baae`.
+- Client binary SHA-256: `cdffc01040a2e926e6cbd795f618c1bbccbe49b89e0f5978988118f7f5d57774`.
+- Frozen source archive SHA-256: `108e2eb669a1c12e7bab59ba28b69c7307249c4157b6640abfa79f90a5ca9f9b`.
 - Rust 1.95.0, locked dependencies, `fast` profile, `horizon-client`, default features disabled, `ae2-lab` enabled.
 - Runtime content generated locally from the pinned source and owned Minecraft resources. Prepared assets, saves and binaries are excluded from the repository.
 
 ## Automated checks
 
-The Wave 16c full gate passed 1,336 library tests and 451 client-host tests, with 32 and three prerequisite/manual tests ignored. Its AE2-named subsets contain 110 and 324 passing tests. The three AE2 registry/resource checks passed separately with their prerequisites on Wave 12. Earlier wrapped-stack and standalone crafting-core gates passed seven and 83 tests respectively; their dates and later focused checks are recorded below.
+The Wave 17 cohort passed 1,341 library tests (32 ignored) and 459 client-host tests (three ignored). The library gate ran on 17d; the subsequent 17e–17g fixes affect only the client-host modules and their tests. The final client-host gate ran on 17g. Their AE2-named subsets contain 113 and 332 passes. Sixteen live cell-core tests passed separately. The three resource-backed Formation/shape/context checks passed with the actual prepared resources; resource absence was not counted as a pass. Earlier source registry and crafting-core checks retain their separate checkpoint scope below.
 
 Actual pinned Java tree classes compiled against test-only host stubs agree with the native byte-accounting cases, including cake (68 bytes), reusable containers (34), crafted substitutes, source-greedy shortages, and four 10,000-push cases (60,016 or 70,016 bytes). These stubs do not represent a running Java game. Separate source oracles cover pathing on 128 synthetic graphs, stored-energy numeric boundaries, and seven actual QuantumCluster/Locatables readiness, pairing and unload/reload states.
 
@@ -92,3 +92,28 @@ Eleven named hidden worlds passed on the current runtime: physical menu/terminal
 The first broad gate exposed sparse test registries lacking real CUSTOM_DATA ID 0 and a numerical source-pattern test with fewer than the now-required nine slots. Those fixtures were corrected. Two crash-stack assertions assumed line tables although fast inherits release with none: they now assert the actual originating function in every profile and additionally require the source location in development builds. All full suites then passed. These corrections are test-only: the 16, 16b and 16c native binaries have identical SHA-256, so the existing physical runs test the exact runtime bytes. Both earlier source archives remain retained by their own hashes locally.
 
 General Formation placement, mixed-channel/overfilled source cells, recipe-aware machine filters and complete local wireless lifecycle remain ongoing source-port work. New Java-method comparison helpers may document those requirements before their native implementations pass a gate.
+
+
+## Wave 17: mixed source cells, placement transactions and repository clicks
+
+The final native binary/source hashes appear above. Patch SHA-256 is `276b0e9e214863d8c313772b61c56671fc316a0f05677c272adfd8cf0aaab55f` against `747e4823632bb7a4d7a264612b29b603ed901288`. Production Rust/TOML/lock files, including newly added files, were checked against the archived build inputs before publication.
+
+This cohort has **24 distinct passing fixture/mode combinations** across three immutable builds. It is not a claim that every fixture ran on one binary:
+
+| Build | Binary SHA-256 | Physical scope |
+| --- | --- | --- |
+| 17e | `e90f5d25b7463ad06feef36a86509ca237598c6944f6c4662cef176d0a1f2b10` | Fifteen selected worlds passed, plus four in-frame menu worlds. The broader mixed-cell server case exposed the prediction/portable defects corrected below. |
+| 17f | `7d370e0e752f37369ae2adc6feb1fbc709544f43108e8b012073f1a5c454e49c` | Repository prediction, local machine menus, physical menu ownership and fake/physical drag custody passed. Mixed-cell server advanced to the portable queued-click defect. |
+| 17g | `cdffc01040a2e926e6cbd795f618c1bbccbe49b89e0f5978988118f7f5d57774` | Mixed-cell server menus, held-server authoritative portable rapid clicks and repository prediction all passed, with exact custody and restart. |
+
+The named storage cases recover unavailable items from a fluid cell, preserve positive foreign-channel contents, extract from an overfilled source cell without accepting more input, and let an I/O Port transfer an item past blocked water. ME Chest exposes both channels; a portable menu hides foreign keys while retaining them physically. The Inscriber rejects unrelated input and honors partial recipes/Name Presses. The Assembler uses its named current recipe, source substitution rules and extract-only output; a forced plan retains its definition and executes with real substitute input. Corrected in-frame hotkeys select the source-ranked cell without requiring it in the selected slot.
+
+Formation now stages real native BlockItem placement, imports item block state and block-entity components before `setPlacedBy`, and commits or discards the physical changes together. Hidden worlds place a charged/styled Energy Cell, a nested shulker with lock/name, an oriented Monitor, torch, seed and both door halves; the corresponding custody and restart assertions passed. A held-server TNT circuit verifies that preview does not publish or duplicate its neighbor-triggered priming event. Native fluid placement covers water, flowing lava, waterlogging (including an already-wet slab), component rejection, source filters, power loss, exact 1,377→1,000+377 mB I/O custody, empty legacy patches, Nether evaporation and restart. Normal player chest/Monitor orientation, energy-cell wrench recovery and hive item-state/bee placement passed too.
+
+Server virtual clicks now retain bounded visible-key history, so an unrelated state update does not discard an ordered action while changed key mappings still reject it. The server identifies repository slots per window; those slots do not receive vanilla physical slot/cursor prediction or physical drag/double-click handling. Separate held-server before/after worlds check authoritative cell contents, not just predicted client icons. Physical cells, upgrades, encoding ghosts and machine ownership remain on their respective existing routes.
+
+The first gate exposed two test assumptions: source cell loading preserves an already-stored nonempty nested cell even though insertion rejects it, and the Assembler test catalog required its loot-table directory. Those were corrected without a native behavior change. Hotkey options needed their actual data-version header. A flowing-lava fixture also needed freeze restored after restart and neighboring fixture water cleared before checking its transient state; the unchanged 17d binary then passed. The menu failures were actual production defects and received the separate 17e–17g fixes.
+
+Scoped Java-method oracles cover five currently implemented mixed/overfilled-cell cases plus pending duplicate/nonpositive requirements, four I/O transfer cases, and seven pattern-validation/assembly cases. New CPU-completion and Armor Stand source oracles document further requirements against explicit host stubs; they do not establish native gameplay. The world runner lists unverified or failing follow-ons as explicitly selectable pending suites, excluded from its default checkpoint run.
+
+**Remaining:** cross-dimension Formation execution, successful non-BlockItem `useOn` adapters and golem/Wither callbacks; source CPU finish/cancel/idle-inventory behavior; wireless/portable lifecycle and source crafting/fluid gestures; duplicate/nonpositive cell edge cases and other ledger items. The hidden before-cases reproduce remote Quantum-plane rejection, blocked-fluid CPU completion withholding the independent item output, and the old shift-click crafting shortcut. Full AE2 and ATM10 compatibility remain unfinished.

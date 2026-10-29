@@ -117,7 +117,7 @@ pub enum Ae2MutationKind {
     ProviderRawRead { node: ae2_network_core::NodeIdentity, snapshot: Ae2ProviderSnapshot },
 }
 #[cfg(feature = "ae2-lab")]
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Ae2Journal { entries: Vec<Ae2Mutation>, overflowed: bool, clock: Option<std::sync::Arc<std::sync::atomic::AtomicU64>> }
 
 /// What a block state's block entity does each tick (`BlockState.getTicker`).
@@ -246,6 +246,34 @@ pub fn chunk_map_order(positions: impl IntoIterator<Item = Pos>) -> Vec<Pos> {
 }
 
 impl BlockEntities {
+    pub fn placement_snapshot(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            incarnations: self.incarnations.clone(),
+            tickers: self.tickers.clone(),
+            live: self.live.clone(),
+            added: self.added.clone(),
+            pending: self.pending.clone(),
+            out: self.out.clone(),
+            states: self.states.clone(),
+            next_slot: self.next_slot, freed: self.freed,
+            #[cfg(feature="ae2-lab")]
+            vanilla_metadata: self.vanilla_metadata.clone(),
+            #[cfg(feature="ae2-lab")]
+            vanilla_loaded_metadata: self.vanilla_loaded_metadata.clone(),
+            #[cfg(feature="ae2-lab")]
+            ae2_taken: self.ae2_taken.clone(),
+            #[cfg(feature="ae2-lab")]
+            ae2_loaded_provider_inventory: self.ae2_loaded_provider_inventory.clone(),
+            #[cfg(feature="ae2-lab")]
+            ae2_loaded_cpu_core: self.ae2_loaded_cpu_core.clone(),
+            #[cfg(feature="ae2-lab")]
+            ae2_journal: std::sync::Mutex::new(self.ae2_journal.lock().expect("AE2 journal poisoned").clone()),
+            #[cfg(feature="ae2-lab")]
+            ae2_journal_active: std::sync::atomic::AtomicBool::new(self.ae2_journal_active.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
+
     #[cfg(feature = "ae2-lab")]
     fn record_ae2(&self, position: Pos, kind: Ae2MutationKind) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -518,6 +546,48 @@ impl BlockEntities {
             self.add(pos);
         }
         old
+    }
+    /// Import an item into the just-constructed block entity without replacing
+    /// the live object or its ticking slot/physical incarnation. The decoded
+    /// data must describe the same block-entity type that was constructed.
+    pub fn import_placed_in_place(&mut self, pos: Pos, entity: BlockEntity) -> Result<(), &'static str> {
+        let current=self.map.get_mut(&pos).ok_or("placed block entity disappeared")?;
+        if std::mem::discriminant(&*current)!=std::mem::discriminant(&entity) {
+            return Err("placed block entity type changed");
+        }
+        #[cfg(feature = "ae2-lab")]
+        if let (BlockEntity::Ae2(old),BlockEntity::Ae2(new))=(&*current,&entity) {
+            if old.kind!=new.kind {return Err("placed AE2 machine type changed");}
+        }
+        *current=entity;
+        Ok(())
+    }
+    /// Update the still-pending construction record after item data has been
+    /// loaded into that same object. Source `onReady` has not fired yet; its
+    /// observers must see the imported provider/CPU data and physical energy.
+    /// None means this is not an AE2 entity or journaling is disabled. A false
+    /// result means the Added record has already escaped or overflowed and the
+    /// caller must not continue relying on the ordered observer as authoritative.
+    #[cfg(feature = "ae2-lab")]
+    pub fn refresh_pending_placed_ae2(&self, pos: Pos, raw: Option<&horizon_world::nbt::Tag>) -> Option<bool> {
+        if !self.ae2_journal_enabled() {return None;}
+        let BlockEntity::Ae2(machine)=self.map.get(&pos)? else {return None};
+        let incarnation=match self.incarnation(&pos) {Some(id)=>id,None=>return Some(false)};
+        let kind=machine.kind;
+        let entity=BlockEntity::Ae2(machine.clone());
+        let mut journal=self.ae2_journal.lock().unwrap_or_else(|error|error.into_inner());
+        if journal.overflowed {return Some(false);}
+        let Some(event)=journal.entries.iter_mut().rev().find(|event|event.position==pos && matches!(
+            &event.kind,Ae2MutationKind::EntityAdded{incarnation:id,..} if *id==incarnation)) else {return Some(false)};
+        let Ae2MutationKind::EntityAdded {entity: initial, provider_inventory, cpu_core, ..}=&mut event.kind else {unreachable!()};
+        *initial=entity;
+        if let Some(raw)=raw {
+            if kind==crate::ae2_world::MachineKind::PatternProvider {
+                *provider_inventory=Ae2ProviderInitialInventory::Saved(raw.get("Items").cloned());
+            }
+            if ae2_cpu_kind(kind) { *cpu_core=Ae2CpuInitialCore::Saved(raw.get("core").cloned()); }
+        }
+        Some(true)
     }
     /// A command's decoded replacement carries loaded inventory/core state,
     /// unlike a freshly constructed entity. Keep the replacement's remove/add
@@ -944,6 +1014,44 @@ mod tests {
         assert!(matches!(&events[0].kind,Ae2MutationKind::EntityRemoved{incarnation,..} if *incarnation==old));
         assert!(matches!(&events[1].kind,Ae2MutationKind::EntityAdded{incarnation,provider_inventory:Ae2ProviderInitialInventory::Saved(Some(Tag::List(items))),..} if *incarnation==next&&items.is_empty()));
         assert!(events[0].sequence<events[1].sequence);
+    }
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn placed_item_import_keeps_incarnation_and_updates_pending_ready_data() {
+        use crate::ae2_world::{Machine,MachineKind};
+        use crate::items::ItemStack;
+        use horizon_world::nbt::Tag;
+        let mut entities=level();entities.start_ae2_journal();
+        let provider=(1,64,2);let cpu=(2,64,2);let energy=(3,64,2);
+        for (pos,kind) in [(provider,MachineKind::PatternProvider),(cpu,MachineKind::CraftingStorage1k),(energy,MachineKind::EnergyCell)] {
+            entities.insert(pos,BlockEntity::Ae2(Box::new(Machine::new(kind))));
+        }
+        let identities=[provider,cpu,energy].map(|pos|entities.incarnation(&pos).unwrap());
+        let mut imported=Machine::new(MachineKind::PatternProvider);
+        imported.slots[0]=Some(ItemStack::new("ae2:encoded_pattern",1));
+        imported.config.insert("priority".into(),Tag::Int(17));
+        let items=crate::save::encode_items(&imported.slots);
+        let provider_raw=Tag::compound([("Items",items.clone())]);
+        entities.import_placed_in_place(provider,BlockEntity::Ae2(Box::new(imported.clone()))).unwrap();
+        assert_eq!(entities.refresh_pending_placed_ae2(provider,Some(&provider_raw)),Some(true));
+        let mut imported_cpu=Machine::new(MachineKind::CraftingStorage1k);
+        imported_cpu.config.insert("core".into(),Tag::Byte(1));
+        let cpu_raw=Tag::compound([("core",Tag::Byte(1))]);
+        entities.import_placed_in_place(cpu,BlockEntity::Ae2(Box::new(imported_cpu))).unwrap();
+        assert_eq!(entities.refresh_pending_placed_ae2(cpu,Some(&cpu_raw)),Some(true));
+        if let Some(BlockEntity::Ae2(machine))=entities.get_mut(&energy) {machine.energy=1234.0;}
+        assert_eq!(entities.refresh_pending_placed_ae2(energy,None),Some(true));
+        assert_eq!([provider,cpu,energy].map(|pos|entities.incarnation(&pos).unwrap()),identities);
+        let events=entities.take_ae2_mutations().unwrap();
+        assert_eq!(events.len(),3,"imports do not emit remove/add pairs");
+        assert!(events.windows(2).all(|pair|pair[0].sequence<pair[1].sequence));
+        assert!(matches!(&events[0].kind,Ae2MutationKind::EntityAdded {incarnation,entity:BlockEntity::Ae2(machine),provider_inventory:Ae2ProviderInitialInventory::Saved(Some(raw)),..}
+            if *incarnation==identities[0] && machine.slots==imported.slots && machine.config.get(&"priority".into())==Some(&Tag::Int(17)) && raw==&items));
+        assert!(matches!(&events[1].kind,Ae2MutationKind::EntityAdded {incarnation,cpu_core:Ae2CpuInitialCore::Saved(Some(Tag::Byte(1))),..} if *incarnation==identities[1]));
+        assert!(matches!(&events[2].kind,Ae2MutationKind::EntityAdded {incarnation,entity:BlockEntity::Ae2(machine),..} if *incarnation==identities[2] && machine.energy==1234.0));
+        assert_eq!(entities.refresh_pending_placed_ae2(provider,Some(&provider_raw)),Some(false),"a drained Added cannot be rewritten");
+        assert!(entities.import_placed_in_place(provider,BlockEntity::Ae2(Box::new(Machine::new(MachineKind::EnergyCell)))).is_err());
+        assert_eq!(entities.incarnation(&provider),Some(identities[0]));
     }
     #[cfg(feature = "ae2-lab")]
     #[test]

@@ -13,3 +13,23 @@ a running AE2 installation. Fluid primary-key behavior follows
 `KeyCounter.getSubIndex` and `VariantCounter.UnorderedVariantMap.findFuzzy`
 and is separately exercised by the Rust cell tests and the prepared physical
 world fixture.
+
+The mixed-channel cell oracle runs `bun ae2-cell-core/tests/oracle/run-mixed-cell-oracle.ts`
+with `AE2_REFERENCE` set to the pinned reference checkout. It extracts the
+actual `BasicCellInventory.getCellItems`, `loadCellItems`, `getAvailableStacks`,
+`extract`, `saveChanges` and capacity-accounting methods into a small Java
+stub. It checks that stored item and fluid keys are both exposed, a simulated
+foreign-channel extraction is nonmutating, committed extraction preserves the
+other key and remainder, and an overfilled 1K cell remains extractable. It also
+checks duplicate-key last-write behavior, the source's initial list accounting
+and post-mutation map recount, and zero/negative entry behavior; the native
+cell decoder does not yet support those cases.
+The stub models only the key, counter, primitive-map and save hooks used by
+those methods; it is not an AE2 game instance. Compilation occurs in a
+system temporary directory.
+
+`run-io-port-oracle.ts` extracts the pinned `IOPortBlockEntity.transferContents`
+method into scoped storage/grid stubs. It verifies that a blocked fluid does
+not block a later item, and that a later 1,000 mB transfer uses eight fluid
+operations and preserves custody. It requires the same `AE2_REFERENCE` and JDK;
+all compiled classes stay in a temporary directory.

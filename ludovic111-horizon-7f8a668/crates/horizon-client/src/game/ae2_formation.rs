@@ -42,10 +42,7 @@ pub(super) fn accepted(count: usize, limit: i32, requested: u64, max_stack: u32)
     requested.min(u64::from(max_stack)) as u32
 }
 pub(super) fn max_stack(stack: &ItemStack, item_default: u32) -> u32 {
-    if let Some(horizon_world::nbt::Tag::Int(n)) = stack.data().and_then(|d| d.other("minecraft:max_stack_size")) {
-        return (*n).clamp(1,99) as u32;
-    }
-    item_default
+    horizon_client::items::stack_max_with_default(stack,item_default)
 }
 pub(super) fn spawn_position(host: (i32, i32, i32), direction: [i32; 3], random: [f32; 3]) -> [f64; 3] {
     let horizontal = |i: usize| if direction[i] == 0 { f64::from(random[i]) * 0.75 - 0.375 }

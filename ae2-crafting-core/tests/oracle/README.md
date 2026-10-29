@@ -56,3 +56,11 @@ AE2_REFERENCE=/path/to/ae2-reference bun ae2-crafting-core/tests/oracle/run-item
 The assembler runner extracts the actual pinned default methods from `IPatternDetails` and `IMolecularAssemblerSupportedPattern`, `AECraftingPattern.fillCraftingGrid`, and `MolecularAssemblerBlockEntity.pushPattern`/`fillGrid`. Minimal item and fluid counter stubs establish that assembler-supported patterns reject generic targets, ordinary one-item inputs are saved, and non-unit inputs throw after partially filling the assembler while leaving excess input in the passed table. The native host deliberately retains its escrow instead of reproducing that partial mutation. These tests do not model Minecraft's exception handling, a full grid, persistence or a running assembler.
 
 The item-drop runner extracts `AEItemKey.addDrops` with minimal item/list stubs. It verifies the 1,001-stack boundary, a preexisting wrench-part entry sharing that limit, and the fresh list used for each CPU inventory key. `AEBaseEntityBlock.onRemove`, `CableBusContainer.addPartDrops`/`addAdditionalDrops`, `CableBusBlockEntity.disassembleWithWrench`, and `CraftingBlockEntity.breakCluster` define the list contexts separately; the stubs do not reproduce loot generation or item entities. The copied method is LGPL-3.0-or-later and is compiled only in a temporary directory.
+
+The pattern assembly runner extracts `AECraftingPattern.isItemValid` and `assemble` from the pinned source:
+
+```sh
+AE2_REFERENCE=/path/to/ae2-reference bun ae2-crafting-core/tests/oracle/run-pattern-assembly-oracle.ts
+```
+
+Its minimal positioned-grid and recipe stubs check individual substitutions, two independently valid alternatives whose combined grid no longer matches, the encoded recipe's original output, a shifted frame, strict substitution rejection, and dynamic special-recipe assembly. It does not model Minecraft's complete recipes, fluid containers, remainders, inventory, or world. Source methods are copied only to a temporary directory for compilation.

@@ -710,6 +710,8 @@ impl Game<'_> {
             #[cfg(feature = "ae2-lab")]
             if self.ae2_local_bus_open() {v["title"]=json!([{ "text": self.ae2_local_bus_title() }]);}
             #[cfg(feature = "ae2-lab")]
+            if self.ae2_local_pattern_access_open() {v["title"]=json!([{ "text": "AE2 Pattern Access" }]);}
+            #[cfg(feature = "ae2-lab")]
             if self.ae2_terminal_open() {
                 v["title"] = json!([{ "text": if self.ae2_local_crafting_terminal_open() {"AE2 Crafting Terminal"} else {"AE2 ME Terminal"} }]);
             }
@@ -728,7 +730,7 @@ impl Game<'_> {
             }
             #[cfg(feature = "ae2-lab")]
             if self.ae2_pattern_access_screen() {
-                v["pattern_layout"]=self.remote.as_ref().and_then(|r|r.ae2_pattern_layout.clone()).unwrap_or(serde_json::Value::Null);
+                v["pattern_layout"]=self.ae2_pattern_access_layout().unwrap_or(serde_json::Value::Null);
             }
             v["slot_ids"] = json!(
                 "0-8 hotbar, 9-35 inventory, 100+ crafting grid (row-major), 200 crafting result, 300+ container, 500-503 armor, 504 offhand, 600+ station"

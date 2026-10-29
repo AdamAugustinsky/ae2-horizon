@@ -1256,7 +1256,7 @@ impl Menu {
     // ---- item helpers ----
 
     fn max_stack(env: &Env, stack: &ItemStack) -> u32 {
-        env.items.get(&stack.item).map_or(64, |i| i.max_stack)
+        env.items.stack_max(stack)
     }
 
     fn damageable(env: &Env, stack: &ItemStack) -> bool {

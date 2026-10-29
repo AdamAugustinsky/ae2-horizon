@@ -5120,7 +5120,7 @@ impl Game<'_> {
     /// when none is open).
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_focused(&self) -> bool {
-        self.ae2_local_energy_focused() || self.ae2_local_machine_editor_focused() || self.ae2_local_priority_focused() || self.ae2_local_craft_focused() || self.ae2_local_terminal_search_focused() || self.screen == Screen::Inventory
+        self.ae2_local_pattern_access_search_focused() || self.ae2_local_energy_focused() || self.ae2_local_machine_editor_focused() || self.ae2_local_priority_focused() || self.ae2_local_craft_focused() || self.ae2_local_terminal_search_focused() || self.screen == Screen::Inventory
             && self
                 .remote
                 .as_ref()
@@ -5133,6 +5133,7 @@ impl Game<'_> {
         text: Option<&str>,
         key: Option<winit::keyboard::KeyCode>,
     ) {
+        if self.ae2_local_pattern_access_search_focused() {self.ae2_local_pattern_access_search_input(text,key);return;}
         if self.ae2_local_energy_focused() {self.ae2_local_energy_input(text,key);return;}
         if self.ae2_local_machine_editor_focused() {self.ae2_local_machine_editor_input(text,key);return;}
         if self.ae2_local_priority_focused() {
@@ -5190,6 +5191,7 @@ impl Game<'_> {
         &mut self,
         shortcut: horizon_client::clipboard::EditShortcut,
     ) {
+        if self.ae2_local_pattern_access_search_focused() {self.ae2_local_pattern_access_search_shortcut(shortcut);return;}
         if self.ae2_local_energy_focused() {self.ae2_local_energy_shortcut(shortcut);return;}
         if self.ae2_local_machine_editor_focused() {self.ae2_local_machine_editor_shortcut(shortcut);return;}
         if self.ae2_local_priority_focused() {
@@ -5216,6 +5218,7 @@ impl Game<'_> {
     }
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_click(&mut self, ox: f32, oy: f32, right: bool) -> bool {
+        if self.ae2_local_pattern_access_open() {return self.ae2_local_pattern_access_search_click(ox,oy,right);}
         if self.ae2_local_energy.is_some() {return self.ae2_local_energy_click_field(ox,oy,right);}
         if self.ae2_local_machine_editor_open() {return self.ae2_local_machine_editor_click_field(ox,oy,right);}
         if self.ae2_local_provider_priority_open() {
@@ -5246,6 +5249,7 @@ impl Game<'_> {
     }
     #[cfg(feature = "ae2-lab")]
     pub(super) fn ae2_search_draw(&self, batch: &mut HudBatch, ox: f32, oy: f32) {
+        if self.ae2_local_pattern_access_open() {self.ae2_local_pattern_access_search_draw(batch,ox,oy);return;}
         if self.ae2_local_energy.is_some() {self.ae2_local_energy_draw(batch,ox,oy);return;}
         if self.ae2_local_machine_editor_open() {self.ae2_local_machine_editor_draw(batch,ox,oy);return;}
         if self.ae2_local_provider_priority_open() {
@@ -5396,6 +5400,7 @@ impl Game<'_> {
     #[cfg(feature = "ae2-lab")]
     pub(super) fn remote_pattern_access_control(&mut self,action:i16)->bool {
         if !matches!(action,-10|-11|-12) || !self.ae2_pattern_access_screen() {return false;}
+        if self.ae2_local_pattern_access_open(){return self.ae2_local_pattern_access_control(action);}
         let (window,_)=self.remote_menu();
         self.send_clicks(window,vec![(action,0,Input::Pickup,Vec::new(),self.carried.clone())],false);true
     }

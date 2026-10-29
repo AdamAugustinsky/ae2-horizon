@@ -142,10 +142,7 @@ impl Containers<'_> {
         self.registry.state(state).map_or("", |s| s.name.as_str())
     }
     fn max_stack(&self, stack: &ItemStack) -> u32 {
-        self.items
-            .get(&stack.item)
-            .map_or(64, |i| i.max_stack)
-            .max(1)
+        self.items.stack_max(stack)
     }
     /// `HopperBlockEntity.getBlockContainer` (double chests combined, right half
     /// first). `blocked_chests`: `ChestBlock.getContainer(.., false)` returns

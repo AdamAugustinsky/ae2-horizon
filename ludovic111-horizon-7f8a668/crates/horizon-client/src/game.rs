@@ -1685,6 +1685,8 @@ struct Game<'a> {
     #[cfg(feature = "ae2-lab")]
     ae2_local_bus: Option<ae2_bus_ui::GuestBus>,
     #[cfg(feature = "ae2-lab")]
+    ae2_local_pattern_access: Option<ae2_pattern_access::LocalPatternAccess>,
+    #[cfg(feature = "ae2-lab")]
     ae2_local_energy: Option<horizon_client::ui::EditBox>,
     #[cfg(feature = "ae2-lab")]
     ae2_local_terminal: Option<ae2_terminal::LocalTerminalSession>,
@@ -2395,11 +2397,7 @@ impl Game<'_> {
     }
     /// Inventory.add: returns the stack that did not fit.
     fn give(&mut self, mut stack: ItemStack) -> Option<ItemStack> {
-        let max = self
-            .res
-            .items()
-            .get(&stack.item)
-            .map_or(64, |i| i.max_stack);
+        let max = self.res.items().stack_max(&stack);
         // Prefer the selected slot, then the hotbar, then the main inventory.
         let order: Vec<usize> = std::iter::once(self.selected)
             .chain((0..36).filter(|&i| i != self.selected))
@@ -2694,13 +2692,7 @@ impl Game<'_> {
         let mut removed = vec![false; items.len()];
         let mut cells = horizon_client::entities::ItemCells::new(&items);
         let catalog = self.res.items();
-        let max_stack = |stack: &ItemStack| {
-            let item_default=catalog.get(&stack.item).map_or(64,|i|i.max_stack).max(1);
-            match stack.data().and_then(|data|data.other("minecraft:max_stack_size")) {
-                Some(horizon_world::nbt::Tag::Int(value))=>(*value).clamp(1,99) as u32,
-                _=>item_default,
-            }
-        };
+        let max_stack = |stack: &ItemStack| catalog.stack_max(stack);
         // A LAN or server guest only shows the host's items.
         let merging = self.remote.is_none();
         for i in 0..items.len() {
@@ -4151,6 +4143,12 @@ impl Game<'_> {
             if !held.as_ref().is_some_and(|s|matches!(s.item.as_ref(),"ae2:entropy_manipulator"|"ae2:color_applicator"))
                 && self.ae2_ensure_machine((hit.pos[0],hit.pos[1],hit.pos[2]))
                 && self.ae2_open_local_bus((hit.pos[0],hit.pos[1],hit.pos[2]),hit.face) {
+                self.swing_arm();return Ok(true);
+            }
+            #[cfg(feature = "ae2-lab")]
+            if !held.as_ref().is_some_and(|s|matches!(s.item.as_ref(),"ae2:entropy_manipulator"|"ae2:color_applicator"))
+                && self.ae2_ensure_machine((hit.pos[0],hit.pos[1],hit.pos[2]))
+                && self.ae2_open_local_pattern_access((hit.pos[0],hit.pos[1],hit.pos[2]),hit.face) {
                 self.swing_arm();return Ok(true);
             }
             #[cfg(feature = "ae2-lab")]
@@ -5659,7 +5657,7 @@ impl Game<'_> {
             if !(slot<36 || (327..=335).contains(&slot)) {return false;}
             let Some(carried)=self.carried.clone() else{return false;};
             if ty!=2 && carried.count as usize<=dragged {return false;}
-            let max=self.res.items().get(&carried.item).map_or(64,|v|v.max_stack).max(1);
+            let max=self.res.items().stack_max(&carried);
             return self.slot_view(slot).is_none_or(|item|item.same_item_same_components(&carried) && item.count<max);
         }
         #[cfg(feature="ae2-lab")]
@@ -5669,7 +5667,7 @@ impl Game<'_> {
                 let Some(carried) = self.carried.clone() else { return false; };
                 if !horizon_client::ae2_network_tool::is_card(&carried.item)
                     || (ty != 2 && carried.count as usize <= dragged) { return false; }
-                let max = self.res.items().get(&carried.item).map_or(64, |i| i.max_stack).max(1);
+                let max = self.res.items().stack_max(&carried);
                 return self.slot_view(slot).is_none_or(|s|
                     s.same_item_same_components(&carried) && s.count < max);
             }
@@ -6020,7 +6018,7 @@ impl Game<'_> {
     #[cfg(feature="ae2-lab")]
     fn ae2_craft_screen(&self)->u8 {self.remote.as_ref().map_or_else(||self.ae2_local_craft_screen(),|r|r.ae2_craft_screen)}
     #[cfg(feature="ae2-lab")]
-    fn ae2_pattern_access_screen(&self)->bool {self.remote.as_ref().is_some_and(|r|r.ae2_pattern_access_screen)}
+    fn ae2_pattern_access_screen(&self)->bool {self.ae2_local_pattern_access_open() || self.remote.as_ref().is_some_and(|r|r.ae2_pattern_access_screen)}
     fn screen_batch(&self, size: [u32; 2]) -> HudBatch {
         let mut batch = HudBatch::new(size);
         #[cfg(feature="ae2-lab")]
@@ -6070,7 +6068,7 @@ impl Game<'_> {
         #[cfg(feature="ae2-lab")]
         if self.ae2_pattern_access_screen() {
             let mut slots:Vec<usize>=(0..36).collect();
-            if let Some(rows)=self.remote.as_ref().and_then(|r|r.ae2_pattern_layout.as_ref()).and_then(|v|v.get("rows")).and_then(|v|v.as_array()) {
+            if let Some(rows)=self.ae2_pattern_access_layout().as_ref().and_then(|v|v.get("rows")).and_then(|v|v.as_array()) {
                 for (line,row) in rows.iter().take(6).enumerate() {
                     if row.get("kind").and_then(|v|v.as_str())==Some("provider") {slots.extend(300+line*9..309+line*9);}
                 }
@@ -6337,6 +6335,8 @@ impl Game<'_> {
         if self.ae2_local_machine_open() && (300..327).contains(&i) {return self.ae2_local_machine_slot_view(i);}
         #[cfg(feature = "ae2-lab")]
         if self.ae2_local_bus_open() && (300..354).contains(&i) {return self.ae2_local_bus_slot_view(i);}
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_pattern_access_open() && (300..354).contains(&i) {return self.ae2_local_pattern_access_slot_view(i);}
         #[cfg(feature="ae2-lab")]
         if (365..374).contains(&i) {return self.remote.as_ref().and_then(|r|r.ae2_terminal_toolbox.as_ref()).and_then(|(_, slots)|slots.get(i-365)).cloned().flatten();}
         #[cfg(feature="ae2-lab")]
@@ -6608,7 +6608,7 @@ impl Game<'_> {
         #[cfg(feature = "ae2-lab")]
         let local_machine_items=self.ae2_local_machine_close();
         #[cfg(feature = "ae2-lab")]
-        {self.ae2_local_bus=None;self.ae2_local_energy=None;}
+        {self.ae2_local_bus=None;self.ae2_local_energy=None;self.ae2_local_pattern_access=None;}
         #[cfg(feature = "ae2-lab")]
         self.ae2_portable_close();
         self.reset_inventory_clicks();
@@ -6725,7 +6725,7 @@ impl Game<'_> {
         let first = self.creative_screen.first_row(&self.pack.names);
         let shown = items.get(first * 9 + slot - Creative::DISPLAY);
         let catalog = self.res.items();
-        let max = |s: &ItemStack| catalog.get(&s.item).map_or(64, |i| i.max_stack);
+        let max = |s: &ItemStack| catalog.stack_max(s);
         match click_display(&mut self.carried, shown, max, button, input) {
             DisplayClick::Hotbar(i, stack) => self.inventory[i] = Some(stack),
             DisplayClick::Drop(stack) => self.player_drop(stack),
@@ -6760,6 +6760,11 @@ impl Game<'_> {
         #[cfg(feature = "ae2-lab")]
         if self.ae2_local_bus_open() {
             for &(slot,button,input) in ops {self.ae2_local_bus_click(slot,button,input);}
+            return true;
+        }
+        #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_pattern_access_open() {
+            for &(slot,button,input) in ops {self.ae2_local_pattern_access_click(slot,button,input);}
             return true;
         }
         if self.remote.is_some() && self.screen == Screen::Inventory {
@@ -7457,7 +7462,7 @@ impl Game<'_> {
                     return;
                 }
                 #[cfg(feature = "ae2-lab")]
-                if self.ae2_local_terminal_open() || self.ae2_local_provider_open() || self.ae2_local_machine_open() || self.ae2_local_bus_open() || self.ae2_portable_open() {
+                if self.ae2_local_terminal_open() || self.ae2_local_provider_open() || self.ae2_local_machine_open() || self.ae2_local_bus_open() || self.ae2_local_pattern_access_open() || self.ae2_portable_open() {
                     self.last_inv_click=None;
                     self.inv_clicks.skip_release();
                     return;
@@ -7838,7 +7843,7 @@ impl Game<'_> {
         };
         let batch = self.screen_batch(size);
         #[cfg(feature = "ae2-lab")]
-        if self.ae2_local_provider_priority_open() || self.ae2_local_machine_editor_open() || self.ae2_local_energy.is_some() || self.ae2_local_craft_screen()==1 || self.ae2_terminal_open() {
+        if self.ae2_local_provider_priority_open() || self.ae2_local_machine_editor_open() || self.ae2_local_energy.is_some() || self.ae2_local_pattern_access_open() || self.ae2_local_craft_screen()==1 || self.ae2_terminal_open() {
             let (ox,oy)=self.inventory_origin(&batch);
             if self.ae2_search_click(ox,oy,right) {return;}
         }
@@ -7872,6 +7877,11 @@ impl Game<'_> {
             self.ae2_local_bus_click(Some(slot),i32::from(right),input);return;
         }
         #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_pattern_access_open() {
+            let input=if held_shift {horizon_client::menu::Input::QuickMove}else{horizon_client::menu::Input::Pickup};
+            self.ae2_local_pattern_access_click(Some(slot),i32::from(right),input);return;
+        }
+        #[cfg(feature = "ae2-lab")]
         if self.ae2_terminal_open() || self.ae2_portable_open() {
             let input=if held_shift {horizon_client::menu::Input::QuickMove} else {horizon_client::menu::Input::Pickup};
             self.menu_click(Some(slot),i32::from(right),input);
@@ -7891,7 +7901,7 @@ impl Game<'_> {
         {
             return;
         }
-        let max = |items: &Items, s: &ItemStack| items.get(&s.item).map_or(64, |i| i.max_stack);
+        let max = |items: &Items, s: &ItemStack| items.stack_max(s);
         let shift = held_shift;
         if slot >= 300
             && let Some(key) = self.container
@@ -13680,6 +13690,8 @@ impl<'a> Game<'a> {
             ae2_local_machine: None,
             #[cfg(feature = "ae2-lab")]
             ae2_local_bus: None,
+            #[cfg(feature = "ae2-lab")]
+            ae2_local_pattern_access: None,
             #[cfg(feature = "ae2-lab")]
             ae2_local_energy: None,
             #[cfg(feature = "ae2-lab")]

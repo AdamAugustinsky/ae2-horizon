@@ -1,19 +1,19 @@
 # Native validation checkpoint
 
-The latest completed host gate recorded here is Wave 15 on macOS / Apple M3 Pro. The source target is AE2 19.2.18 at `db17504a86128fdf3dae31f5fb7a112a646e0b93`; the engine target is Horizon / Minecraft 26.3 at `7f8a6680a88f36a3c4a499f821862c447b72ce3f`.
+The latest completed host gate recorded here is Wave 16c on macOS / Apple M3 Pro. The source target is AE2 19.2.18 at `db17504a86128fdf3dae31f5fb7a112a646e0b93`; the engine target is Horizon / Minecraft 26.3 at `7f8a6680a88f36a3c4a499f821862c447b72ce3f`.
 
 This is bounded evidence, not certification of full AE2, Java-world or ATM10 compatibility. Later working-tree changes need their own gate. The parity ledgers distinguish implementation, named tests and remaining work.
 
 ## Reproducible inputs
 
-- Client binary SHA-256: `d9d6f8f5d61b99acd77f1d4096294edfe2f2c9cb6672c7ee8aa9a2f01c322ade`.
-- Frozen source archive SHA-256: `bc816f002fc5c075ab3f98378316b06009bb8a897f4cff4407556792bf25e634`.
+- Client binary SHA-256: `3411bc9a7a66a9a818220416e89897aa8061bd59fb59f32e7d0486fa9c9dc784`.
+- Frozen source archive SHA-256: `2397719e8c8402c0dddeaad83dbc3901e99fa4bbb5c0069cdd35888a27d4baae`.
 - Rust 1.95.0, locked dependencies, `fast` profile, `horizon-client`, default features disabled, `ae2-lab` enabled.
 - Runtime content generated locally from the pinned source and owned Minecraft resources. Prepared assets, saves and binaries are excluded from the repository.
 
 ## Automated checks
 
-The Wave 15 AE2-filtered gate passed 110 library tests and 321 client tests; three library tests were ignored in that default selection and passed separately with their prerequisites on Wave 12. The separately selected wrapped-stack gate passed seven tests, with one resource-dependent test ignored. The standalone crafting core passed 83 tests on Wave 15.
+The Wave 16c full gate passed 1,336 library tests and 451 client-host tests, with 32 and three prerequisite/manual tests ignored. Its AE2-named subsets contain 110 and 324 passing tests. The three AE2 registry/resource checks passed separately with their prerequisites on Wave 12. Earlier wrapped-stack and standalone crafting-core gates passed seven and 83 tests respectively; their dates and later focused checks are recorded below.
 
 Actual pinned Java tree classes compiled against test-only host stubs agree with the native byte-accounting cases, including cake (68 bytes), reusable containers (34), crafted substitutes, source-greedy shortages, and four 10,000-push cases (60,016 or 70,016 bytes). These stubs do not represent a running Java game. Separate source oracles cover pathing on 128 synthetic graphs, stored-energy numeric boundaries, and seven actual QuantumCluster/Locatables readiness, pairing and unload/reload states.
 
@@ -78,3 +78,17 @@ The six immutable-14 before-cases reproduced real defects in per-push mixed inpu
 The CPU-break world now emits 1,001 max-16 stone stacks from a 999,999-item escrow and separately retains all 65 max-8 dirt items after restart. The omitted excess follows the actual source `AEItemKey.addDrops` cutoff. Non-unit patterns calculate source byte counts and retain physical escrow; native preflight deliberately avoids the actual Java assembler's observed partial mutation followed by an exception. This safety difference remains explicit.
 
 Eleven named scenarios passed on Wave 15, with the bus fixture rerun after correcting its virtual gesture: mixed pushes, non-unit pattern custody, large CPU break, real client component round trip, item block-state placement, Pattern Access ownership, emitter fake actions, local bus, local emitter, mixed processing, and the local machine-family regression. Emitter fake actions also passed in-frame. Source fake drags collect slots on movement, so the corrected bus gesture crosses A to B and back to A; physical card drags retain the ordinary A-to-B action. The passing transport case covers its named components; complete original item patches and all physical component stack boundaries remain next-wave work.
+
+## Wave 16c: modeled component retention and physical stack boundaries
+
+The full `horizon-client` library suite passed **1,336 tests** (32 ignored), and the full client-host suite passed **451 tests** (three ignored), using the locked fast profile. The ignored tests retain their source resource/GPU/manual prerequisites; the AE2 registry prerequisites were separately supplied in Wave 12. Binary and source archive hashes appear above; patch SHA-256 is `ab6dd52d1388e035c061395204ee7b521986c54ff0a6ff6a38575232acc1bc2d` against `1f233c62079fc622db8b4b69499043a30a6720c8`.
+
+The v2 local compatibility envelope preserves the full modeled item-component patch, explicit removals, nested modeled stacks and transient map operations, while retaining its v1 reader and escaping colliding custom data. Typed max-stack packets use the ordinary protocol component too. This is Horizon-to-Horizon transport, within the existing network-NBT quota. It preserves data retained by the host model; it does not implement every component's gameplay or a vanilla-client codec. Source-valid extra potion/effect/color, enchantment visibility and book page/filter/resolved data now retain raw payloads while unchanged; baseline tracking prevents a later modeled edit from resurrecting stale data. Supported default/alternate codec shapes normalize to one native item identity.
+
+Shared physical stack limits now cover menus/cursors, real machine and Interface slots, pickups, world-item merging, commands, hoppers/carts, terminal/tool/monitor transfers and returns. Cell, CPU and Provider logical quantities keep their separate limits. Inscriber ONE/FOUR/SIXTY_FOUR capacity and Assembler input limits have source-shaped implementations. The recipe-aware Inscriber filter is separate pending work; an earlier local-machine test that accepted iron in an invalid recipe slot is retracted as Inscriber parity evidence.
+
+Eleven named hidden worlds passed on the current runtime: physical menu/terminal limits, Inscriber capacity, item pickup, `/give` and explicit component removal, hopper transfer, hopper-minecart pickup, complete modeled component wire/creative return, rich item cell storage, local Pattern Access, source-only cell/pattern crafting and wireless source components. The menu/terminal and Inscriber capacity fixtures also passed in-frame. These checks include authoritative server component assertions and real save/reload custody. The before-runs reproduced oversized inventory, hopper/cart and command stacks, discarded removals/potion fields, and the absent local Pattern Access opener.
+
+The first broad gate exposed sparse test registries lacking real CUSTOM_DATA ID 0 and a numerical source-pattern test with fewer than the now-required nine slots. Those fixtures were corrected. Two crash-stack assertions assumed line tables although fast inherits release with none: they now assert the actual originating function in every profile and additionally require the source location in development builds. All full suites then passed. These corrections are test-only: the 16, 16b and 16c native binaries have identical SHA-256, so the existing physical runs test the exact runtime bytes. Both earlier source archives remain retained by their own hashes locally.
+
+General Formation placement, mixed-channel/overfilled source cells, recipe-aware machine filters and complete local wireless lifecycle remain ongoing source-port work. New Java-method comparison helpers may document those requirements before their native implementations pass a gate.

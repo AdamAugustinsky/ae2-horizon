@@ -318,12 +318,7 @@ impl Game<'_> {
             Saved::Io(v)=>super::ae2_memory::apply_io_partial(&mut machine,&mut inventory,&mut pocket,v,self.creative),
             Saved::Vibration(_) if preserve_direct_upgrades=>Ok(super::ae2_memory::PhysicalChanges{drops:Vec::new(),changed_tracked:Vec::new(),replaced_tracked:Vec::new(),missing:0}),
             Saved::Vibration(v)=>super::ae2_memory::apply_vibration(&mut machine,&mut inventory,&mut pocket,v,self.creative),
-            Saved::Interface(v)=>super::ae2_memory::apply_interface_with_limits(&mut machine,&mut inventory,&mut pocket,v,self.creative,interface_contents,|stack|{
-                match stack.data().and_then(|data|data.other("minecraft:max_stack_size")){
-                    Some(Tag::Int(value)) if *value>0=>*value as u32,
-                    _=>self.res.items().get(&stack.item).map_or(64,|item|item.max_stack).max(1),
-                }
-            }),
+            Saved::Interface(v)=>super::ae2_memory::apply_interface_with_limits(&mut machine,&mut inventory,&mut pocket,v,self.creative,interface_contents,|stack|self.res.items().stack_max(stack)),
             Saved::Assembler(_) if preserve_direct_upgrades=>Ok(super::ae2_memory::PhysicalChanges{drops:Vec::new(),changed_tracked:Vec::new(),replaced_tracked:Vec::new(),missing:0}),
             Saved::Assembler(v)=>super::ae2_memory::apply_assembler(&mut machine,&mut inventory,&mut pocket,v,self.creative)
         };let mut changes=match changes {Ok(v)=>v,Err(_)=>return true};

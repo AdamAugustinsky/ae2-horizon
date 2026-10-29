@@ -100,12 +100,7 @@ impl Game<'_> {
             )
         } else {
             let mut stack = ae2_lab::prototype(key).ok()?;
-            let max = self
-                .res
-                .items()
-                .get(&stack.item)
-                .map_or(64, |i| i.max_stack)
-                .max(1);
+            let max = self.res.items().stack_max(&stack);
             stack.count = (*n).min(u64::from(max)) as u32;
             stack
         };
@@ -180,12 +175,7 @@ impl Game<'_> {
             } else if stage == 2 && drag.active {
                 if let Some(mut held) = self.carried.take() {
                     let original = held.count;
-                    let max = self
-                        .res
-                        .items()
-                        .get(&held.item)
-                        .map_or(64, |i| i.max_stack)
-                        .max(1);
+                    let max = self.res.items().stack_max(&held);
                     let each = match drag.kind {
                         0 => original / drag.slots.len().max(1) as u32,
                         1 => 1,
@@ -235,12 +225,7 @@ impl Game<'_> {
                     .filter(|_| slot - 300 < PAGE)
                 {
                     let mut item = ae2_lab::prototype(key)?;
-                    item.count = self
-                        .res
-                        .items()
-                        .get(&item.item)
-                        .map_or(64, |i| i.max_stack)
-                        .max(1);
+                    item.count = self.res.items().stack_max(&item);
                     self.carried = Some(item);
                 }
                 return Ok(());
@@ -277,12 +262,7 @@ impl Game<'_> {
                     return Ok(());
                 };
                 let mut item = ae2_lab::prototype(key)?;
-                let max = self
-                    .res
-                    .items()
-                    .get(&item.item)
-                    .map_or(64, |i| i.max_stack)
-                    .max(1);
+                let max = self.res.items().stack_max(&item);
                 let requested =
                     self.portable_transfer_cost(&stack, u64::from(max).min(*available), 1.0)?;
                 if requested == 0 {
@@ -335,12 +315,7 @@ impl Game<'_> {
                 *self.stack_in_mut(source) = Some(stack);
             } else if let Some((key, available)) = entries.get(*page * PAGE + index) {
                 let mut item = ae2_lab::prototype(key)?;
-                let max = self
-                    .res
-                    .items()
-                    .get(&item.item)
-                    .map_or(64, |i| i.max_stack)
-                    .max(1);
+                let max = self.res.items().stack_max(&item);
                 let available = u64::from(max).min(*available);
                 let requested = if button == 1 {
                     available.div_ceil(2)
@@ -417,24 +392,14 @@ impl Game<'_> {
                     self.inventory[slot] = Some(item);
                 }
             }
-            (Some(held), None, 0) => self.inventory[slot] = Some(held),
-            (Some(mut held), None, 1) => {
-                self.inventory[slot] = Some(ItemStack {
-                    count: 1,
-                    ..held.clone()
-                });
-                held.count -= 1;
-                if held.count > 0 {
-                    self.carried = Some(held);
-                }
+            (Some(mut held), None, b) => {
+                let limit=self.res.items().stack_max(&held);
+                let count=held.count.min(if b==1 {1}else{limit});
+                self.inventory[slot]=Some(ItemStack{count,..held.clone()});held.count-=count;
+                if held.count>0 {self.carried=Some(held);}
             }
             (Some(mut held), Some(mut item), b) if held.same_item_same_components(&item) => {
-                let max = self
-                    .res
-                    .items()
-                    .get(&item.item)
-                    .map_or(64, |i| i.max_stack)
-                    .max(1);
+                let max = self.res.items().stack_max(&item);
                 let n = max
                     .saturating_sub(item.count)
                     .min(if b == 1 { 1 } else { held.count });
@@ -445,7 +410,7 @@ impl Game<'_> {
                     self.carried = Some(held);
                 }
             }
-            (Some(held), Some(item), _) => {
+            (Some(held), Some(item), _) if held.count<=self.res.items().stack_max(&held) => {
                 self.inventory[slot] = Some(held);
                 self.carried = Some(item);
             }

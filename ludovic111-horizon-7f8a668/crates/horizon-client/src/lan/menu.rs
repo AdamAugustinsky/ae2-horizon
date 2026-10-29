@@ -205,7 +205,7 @@ impl View<'_> {
         if self.container.is_none() && (5..=8).contains(&i) {
             return 1;
         }
-        rules.max_stack(&stack.item).max(1)
+        rules.items().stack_max(stack)
     }
     /// The ranges quick move uses: (container start..end, main, hotbar).
     fn player_ranges(&self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
@@ -372,7 +372,7 @@ pub fn click(
                     && let Ok(i) = usize::try_from(slot)
                     && let Some(stack) = view.get(i)
                 {
-                    let max = rules.max_stack(&stack.item).max(1);
+                    let max = rules.items().stack_max(&stack);
                     view.guest.carried = Some(ItemStack {
                         count: max,
                         ..stack
@@ -610,7 +610,7 @@ fn pickup_all(view: &mut View, slot: i32, rules: &dyn Rules) {
     let Some(mut carried) = view.guest.carried.clone() else {
         return;
     };
-    let max = rules.max_stack(&carried.item).max(1);
+    let max = rules.items().stack_max(&carried);
     // Partial stacks first, then full ones.
     for full in [false, true] {
         for i in 0..view.len() {
@@ -678,7 +678,7 @@ fn quick_craft(
             let each = match kind {
                 0 => carried.count / slots.len() as u32,
                 1 => 1,
-                _ => rules.max_stack(&carried.item).max(1),
+                _ => rules.items().stack_max(&carried),
             };
             for i in slots {
                 if carried.count == 0 {

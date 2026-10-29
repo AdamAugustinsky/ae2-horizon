@@ -333,7 +333,7 @@ impl Game<'_>{
         };
         let definitions=saved.patterns.iter().map(|p|p.as_ref().and_then(|p|self.memory_pattern_definition(p))).collect::<Vec<_>>();
         let mut machine=before.machine.clone();let mut player=Player{main:self.inventory.clone(),offhand:self.offhand.clone(),selected:self.selected,armor_blanks:self.armor.iter().flatten().filter(|s|s.item.as_ref()=="ae2:blank_pattern").map(|s|u64::from(s.count)).sum()};
-        let changes=apply_patterns(&mut machine,&mut player,&definitions,self.creative,|s|self.res.items().get(&s.item).map_or(64,|item|item.max_stack))?;
+        let changes=apply_patterns(&mut machine,&mut player,&definitions,self.creative,|s|self.res.items().stack_max(s))?;
         apply_partial_settings(&mut machine,&saved.settings);
         if matches!(before.target,Target::Block)&&saved.push.is_some(){
             let old_state=self.world.block(pos[0],pos[1],pos[2]);

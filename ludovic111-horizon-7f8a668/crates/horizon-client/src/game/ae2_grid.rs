@@ -1486,11 +1486,7 @@ impl Game<'_> {
                 let entries = self.ae2_grid_inventory(p)?;
                 let (k, available) = entries.get(index).ok_or("entry out of range")?;
                 let mut proto = ae2_lab::prototype(k)?;
-                let max = self
-                    .res
-                    .items()
-                    .get(&proto.item)
-                    .map_or(64, |i| i.max_stack) as u64;
+                let max = u64::from(self.res.items().stack_max(&proto));
                 let desired = wanted.min(*available).min(max);
                 proto.count = desired as u32;
                 let before = self.inventory.clone();

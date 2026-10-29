@@ -1589,13 +1589,7 @@ impl Game<'_> {
                 let Some(stack) = self.item_from_network(host, &p.item) else {
                     return;
                 };
-                if stack.count
-                    > self
-                        .res
-                        .items()
-                        .get(&stack.item)
-                        .map_or(64, |i| i.max_stack)
-                {
+                if stack.count > self.res.items().stack_max(&stack) {
                     return;
                 }
                 let play = host.play.entry(conn).or_default();
@@ -1615,6 +1609,9 @@ impl Game<'_> {
                     return;
                 }
                 let item = self.item_from_network(host, &p.item);
+                if item.as_ref().is_some_and(|stack| stack.count > self.res.items().stack_max(stack)) {
+                    return;
+                }
                 let slot = p.slot as usize;
                 let g = &mut host.hub.guests[gi];
                 let old = g.menu_slot(slot);

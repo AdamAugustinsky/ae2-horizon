@@ -34,7 +34,9 @@ pub(super) fn crafting(stack:&ItemStack)->Option<Result<SourceCrafting,String>> 
     let source=stack.data()?.other("ae2:encoded_crafting_pattern")?;
     Some((||{
         let Some(Tag::List(inputs))=source.get("inputs") else{return Err("invalid crafting pattern inputs".into());};
-        if inputs.len()>9 {return Err("too many crafting pattern inputs".into());}
+        // The source constructor indexes all nine sparse positions while
+        // condensing inputs; a shorter list cannot become a crafting pattern.
+        if inputs.len()!=9 {return Err("crafting pattern requires nine inputs".into());}
         let mut grid=Vec::with_capacity(9);let mut input_amounts=Vec::with_capacity(9);
         for entry in inputs {
             if matches!(entry,Tag::Compound(data) if data.is_empty()){grid.push(None);input_amounts.push(0);}else{
@@ -139,6 +141,15 @@ mod tests {
         assert!(crafting(&pattern).unwrap().is_err());
     }
     #[test]
+    fn crafting_pattern_requires_the_nine_source_sparse_positions() {
+        let mut grid=vec![None;9];grid[0]=Some(ItemStack::new("minecraft:oak_log",1));
+        let mut source=encode_crafting(&grid,&ItemStack::new("minecraft:oak_planks",4),"minecraft:oak_planks",false,false).unwrap();
+        let Tag::Compound(data)=&mut source else{panic!()};
+        let Some(Tag::List(inputs))=data.get_mut(&"inputs".into()) else{panic!()};inputs.pop();
+        let mut pattern=ItemStack::new("ae2:crafting_pattern",1);pattern.data_mut().set_other("ae2:encoded_crafting_pattern",Some(source));
+        assert!(crafting(&pattern).unwrap().is_err());
+    }
+    #[test]
     fn raw_source_flags_follow_dynamic_ops_number_byte_value() {
         // NbtOps.getNumberValue returns the Java Number; DynamicOps reads its
         // byteValue, including Java's float-to-int clamp before byte narrowing.
@@ -156,7 +167,7 @@ mod tests {
     fn raw_crafting_item_fields_follow_source_numeric_and_default_namespace_rules() {
         let mut pattern=ItemStack::new("ae2:crafting_pattern",1);
         pattern.data_mut().set_other("ae2:encoded_crafting_pattern",Some(Tag::compound([
-            ("inputs",Tag::List(vec![Tag::compound([("id",Tag::String("oak_log".into())),("count",Tag::Long(4_294_967_297))])])),
+            ("inputs",Tag::List(std::iter::once(Tag::compound([("id",Tag::String("oak_log".into())),("count",Tag::Long(4_294_967_297))])).chain(std::iter::repeat_with(||Tag::Compound(Default::default())).take(8)).collect())),
             ("result",Tag::compound([("id",Tag::String("oak_planks".into())),("count",Tag::Short(4))])),
             ("recipeId",Tag::String("oak_planks".into())),("canSubstitute",Tag::Int(1)),("canSubstituteFluids",Tag::Double(0f64.to_bits())),
         ])));

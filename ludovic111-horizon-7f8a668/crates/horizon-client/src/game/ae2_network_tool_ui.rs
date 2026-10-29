@@ -224,7 +224,7 @@ impl Game<'_> {
         // sends a full resync. Dropping the click makes rapid use unreliable.
         let inv=Inventory::read(&tool).expect("validated tool");
         let input=super::lan_crafting::input(p.input);
-        if inv.slots.iter().flatten().any(|s|s.count==0 || s.count>self.res.items().get(&s.item).map_or(64,|i|i.max_stack).max(1).min(99)) {
+        if inv.slots.iter().flatten().any(|s|s.count==0 || s.count>self.res.items().stack_max(&s).min(99)) {
             host.play.entry(conn).or_default().ae2_network_tool=Some(session);
             host.hub.send_inventory(gi);self.lan_send_ae2_network_tool(host,conn);return true;
         }

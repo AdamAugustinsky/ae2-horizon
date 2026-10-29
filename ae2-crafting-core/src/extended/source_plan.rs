@@ -397,7 +397,8 @@ impl<'a,'b> SourcePlanner<'a,'b> {
         self.add_bytes(state,u128::from(times)*1000)?;
         let mixed=times>1 && selections.iter().any(|(slot,_,taken)|taken.len()>1
             || self.registry.source_templates.get(&pattern.id).and_then(|templates|templates.get(*slot)).is_some_and(|templates| {
-                templates.iter().enumerate().any(|(index,(key,amount))|templates[..index].iter().any(|(other,n)|key==other && amount!=n))
+                let mut seen=std::collections::HashMap::new();
+                templates.iter().any(|(key,amount)|seen.insert(key,*amount).is_some_and(|previous|previous!=*amount))
             }));
         if mixed || inputs.values().any(|n|n%times!=0) || outputs.values().any(|n|n%times!=0) {
             // Preserve the selected physical keys per push, batching only
@@ -476,7 +477,8 @@ impl<'a,'b> SourcePlanner<'a,'b> {
         self.add_bytes(state,u128::from(times)*1000)?;
         let mixed=times>1 && selections.iter().any(|(slot,_,taken)|taken.len()>1
             || self.registry.source_templates.get(&pattern.id).and_then(|templates|templates.get(*slot)).is_some_and(|templates| {
-                templates.iter().enumerate().any(|(index,(key,amount))|templates[..index].iter().any(|(other,n)|key==other && amount!=n))
+                let mut seen=std::collections::HashMap::new();
+                templates.iter().any(|(key,amount)|seen.insert(key,*amount).is_some_and(|previous|previous!=*amount))
             }));
         if mixed || inputs.values().any(|n|n%times!=0) || outputs.values().any(|n|n%times!=0) {
             // Preserve the selected physical keys per push, batching only

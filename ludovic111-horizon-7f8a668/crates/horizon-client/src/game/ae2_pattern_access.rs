@@ -30,6 +30,14 @@ fn display_lines(rows:&[Row])->Vec<DisplayLine> {
     }
     lines
 }
+struct AccessView {
+    rows:Vec<Row>, pinned:Vec<Owner>, page:usize, items:Vec<Option<ItemStack>>,
+    layout:Vec<serde_json::Value>, owners:Vec<Option<OwnerIdentity>>, max_scroll:usize,
+}
+pub(super) struct LocalPatternAccess {
+    pos:(i32,i32,i32),face:String,dim:String,terminal:OwnerIdentity,filter:u8,
+    view:AccessView,field:horizon_client::ui::EditBox,menu:Menu,refresh:u8,
+}
 pub(super) struct GuestPatternAccess {
     window:i32,state:i32,pos:(i32,i32,i32),face:String,dim:String,page:usize,terminal:OwnerIdentity,
     search:String,filter:u8,rows:Vec<Row>,pinned:Vec<Owner>,menu:Menu,refresh:u8,
@@ -227,6 +235,124 @@ impl Game<'_> {
         rows.sort_by(|a,b|a.group.name.to_lowercase().cmp(&b.group.name.to_lowercase()).then(a.group.cmp(&b.group)).then(a.sort.cmp(&b.sort)));
         (rows,pins)
     }
+    /// In-frame access sessions retain the clicked terminal and the exact
+    /// provider identities shown to the player.
+    pub(super) fn ae2_open_local_pattern_access(&mut self,pos:(i32,i32,i32),face:[i32;3])->bool {
+        if self.remote.is_some(){return false;}
+        let face=match face {[1,0,0]=>"east",[-1,0,0]=>"west",[0,1,0]=>"up",[0,-1,0]=>"down",[0,0,1]=>"south",[0,0,-1]=>"north",_=>return false};
+        let Some(filter)=self.access_filter(pos,face) else{return false};
+        let Some(terminal)=self.access_terminal_identity(pos,face) else{return false};
+        let view=self.access_view(pos,face,0,"",filter,&[]);
+        let mut field=horizon_client::ui::EditBox::new(0.0,0.0,65.0,12.0);field.max_length=128;field.focused=true;
+        self.container=Some(pos);self.ae2_local_pattern_access=Some(LocalPatternAccess{pos,face:face.into(),dim:self.dim.id().into(),terminal,filter,view,field,menu:Menu::new(Kind::Chest(6)),refresh:0});
+        self.screen=super::Screen::Inventory;self.capture(false);self.right=false;true
+    }
+    pub(super) fn ae2_local_pattern_access_open(&self)->bool {
+        self.remote.is_none() && self.ae2_local_pattern_access.as_ref().is_some_and(|s|self.container==Some(s.pos))
+    }
+    pub(super) fn ae2_local_pattern_access_valid(&self)->bool {
+        self.ae2_local_pattern_access_open() && self.ae2_local_pattern_access.as_ref().is_some_and(|s|
+            s.dim==self.dim.id() && self.access_terminal_identity(s.pos,&s.face)==Some(s.terminal)
+                && self.eye_position().is_some_and(|eye|horizon_client::lan::guest::within_block_range(eye,self.reach()+4.0,[s.pos.0,s.pos.1,s.pos.2])))
+    }
+    pub(super) fn ae2_local_pattern_access_refresh(&mut self) {
+        if !self.ae2_local_pattern_access_valid(){return;}
+        let Some(s)=self.ae2_local_pattern_access.as_ref() else{return};
+        let (pos,face,page,search,old_filter,pinned)=(s.pos,s.face.clone(),s.view.page,s.field.value.clone(),s.filter,s.view.pinned.clone());
+        let Some(filter)=self.access_filter(pos,&face) else{return};
+        let view=self.access_view(pos,&face,if filter==old_filter {page}else{0},&search,filter,if filter==old_filter {&pinned}else{&[]});
+        if let Some(s)=self.ae2_local_pattern_access.as_mut(){s.filter=filter;s.view=view;}
+    }
+    pub(super) fn ae2_local_pattern_access_tick(&mut self) {
+        let Some(s)=self.ae2_local_pattern_access.as_mut() else{return};
+        s.refresh=s.refresh.saturating_add(1);
+        if s.refresh>=10 {s.refresh=0;self.ae2_local_pattern_access_refresh();}
+    }
+    pub(super) fn ae2_pattern_access_layout(&self)->Option<serde_json::Value> {
+        if self.ae2_local_pattern_access_open() {
+            let s=self.ae2_local_pattern_access.as_ref()?;
+            Some(serde_json::json!({"rows":s.view.layout.clone(),"offset":s.view.page,"maximum":s.view.max_scroll,"filter":s.filter}))
+        }else{self.remote.as_ref().and_then(|r|r.ae2_pattern_layout.clone())}
+    }
+    pub(super) fn ae2_local_pattern_access_slot_view(&self,slot:usize)->Option<ItemStack> {
+        if !self.ae2_local_pattern_access_valid(){return None;}
+        self.ae2_local_pattern_access.as_ref()?.view.items.get(slot.checked_sub(300)?).cloned().flatten()
+    }
+    pub(super) fn ae2_local_pattern_access_search_focused(&self)->bool {
+        self.ae2_local_pattern_access_open() && self.ae2_local_pattern_access.as_ref().is_some_and(|s|s.field.focused)
+    }
+    pub(super) fn ae2_local_pattern_access_search_input(&mut self,text:Option<&str>,key:Option<winit::keyboard::KeyCode>) {
+        if !self.ae2_local_pattern_access_valid(){return;}
+        let ctrl=self.has_control_down();let shift=self.has_shift_down();
+        if let Some(s)=self.ae2_local_pattern_access.as_mut(){let before=s.field.value.clone();if !key.is_some_and(|key|s.field.key(key,ctrl,shift)){if let Some(text)=text{s.field.insert_text(text);}}if s.field.value!=before{s.view.page=0;}}
+        self.ae2_local_pattern_access_refresh();
+    }
+    pub(super) fn ae2_local_pattern_access_search_shortcut(&mut self,shortcut:horizon_client::clipboard::EditShortcut) {
+        if let Some(s)=self.ae2_local_pattern_access.as_mut(){let before=s.field.value.clone();s.field.shortcut(shortcut,&mut self.clipboard);if s.field.value!=before{s.view.page=0;}}
+        self.ae2_local_pattern_access_refresh();
+    }
+    pub(super) fn ae2_local_pattern_access_search_click(&mut self,ox:f32,oy:f32,right:bool)->bool {
+        let (mx,my)=self.cursor;let hit=mx>=ox+104.0 && mx<ox+169.0 && my>=oy+4.0 && my<oy+16.0;let shift=self.has_shift_down();
+        let Some(s)=self.ae2_local_pattern_access.as_mut() else{return false};s.field.focused=hit;
+        if hit {s.field.x=ox+104.0;s.field.y=oy+4.0;s.field.width=65.0;s.field.height=12.0;s.field.click(&self.gui.atlas,mx,shift,right);}hit
+    }
+    pub(super) fn ae2_local_pattern_access_search_draw(&self,batch:&mut horizon_client::hud::HudBatch,ox:f32,oy:f32) {
+        if let Some(mut field)=self.ae2_local_pattern_access.as_ref().map(|s|s.field.clone()){field.x=ox+104.0;field.y=oy+4.0;field.width=65.0;field.height=12.0;field.draw(batch,&self.gui.atlas,None);}
+    }
+    pub(super) fn ae2_local_pattern_access_control(&mut self,action:i16)->bool {
+        if !self.ae2_local_pattern_access_valid() || !matches!(action,-10|-11|-12){return false;}
+        let Some(s)=self.ae2_local_pattern_access.as_ref() else{return false};
+        let (pos,face,next)=(s.pos,s.face.clone(),(s.filter+1)%3);
+        if action==-12 && !self.access_set_filter(pos,&face,next){return true;}
+        if let Some(s)=self.ae2_local_pattern_access.as_mut(){match action {
+            -10=>s.view.page=s.view.page.saturating_sub(1),-11=>s.view.page=(s.view.page+1).min(s.view.max_scroll),
+            -12=>{s.filter=next;s.view.page=0;s.view.pinned.clear();},_=>{}
+        }}
+        self.ae2_local_pattern_access_refresh();true
+    }
+    /// An actual player menu remains the transaction engine for non-provider
+    /// inventory slots and quick-craft state.
+    fn access_local_player_menu(&mut self,session:&mut LocalPatternAccess,slot:Option<usize>,button:i32,input:Input) {
+        let before_random=self.world.random.clone();
+        let result={let env=self.menu_env();let menu=&mut session.menu;
+            for (i,item) in self.inventory.iter().enumerate(){menu.set_player_item(i,item.clone());}
+            for (i,slot) in [39,38,37,36].into_iter().enumerate(){menu.set_player_item(slot,self.armor[i].clone());}
+            menu.set_player_item(40,self.offhand.clone());menu.selected=self.selected;menu.creative=self.creative;menu.carried=self.carried.clone();
+            menu.recipe_durability_rng=Some(before_random);
+            let result=menu.click(&env,slot.map_or(-999,|slot|slot as i32),button,input);
+            let random=menu.recipe_durability_rng.take();let dropped=std::mem::take(&mut menu.dropped);let equipped=std::mem::take(&mut menu.equipped);
+            menu.drops.clear();menu.crafted.clear();
+            result.map(|()|((0..36).map(|i|menu.player_item(i).cloned()).collect::<Vec<_>>(),
+                std::array::from_fn(|i|menu.player_item([39,38,37,36][i]).cloned()),menu.player_item(40).cloned(),menu.carried.take(),dropped,equipped,random))
+        };
+        if let Ok((inventory,armor,offhand,carried,dropped,equipped,random))=result {
+            self.inventory=inventory;self.armor=armor;self.offhand=offhand;self.carried=carried;
+            if let Some(random)=random{self.world.random=random;}
+            for item in dropped{self.player_drop(item);}for (slot,item) in equipped{self.player_equipped(slot,item.as_ref());}
+        }else{session.menu=Menu::new(Kind::Chest(6));}
+    }
+    pub(super) fn ae2_local_pattern_access_click(&mut self,slot:Option<usize>,button:i32,input:Input) {
+        if !self.ae2_local_pattern_access_valid(){self.close_container();self.screen=super::Screen::Playing;self.capture(true);return;}
+        if input==Input::Clone && slot.is_some_and(|slot|self.slot_view(slot).is_some_and(|item|item.item.as_ref()=="ae2:wrapped_generic_stack")){return;}
+        let Some(mut session)=self.ae2_local_pattern_access.take() else{return};
+        let fresh=self.access_view(session.pos,&session.face,session.view.page,&session.field.value,session.filter,&session.view.pinned);
+        if fresh.rows!=session.view.rows || fresh.owners!=session.view.owners {session.view=fresh;self.ae2_local_pattern_access=Some(session);return;}
+        match slot {
+            Some(slot @ 300..=353)=>{
+                let line=(slot-300)/9;let index=(slot-300)%9;
+                let owner=display_lines(&session.view.rows).get(session.view.page+line).and_then(|line|match line {DisplayLine::Provider(row)=>Some(row.owner),_=>None});
+                if let Some(owner)=owner.filter(|owner|same_sent_owner(session.view.owners.get(line).copied().flatten(),self.access_owner_identity(*owner))) {
+                    self.access_provider_action(owner,index,button,input);
+                }
+            },
+            Some(index @ 0..=35) if input==Input::QuickMove=>self.access_quick_move_player(index,&session.view.rows),
+            Some(index @ 0..=35)=>{let wire=if index<9 {81+index}else{54+index-9};self.access_local_player_menu(&mut session,Some(wire),button,input);},
+            None if input==Input::QuickCraft || input==Input::Pickup=>self.access_local_player_menu(&mut session,None,button,input),
+            _=>{}
+        }
+        session.view=self.access_view(session.pos,&session.face,session.view.page,&session.field.value,session.filter,&session.view.pinned);
+        self.ae2_local_pattern_access=Some(session);
+    }
     pub(super) fn lan_open_pattern_access(&mut self,host:&mut LanHost,conn:u32,pos:(i32,i32,i32),face:&str)->bool {
         let Some(filter)=self.access_filter(pos,face) else{return false};
         let Some(terminal)=self.access_terminal_identity(pos,face) else{return false};
@@ -242,12 +368,10 @@ impl Game<'_> {
         host.play.entry(conn).or_default().ae2_pattern_access=Some(GuestPatternAccess{window,state:0,pos,face:face.into(),dim:self.dim.id().into(),page:0,terminal,search:String::new(),filter,rows:Vec::new(),pinned:Vec::new(),menu:Menu::new(Kind::Chest(6)),refresh:0,sent_views:std::collections::VecDeque::new()});
         self.lan_send_pattern_access(host,conn);true
     }
-    fn lan_send_pattern_access(&mut self,host:&mut LanHost,conn:u32) {
-        let Some((window,state,pos,face,page,search,filter,pinned,terminal))=host.play.get(&conn).and_then(|p|p.ae2_pattern_access.as_ref()).map(|s|(s.window,s.state,s.pos,s.face.clone(),s.page,s.search.clone(),s.filter,s.pinned.clone(),s.terminal)) else{return};
-        if self.access_terminal_identity(pos,&face)!=Some(terminal) {
-            self.lan_pattern_access_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));return;
-        }
-        let (rows,pins)=if self.ae2_part_online(pos,&face){self.access_rows(pos,&search,filter,&pinned)} else{(Vec::new(),Vec::new())};
+    /// Build the same provider rows and original-owner identities for both
+    /// the remote and in-frame Pattern Access screens.
+    fn access_view(&self,pos:(i32,i32,i32),face:&str,page:usize,search:&str,filter:u8,pinned:&[Owner])->AccessView {
+        let (rows,pins)=if self.ae2_part_online(pos,&face){self.access_rows(pos,search,filter,pinned)} else{(Vec::new(),Vec::new())};
         let lines=display_lines(&rows);let max_scroll=lines.len().saturating_sub(6);let page=page.min(max_scroll);
         let mut items=vec![None;54];let mut layout=Vec::new();let mut owners=vec![None;6];
         for (i,line) in lines.iter().skip(page).take(6).enumerate(){
@@ -256,6 +380,14 @@ impl Game<'_> {
                 DisplayLine::Provider(row)=>{owners[i]=self.access_owner_identity(row.owner);items[i*9..i*9+9].clone_from_slice(&row.slots);layout.push(serde_json::json!({"kind":"provider","name":row.name}));}
             }
         }
+        AccessView{rows,pinned:pins,page,items,layout,owners,max_scroll}
+    }
+    fn lan_send_pattern_access(&mut self,host:&mut LanHost,conn:u32) {
+        let Some((window,state,pos,face,page,search,filter,pinned,terminal))=host.play.get(&conn).and_then(|p|p.ae2_pattern_access.as_ref()).map(|s|(s.window,s.state,s.pos,s.face.clone(),s.page,s.search.clone(),s.filter,s.pinned.clone(),s.terminal)) else{return};
+        if self.access_terminal_identity(pos,&face)!=Some(terminal) {
+            self.lan_pattern_access_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));return;
+        }
+        let AccessView{rows,pinned:pins,page,mut items,layout,owners,max_scroll}=self.access_view(pos,&face,page,&search,filter,&pinned);
         let data=serde_json::to_vec(&serde_json::json!({"window":window,"rows":layout,"offset":page,"maximum":max_scroll,"filter":filter})).unwrap_or_default();
         host.hub.send_to(conn,&C::CustomPayload(horizon_protocol::packets::configuration::CustomPayload{channel:"ae2:pattern_layout".into(),data}));
         let Some(g)=host.hub.guests.iter().find(|g|g.conn==conn) else{return};
@@ -273,6 +405,38 @@ impl Game<'_> {
         if !valid {self.lan_pattern_access_closed(host,conn,None);host.hub.send_to(conn,&C::ContainerClose(play::ContainerClose{container:window}));return true;}
         let Some(s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.as_mut()) else{return true};
         s.search=value.chars().take(128).collect();s.page=0;self.lan_send_pattern_access(host,conn);true
+    }
+    /// Transfer a real encoded item through the same provider transaction
+    /// for both the LAN and in-frame Pattern Access screen.
+    fn access_provider_action(&mut self,owner:Owner,slot:usize,button:i32,input:Input) {
+        let Some(mut machine)=self.access_machine(owner) else{return};
+        if slot>=machine.slots.len(){return;}
+        let snapshot=self.ae2_snapshot_blocks();let old_inventory=self.inventory.clone();let old_cursor=self.carried.clone();
+        let current=machine.slots[slot].clone();
+        if input==Input::QuickMove {
+            if let Some(item)=current {machine.slots[slot]=self.give(item);}
+        } else if input==Input::Clone && self.creative && self.carried.is_none() {
+            self.carried=current;
+        } else if input==Input::Pickup && matches!(button,0|1) {
+            let held=self.carried.clone();
+            if held.is_none() {self.carried=current;machine.slots[slot]=None;}
+            else if (button==0 || current.is_none()) && held.as_ref().is_some_and(|x|x.count==1 && encoded_pattern_item(x)) {
+                self.carried=current;machine.slots[slot]=held;
+            }
+        }
+        if self.access_store(owner,&machine).is_err() {
+            self.ae2_restore_blocks(snapshot);self.inventory=old_inventory;self.carried=old_cursor;
+        }
+    }
+    fn access_quick_move_player(&mut self,index:usize,rows:&[Row]) {
+        if let Some(item)=self.inventory.get(index).and_then(Clone::clone).filter(|v|v.count==1 && pattern(v)) {
+            for row in rows {
+                let Some(mut machine)=self.access_machine(row.owner) else{continue};
+                let Some(slot)=machine.slots.iter().position(Option::is_none) else{continue};
+                machine.slots[slot]=Some(item.clone());
+                if self.access_store(row.owner,&machine).is_ok(){self.inventory[index]=None;break;}
+            }
+        }
     }
     pub(super) fn lan_pattern_access_click(&mut self,host:&mut LanHost,conn:u32,p:&play::ContainerClick)->bool {
         let Some(mut s)=host.play.get_mut(&conn).and_then(|p|p.ae2_pattern_access.take()) else{return false};
@@ -297,38 +461,14 @@ impl Game<'_> {
         if (0..54).contains(&p.slot) {
             let lines=display_lines(&rows);let index=s.page+p.slot as usize/9;let slot=p.slot as usize%9;
             if let Some(DisplayLine::Provider(row))=lines.get(index) {
-                if let Some(mut machine)=self.access_machine(row.owner) {
-                    let snapshot=self.ae2_snapshot_blocks();let old_inventory=host.hub.guests[gi].inventory.clone();let old_cursor=host.hub.guests[gi].carried.clone();
-                    let current=machine.slots[slot].clone();
-                    if input==Input::QuickMove {
-                        if let Some(item)=current {if let Some(remaining)=self.as_guest(host,conn,|g|g.give(item)){machine.slots[slot]=remaining;}}
-                    } else if input==Input::Clone && host.hub.guests[gi].creative() && host.hub.guests[gi].carried.is_none() {
-                        host.hub.guests[gi].carried=current;
-                    } else if input==Input::Pickup && matches!(p.button,0|1) {
-                        let held=host.hub.guests[gi].carried.clone();
-                        if held.is_none() {host.hub.guests[gi].carried=current;machine.slots[slot]=None;}
-                        else if (p.button==0 || current.is_none()) && held.as_ref().is_some_and(|x|x.count==1 && encoded_pattern_item(x)) {
-                            host.hub.guests[gi].carried=current;machine.slots[slot]=held;
-                        }
-                    }
-                    if self.access_store(row.owner,&machine).is_err() {
-                        self.ae2_restore_blocks(snapshot);host.hub.guests[gi].inventory=old_inventory;host.hub.guests[gi].carried=old_cursor;
-                    }
-                }
+                self.as_guest(host,conn,|game|game.access_provider_action(row.owner,slot,i32::from(p.button),input));
             }
         } else if p.slot == -10 {s.page=s.page.saturating_sub(1);}
         else if p.slot == -11 {s.page=(s.page+1).min(display_lines(&rows).len().saturating_sub(6));}
         else if p.slot == -12 {let next=(s.filter+1)%3;if self.access_set_filter(s.pos,&s.face,next){s.filter=next;s.page=0;s.pinned.clear();}}
         else if (54..90).contains(&p.slot) && input==Input::QuickMove {
             let index=if p.slot<81 {9+(p.slot as usize-54)} else {p.slot as usize-81};
-            if let Some(item)=host.hub.guests[gi].inventory.get(index).and_then(Clone::clone).filter(|v|v.count==1 && pattern(v)) {
-                for row in &rows {
-                    let Some(mut machine)=self.access_machine(row.owner) else{continue;};
-                    let Some(slot)=machine.slots.iter().position(Option::is_none) else{continue;};
-                    machine.slots[slot]=Some(item.clone());
-                    if self.access_store(row.owner,&machine).is_ok(){host.hub.guests[gi].inventory[index]=None;break;}
-                }
-            }
+            self.as_guest(host,conn,|game|game.access_quick_move_player(index,&rows));
         }
         else if (54..90).contains(&p.slot) {
             self.guest_menu_op(host,gi,&mut s.menu,|m,env|{let _=m.click(env,i32::from(p.slot),i32::from(p.button),input);});

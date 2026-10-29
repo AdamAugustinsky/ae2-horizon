@@ -382,7 +382,26 @@ fn entity_spec(tags: &HashMap<String, HashSet<String>>, spec: &str) -> HashSet<S
         None => HashSet::from([spec.to_owned()]),
     }
 }
+/// The maximum size of a physical ItemStack, including an explicit component
+/// patch. NBT numeric tags use Java Number.intValue; malformed values are
+/// clamped to 1..99 until the host applies component codec validation.
+/// AE2 logical counters must not use this cap until materializing a stack.
+pub fn stack_max_with_default(stack:&ItemStack,item_default:u32)->u32 {
+    use horizon_world::nbt::Tag;
+    // An absent patch uses the item prototype. A removed component leaves no
+    // value in the resolved map; ItemStack.getMaxStackSize falls back to one.
+    if stack.data().is_some_and(|data|data.other("!minecraft:max_stack_size").is_some()) {return 1;}
+    let value=stack.data().and_then(|data|data.other("minecraft:max_stack_size")).and_then(|tag|match tag {
+        Tag::Byte(n)=>Some(i32::from(*n)),Tag::Short(n)=>Some(i32::from(*n)),Tag::Int(n)=>Some(*n),
+        Tag::Long(n)=>Some(*n as i32),Tag::Float(n)=>Some(f32::from_bits(*n) as i32),
+        Tag::Double(n)=>Some(f64::from_bits(*n) as i32),_=>None,
+    });
+    value.map_or(item_default.max(1),|value|value.clamp(1,99) as u32)
+}
 impl Items {
+    pub fn stack_max(&self,stack:&ItemStack)->u32 {
+        stack_max_with_default(stack,self.get(&stack.item).map_or(64,|info|info.max_stack))
+    }
     pub fn resists_fire(&self, stack: &ItemStack, source: &str) -> bool {
         if let Some(data) = stack.data()
             && let Some((_, v)) = data
@@ -1758,6 +1777,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn physical_stack_max_reads_numeric_component_and_catalog_default() {
+        use horizon_world::nbt::Tag;
+        let items=Items::for_tests(Default::default());let mut stack=ItemStack::new("minecraft:stone",1);
+        assert_eq!(items.stack_max(&stack),64);assert_eq!(stack_max_with_default(&stack,16),16);
+        for (tag,expected) in [(Tag::Byte(9),9),(Tag::Short(12),12),(Tag::Int(16),16),
+            (Tag::Long(4_294_967_298),2),(Tag::Float(31.75f32.to_bits()),31),(Tag::Double(44.9f64.to_bits()),44)] {
+            stack.data_mut().set_other("minecraft:max_stack_size",Some(tag));assert_eq!(items.stack_max(&stack),expected);
+        }
+        stack.data_mut().set_other("minecraft:max_stack_size",None);
+        stack.data_mut().set_other("!minecraft:max_stack_size",Some(Tag::compound([] as [(&str,Tag);0])));
+        assert_eq!(items.stack_max(&stack),1);
+        stack.data_mut().set_other("!minecraft:max_stack_size",None);
+        assert_eq!(items.stack_max(&stack),64);
+    }
     #[test]
     fn loot_tag_entries_expand_as_one_choice_or_as_all_items() {
         let items = Items::for_tests(HashMap::from([(

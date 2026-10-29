@@ -37,6 +37,50 @@ pub fn from_network(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> ItemStack
     }
     #[cfg(feature = "ae2-lab")]
     {
+        // v2 carries the complete persistent item patch. Native codecs remain
+        // on the wire for rendering and compatibility; the original source
+        // patch wins when their representation cannot carry every component.
+        let key = "horizon:wire_ae2_components";
+        let mut handled_v2 = false;
+        if let Some(Tag::Compound(mut outer)) = out.data().and_then(|d| d.other("minecraft:custom_data")).cloned() {
+            if let Some(Tag::Compound(mut wrapped)) = outer.get(&key.into()).cloned() {
+                let known = wrapped.keys().all(|field| matches!(field.to_string_lossy().as_str(),
+                    "version" | "had_custom_data" | "components" | "previous" | "noncompound_custom_data" | "ominous_layers_implicit"));
+                let version = wrapped.remove(&"version".into());
+                let had = wrapped.remove(&"had_custom_data".into());
+                let components = wrapped.remove(&"components".into());
+                let previous = wrapped.remove(&"previous".into());
+                let noncompound = wrapped.remove(&"noncompound_custom_data".into());
+                let implicit = wrapped.remove(&"ominous_layers_implicit".into());
+                let valid_implicit = implicit.is_none() || implicit == Some(Tag::Byte(1));
+                let valid_previous = previous.is_none() || had == Some(Tag::Byte(1));
+                let valid_noncompound = noncompound.as_ref().is_none_or(|v| !matches!(v, Tag::Compound(_)))
+                    && (noncompound.is_none() || had == Some(Tag::Byte(0)));
+                if known && version == Some(Tag::Byte(2)) && matches!(had, Some(Tag::Byte(0 | 1)))
+                    && valid_implicit && valid_previous && valid_noncompound {
+                    if let Some(Tag::Compound(mut patch)) = components
+                        .filter(|v| matches!(v, Tag::Compound(m) if !m.contains_key(&"minecraft:custom_data".into()))) {
+                        outer.remove(&key.into());
+                        if let Some(previous) = previous { outer.insert(key.into(), previous); }
+                        if had == Some(Tag::Byte(1)) || !outer.is_empty() {
+                            patch.insert("minecraft:custom_data".into(), Tag::Compound(outer));
+                        } else if let Some(value) = noncompound {
+                            patch.insert("minecraft:custom_data".into(), value);
+                        }
+                        let transient = out.data().and_then(|d| d.map_post_processing);
+                        let (damage, data) = crate::item_data::decode_components(Some(&Tag::Compound(patch)));
+                        out.damage = damage;
+                        out.extra = data;
+                        if let Some(transient) = transient { out.data_mut().map_post_processing = Some(transient); }
+                        if implicit == Some(Tag::Byte(1)) && out.data().is_some_and(|d| d.ominous_banner) {
+                            out.data_mut().banner_patterns.clear();
+                        }
+                        handled_v2 = true;
+                    }
+                }
+            }
+        }
+        if !handled_v2 {
         let key = "horizon:wire_ae2_components";
         if let Some(Tag::Compound(mut envelope)) = out.data().and_then(|data| data.other("minecraft:custom_data")).cloned() {
             if let Some(Tag::Compound(mut wrapped)) = envelope.get(&key.into()).cloned() {
@@ -68,6 +112,7 @@ pub fn from_network(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> ItemStack
                     }
                 }
             }
+        }
         }
     }
     out.tidy();
@@ -232,7 +277,16 @@ fn components_tag(s: &Stack, builtin: &Builtin, synced: &Dynamic) -> Option<Tag>
         };
         entries.push((key, value));
     }
-    Some(Tag::compound(entries))
+    let mut patch = Tag::compound(entries);
+    if let Tag::Compound(map) = &mut patch {
+        for id in &s.removed {
+            if let Some(key) = name(*id) {
+                map.remove(&key.into());
+                map.insert(format!("!{key}").as_str().into(), Tag::Compound(Default::default()));
+            }
+        }
+    }
+    Some(patch)
 }
 
 /// A wire `FireworkExplosion` as vanilla's NBT codec writes it
@@ -286,6 +340,82 @@ fn profile_tag(p: &Profile) -> Tag {
 mod tests {
     use super::*;
     use horizon_protocol::registry::Ids;
+
+    #[cfg(feature = "ae2-lab")]
+    #[test]
+    fn full_item_component_patch_and_nested_transients_survive_wire() {
+        use horizon_protocol::{buf::{Codec,Reader,Writer},item::Slot};
+        let names = ["minecraft:white_banner", "minecraft:spawner", "minecraft:shulker_box", "minecraft:filled_map", "minecraft:bundle", "minecraft:potion", "minecraft:written_book"];
+        let mut component_names = vec![String::new(); 78];
+        for (id,name) in [(component::CUSTOM_DATA,"minecraft:custom_data"),
+            (component::MAX_STACK_SIZE,"minecraft:max_stack_size"),
+            (component::CUSTOM_NAME,"minecraft:custom_name"),
+            (component::CONTAINER,"minecraft:container"),
+            (component::BUNDLE_CONTENTS,"minecraft:bundle_contents"),
+            (component::MAP_POST_PROCESSING,"minecraft:map_post_processing")] {
+            component_names[id as usize] = name.into();
+        }
+        let builtin = Builtin {registries:[
+            ("minecraft:item".into(),Ids::from_names(names.iter().map(|s|s.to_string()).collect())),
+            ("minecraft:data_component_type".into(),Ids::from_names(component_names)),
+        ].into()};
+        let wire=|item:&ItemStack|crate::lan::guest::stack_to_network(
+            |name|builtin.get("minecraft:item").unwrap().id(name).unwrap(),|_,_|None,&Some(item.clone())).unwrap();
+        let round=|item:&ItemStack| {
+            let mut writer=Writer::new(); Slot::write(&Some(wire(item)),&mut writer);
+            let mut reader=Reader::new(&writer.data); let decoded=Slot::read(&mut reader).unwrap().unwrap();
+            assert_eq!(reader.remaining(),0);
+            from_network(&decoded,&builtin,&Dynamic::default())
+        };
+        let marker = Tag::compound([("version",Tag::Byte(1)),("had_custom_data",Tag::Byte(0)),
+            ("components",Tag::compound([("ae2:entangled_singularity_id",Tag::Long(777))]))]);
+        let mut banner=ItemStack::new("minecraft:white_banner",1);
+        banner.data_mut().banner_patterns = vec![crate::banner::BannerLayer::new("minecraft:flower","black")];
+        banner.data_mut().set_other("minecraft:block_entity_data",Some(Tag::compound([
+            ("id",Tag::String("minecraft:banner".into())),("proof",Tag::String("kept".into()))])));
+        banner.data_mut().set_other("minecraft:max_stack_size",Some(Tag::Int(5)));
+        banner.data_mut().set_other("!minecraft:unbreakable",Some(Tag::Compound(Default::default())));
+        banner.data_mut().set_other("minecraft:custom_data",Some(Tag::compound([("horizon:wire_ae2_components",marker)])));
+        banner.set_custom_name_component(Some(Tag::compound([("text",Tag::String("Tint".into())),("color",Tag::String("red".into()))])));
+        assert_eq!(wire(&banner).component(component::MAX_STACK_SIZE),Some(&Component::Int(5)));
+        assert_eq!(round(&banner),banner,"complete patch preserves modeled, unknown, negative and colliding components");
+        let rich=Tag::compound([("minecraft:potion_contents",Tag::compound([
+            ("potion",Tag::String("minecraft:water".into())),("custom_color",Tag::Int(0x123456)),
+            ("custom_effects",Tag::List(vec![Tag::compound([("id",Tag::String("minecraft:speed".into()))])]))])),
+            ("minecraft:written_book_content",Tag::compound([("title",Tag::String("Title".into())),
+                ("author",Tag::String("Writer".into())),("pages",Tag::List(vec![Tag::compound([
+                    ("raw",Tag::compound([("text",Tag::String("scarlet".into())),("color",Tag::String("red".into()))])),
+                    ("filtered",Tag::String("hidden".into()))])])),("resolved",Tag::Byte(1))]))]);
+        let (_,extra)=crate::item_data::decode_components(Some(&rich));
+        let mut rich_item=ItemStack::new("minecraft:written_book",1);rich_item.extra=extra;
+        assert_eq!(round(&rich_item),rich_item,"opaque source potion and book fields survive byte encoding");
+        let mut inner=ItemStack::new("minecraft:filled_map",1);
+        inner.data_mut().map_post_processing=Some(1);
+        inner.data_mut().set_other("minecraft:block_entity_data",Some(Tag::compound([("id",Tag::String("minecraft:mob_spawner".into()))])));
+        let mut outer=ItemStack::new("minecraft:shulker_box",1);
+        outer.data_mut().container.push((3,inner));
+        let mut bundle=ItemStack::new("minecraft:bundle",1);
+        bundle.data_mut().bundle_contents.push(outer);
+        assert_eq!(round(&bundle),bundle,"nested item patches and transient map processing survive");
+        let ominous=crate::mobs::raider::ominous_banner();
+        assert_eq!(round(&ominous),ominous,"the native implicit banner representation survives");
+
+        let mut negative=Stack::new(0,1);
+        negative.removed.push(component::MAX_STACK_SIZE);
+        let removed=from_network(&negative,&builtin,&Dynamic::default());
+        assert!(removed.data().unwrap().other("!minecraft:max_stack_size").is_some());
+        assert_eq!(round(&removed),removed,"network removals become persistent source patch removals");
+        let legacy=Tag::compound([("horizon:wire_ae2_components",Tag::compound([
+            ("version",Tag::Byte(1)),("had_custom_data",Tag::Byte(0)),
+            ("components",Tag::compound([("ae2:entangled_singularity_id",Tag::Long(42))]))]))]);
+        let mut old_packet=Stack::new(0,1);old_packet.added.push((component::CUSTOM_DATA,Component::Nbt(legacy)));
+        assert_eq!(from_network(&old_packet,&builtin,&Dynamic::default()).data().unwrap().other("ae2:entangled_singularity_id"),Some(&Tag::Long(42)));
+        let malformed=Tag::compound([("horizon:wire_ae2_components",Tag::compound([
+            ("version",Tag::Byte(2)),("had_custom_data",Tag::Byte(0)),
+            ("components",Tag::String("bad".into()))]))]);
+        let mut packet=Stack::new(0,1);packet.added.push((component::CUSTOM_DATA,Component::Nbt(malformed.clone())));
+        assert_eq!(from_network(&packet,&builtin,&Dynamic::default()).data().unwrap().other("minecraft:custom_data"),Some(&malformed));
+    }
 
     #[cfg(feature = "ae2-lab")]
     #[test]
@@ -645,6 +775,7 @@ mod tests {
             item::Slot,
         };
         let mut components = vec![String::new(); component::LORE as usize + 1];
+        components[component::CUSTOM_DATA as usize] = "minecraft:custom_data".into();
         components[component::LORE as usize] = "minecraft:lore".into();
         let builtin = Builtin {
             registries: [
@@ -689,6 +820,7 @@ mod tests {
             packets::play::{NetOffer, Offers},
         };
         let mut components = vec![String::new(); component::POTION_CONTENTS as usize + 1];
+        components[component::CUSTOM_DATA as usize] = "minecraft:custom_data".into();
         components[component::POTION_CONTENTS as usize] = "minecraft:potion_contents".into();
         let builtin = Builtin {
             registries: [
@@ -766,6 +898,7 @@ mod tests {
     #[test]
     fn a_bundle_keeps_its_contents_across_the_wire() {
         let mut components = vec![String::new(); 60];
+        components[component::CUSTOM_DATA as usize] = "minecraft:custom_data".into();
         components[component::BUNDLE_CONTENTS as usize] = "minecraft:bundle_contents".into();
         let items = ["minecraft:air", "minecraft:bundle", "minecraft:stone"];
         let builtin = Builtin {
@@ -807,6 +940,7 @@ mod tests {
     fn a_creative_stack_keeps_its_components_across_the_wire() {
         let mut components = vec![String::new(); 60];
         for (id, name) in [
+            (component::CUSTOM_DATA, "minecraft:custom_data"),
             (component::DAMAGE, "minecraft:damage"),
             (component::CUSTOM_NAME, "minecraft:custom_name"),
             (component::ITEM_NAME, "minecraft:item_name"),

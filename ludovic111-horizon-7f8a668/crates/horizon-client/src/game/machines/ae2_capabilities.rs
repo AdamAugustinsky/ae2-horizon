@@ -146,10 +146,7 @@ impl Game<'_> {
             let owner_address = self.ae2_dimension_address(dim, owner)?;
             let incarnation = c.world.block_entities.incarnation(&owner)?;
             let before = c.get(&view, slot).cloned();
-            let item_max = match stack.data().and_then(|d| d.other("minecraft:max_stack_size")) {
-                Some(Tag::Int(n)) => (*n).clamp(1, 99) as u32,
-                _ => c.max_stack(stack),
-            };
+            let item_max = c.max_stack(stack);
             let mut max = native_sided_slot_limit(view.kind, index, &stack.item, before.is_some(), item_max);
             let state = c.world.block(owner.0, owner.1, owner.2);
             if c.name(state).ends_with("shulker_box") && stack.item.ends_with("shulker_box") { continue; }
@@ -423,12 +420,7 @@ impl Game<'_> {
         }
         let mut left = limit.min(stack.count);
         let wanted = left;
-        let max = self
-            .res
-            .items()
-            .get(&stack.item)
-            .map_or(64, |item| item.max_stack)
-            .max(1);
+        let max = self.res.items().stack_max(stack);
         for slot in &mut slots {
             if left == 0 {
                 break;
@@ -663,7 +655,7 @@ impl Game<'_> {
         if matches!(self.ae2_block_entity(address),Some(BlockEntity::Ae2(machine)) if machine.kind==MachineKind::Condenser) {return self.ae2_condenser_insert_at(address,stack,limit,simulate);}
         if let Some(BlockEntity::Ae2(machine)) = self.ae2_block_entity(address) {
             if machine.kind == MachineKind::DebugItemGenerator {
-                let max = self.res.items().get(&stack.item).map_or(64, |info| info.max_stack).min(64);
+                let max = self.res.items().stack_max(stack).min(64);
                 let mut slots = machine.slots.clone();
                 let moved = crate::game::ae2_debug::itemgen_insert(&mut slots, stack, limit, max);
                 if !simulate && moved > 0 {
@@ -926,7 +918,7 @@ impl Game<'_> {
         if !self.ae2_processor_slot_policy(address,stack,true)? {return Some(0)}
         let BlockEntity::Ae2(machine)=self.ae2_block_entity(address)? else {return None};
         let old=machine.slots.first()?.clone();
-        let max=if machine.kind==MachineKind::Charger {1} else {self.res.items().get(&stack.item).map_or(64,|info|info.max_stack).min(64)};
+        let max=if machine.kind==MachineKind::Charger {1} else {self.res.items().stack_max(stack).min(64)};
         let accepted=match old.as_ref(){None=>limit.min(stack.count).min(max),Some(current) if current.same_item_same_components(stack)=>limit.min(stack.count).min(max.saturating_sub(current.count)),_=>0};
         if simulate||accepted==0{return Some(accepted)}
         let BlockEntity::Ae2(machine)=self.ae2_block_entity_mut(address)? else{return Some(0)};
@@ -992,7 +984,7 @@ impl Game<'_> {
         if matches!(m.config.get(&"ae2_smash".into()),Some(Tag::Int(n)) if *n>0){return Some(0)}
         let slots=self.ae2_inscriber_faces(address,face,m)?;let mut staged=m.slots.clone();let old=staged.clone();let mut left=limit.min(stack.count);
         let cap=match m.config.get(&"inscriber_input_capacity".into()){Some(Tag::String(s))=>match s.to_string().ok()?.as_str(){"ONE"=>1,"FOUR"=>4,"SIXTY_FOUR"=>64,_=>return None},None=>64,_=>return None};
-        let max=cap.min(self.res.items().get(&stack.item).map_or(64,|info|info.max_stack));
+        let max=cap.min(self.res.items().stack_max(stack));
         for slot in slots.into_iter().filter(|n|*n<3){if left==0{break}let mut current=(**m).clone();current.slots=staged.clone();if !self.ae2_inscriber_accepts(&current,slot,stack){continue}
             let moved=match staged[slot].as_ref(){None=>left.min(max),Some(s) if s.same_item_same_components(stack)=>left.min(max.saturating_sub(s.count)),_=>0};if moved==0{continue}
             if let Some(s)=staged[slot].as_mut(){s.count+=moved}else{let mut s=stack.clone();s.count=moved;horizon_client::ae2_stack_identity::detach_if_tracked(&mut s);staged[slot]=Some(s)}left-=moved;
@@ -1036,7 +1028,7 @@ impl Game<'_> {
     }
     fn ae2_assembler_insert(&mut self,address:GridAddress,stack:&ItemStack,limit:u32,simulate:bool)->Option<u32>{
         let BlockEntity::Ae2(m)=self.ae2_block_entity(address)? else{return None};if m.kind!=MachineKind::MolecularAssembler{return None}if m.slots.len()!=11{return Some(0)}
-        let old=m.slots.clone();let mut staged=old.clone();let mut left=limit.min(stack.count);let max=self.res.items().get(&stack.item).map_or(64,|i|i.max_stack).min(64);
+        let old=m.slots.clone();let mut staged=old.clone();let mut left=limit.min(stack.count);let max=self.res.items().stack_max(stack).min(64);
         for slot in 0..9{if left==0{break}if !self.ae2_assembler_accepts(m,slot,stack){continue}let moved=match staged[slot].as_ref(){None=>left.min(max),Some(s) if s.same_item_same_components(stack)=>left.min(max.saturating_sub(s.count)),_=>0};if moved==0{continue}
             if let Some(s)=staged[slot].as_mut(){s.count+=moved}else{let mut s=stack.clone();s.count=moved;horizon_client::ae2_stack_identity::detach_if_tracked(&mut s);staged[slot]=Some(s)}left-=moved;
         }

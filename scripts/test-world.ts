@@ -28,6 +28,9 @@ const suites = [
   'emitter-fake-gestures', 'client-container-component-wire', 'block-item-state-components',
   'crafting-break-large-escrow', 'source-nonunit-crafting', 'crafting-even-mixed-pushes', 'processing-mixed-ordered',
   'pattern-access-owner', 'inframe-bus-menu', 'inframe-emitter-menu',
+  'physical-menu-stack-limit', 'inscriber-menu-capacity', 'item-component-pickup-limit', 'item-component-give-limit',
+  'hopper-component-stack-limit', 'client-complete-component-wire', 'cell-rich-item-components', 'inframe-pattern-access',
+  'hopper-minecart-component-limit',
   'encoding-fake-hotkeys', 'interface-fake-hotkeys', 'processing-large-provider-queue', 'processing-creative-interface', 'crafting-large-job-persistence', 'source-special-patterns',
 ];
 // Explicitly selectable before-cases, not part of the default passing checkpoint.

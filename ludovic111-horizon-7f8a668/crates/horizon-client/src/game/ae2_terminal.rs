@@ -619,8 +619,7 @@ impl Game<'_> {
     /// AEItemKey.getMaxStackSize uses the effective item component, not just
     /// the registry's default max stack size.
     fn ae2_config_item_max(&self,item:&ItemStack)->u32 {
-        let default=self.res.items().get(&item.item).map_or(64,|info|info.max_stack);
-        super::ae2_formation::max_stack(item,default).max(1)
+        self.res.items().stack_max(item)
     }
     fn ae2_local_encoding_machine(&self)->Option<(super::ae2_parts::PartAddress,horizon_client::ae2_world::Machine)> {
         if !self.ae2_local_terminal_valid() {return None;}
@@ -728,7 +727,7 @@ impl Game<'_> {
         let accepts=|item:&ItemStack|if index==0 {item.item.as_ref()=="ae2:blank_pattern"}else{item.item.as_ref()=="ae2:blank_pattern" || super::ae2_encoding::EncodingState::from_pattern(item).is_some()};
         if input==Input::QuickMove {
             if let Some(mut item)=machine.slots[index].take() {
-                let max=self.res.items().get(&item.item).map_or(64,|v|v.max_stack).max(1);
+                let max=self.res.items().stack_max(&item);
                 for target in &mut inventory {
                     if let Some(existing)=target.as_mut().filter(|s|same(s,&item) && s.count<max) {
                         let n=item.count.min(max-existing.count);existing.count+=n;item.count-=n;
@@ -745,9 +744,9 @@ impl Game<'_> {
             let held=carried.take();let stored=machine.slots[index].take();
             match (held,stored) {
                 (None,Some(mut item))=>{let n=if button==1 {item.count.div_ceil(2)}else{item.count};let mut taken=item.clone();taken.count=n;item.count-=n;carried=Some(taken);if item.count>0 {machine.slots[index]=Some(item);}},
-                (Some(mut held),None) if accepts(&held)=>{let n=if button==1 {1}else{held.count.min(if index==1 {1}else{64})};let mut put=held.clone();put.count=n;held.count-=n;machine.slots[index]=Some(put);if held.count>0 {carried=Some(held);}},
-                (Some(mut held),Some(mut item)) if index==0 && accepts(&held) && same(&held,&item)=>{let n=64u32.saturating_sub(item.count).min(if button==1 {1}else{held.count});held.count-=n;item.count+=n;machine.slots[index]=Some(item);if held.count>0 {carried=Some(held);}},
-                (Some(held),Some(item)) if button==0 && accepts(&held) && held.count<=if index==1 {1}else{64}=>{machine.slots[index]=Some(held);carried=Some(item);},
+                (Some(mut held),None) if accepts(&held)=>{let limit=self.res.items().stack_max(&held).min(if index==1 {1}else{64});let n=if button==1 {1.min(limit)}else{held.count.min(limit)};let mut put=held.clone();put.count=n;held.count-=n;machine.slots[index]=Some(put);if held.count>0 {carried=Some(held);}},
+                (Some(mut held),Some(mut item)) if index==0 && accepts(&held) && same(&held,&item)=>{let n=self.res.items().stack_max(&held).min(64).saturating_sub(item.count).min(if button==1 {1}else{held.count});held.count-=n;item.count+=n;machine.slots[index]=Some(item);if held.count>0 {carried=Some(held);}},
+                (Some(held),Some(item)) if button==0 && accepts(&held) && held.count<=self.res.items().stack_max(&held).min(if index==1 {1}else{64})=>{machine.slots[index]=Some(held);carried=Some(item);},
                 (held,item)=>{carried=held;machine.slots[index]=item;}
             }
         } else {return Ok(());}
@@ -761,7 +760,7 @@ impl Game<'_> {
         let Some(mut item)=self.inventory.get(index).cloned().flatten() else{return Ok(false);};
         let target=if item.item.as_ref()=="ae2:blank_pattern" {0}else if super::ae2_encoding::EncodingState::from_pattern(&item).is_some(){1}else{return Ok(false);};
         let (part,mut machine)=self.ae2_local_encoding_machine().ok_or("encoding terminal unavailable")?;
-        let limit:u32=if target==0 {64}else{1};
+        let limit=self.res.items().stack_max(&item).min(if target==0 {64}else{1});
         let room=match machine.slots[target].as_ref(){None=>limit,Some(existing) if target==0 && same(existing,&item)=>limit.saturating_sub(existing.count),_=>0};
         let moved=item.count.min(room);if moved==0 {return Ok(true);}
         if let Some(existing)=machine.slots[target].as_mut(){existing.count+=moved;}else{let mut placed=item.clone();placed.count=moved;machine.slots[target]=Some(placed);}
@@ -907,7 +906,7 @@ impl Game<'_> {
         let order:Vec<usize>=(0..9).rev().chain(9..36).collect();
         for slot in &mut machine.slots {
             let Some(mut stack)=slot.take() else{continue;};
-            let max=self.res.items().get(&stack.item).map_or(64,|item|item.max_stack).max(1);
+            let max=self.res.items().stack_max(&stack);
             for &index in &order {
                 if let Some(target)=inventory[index].as_mut().filter(|target|target.same_item_same_components(&stack) && target.count<max) {
                     let moved=stack.count.min(max-target.count);target.count+=moved;stack.count-=moved;if stack.count==0 {break;}
@@ -940,7 +939,7 @@ impl Game<'_> {
         let mut machine=self.ae2_local_craft_matrix().ok_or("crafting terminal unavailable")?;
         let original_matrix=machine.slots.clone();
         if machine.slots.iter().chain(self.inventory.iter()).chain(std::iter::once(&self.offhand)).chain(std::iter::once(&self.carried)).flatten().any(|stack| {
-            let max=self.res.items().get(&stack.item).map_or(64,|item|item.max_stack).max(1).min(99);
+            let max=self.res.items().stack_max(&stack).min(99);
             stack.count==0 || stack.count>max
         }) {return Err("oversized crafting inventory".into());}
         let order:Vec<usize>=(9..36).chain(0..9).collect();
@@ -982,7 +981,7 @@ impl Game<'_> {
         let pos=self.container.ok_or("terminal closed")?;let part=self.ae2_local_terminal_part();
         let initial=self.res.recipes().find(&machine.slots,3).map(|(_,item)|item);
         let Some(expected)=initial else{return Ok(());};
-        let max=self.res.items().get(&expected.item).map_or(64,|item|item.max_stack).max(1);
+        let max=self.res.items().stack_max(&expected);
         let passes=if input==Input::QuickMove {max/expected.count.max(1)}else{1};
         let before=self.ae2_snapshot_blocks();let original_matrix=machine.slots.clone();
         let mut inventory=self.inventory.clone();let mut offhand=self.offhand.clone();let mut carried=self.carried.clone();let mut random=self.world.random.clone();
@@ -1183,12 +1182,7 @@ impl Game<'_> {
             return Some(icon);
         }
         let mut stack = ae2_lab::prototype(key).ok()?;
-        let max = self
-            .res
-            .items()
-            .get(&stack.item)
-            .map_or(64, |i| i.max_stack)
-            .max(1);
+        let max = self.res.items().stack_max(&stack);
         stack.count = (*amount).max(1).min(u64::from(max)) as u32;
         let mut lore = match stack.data().and_then(|d| d.other("minecraft:lore")) {
             Some(Tag::List(v)) => v.clone(),
@@ -1433,12 +1427,7 @@ impl Game<'_> {
                     return Ok(());
                 }
                 let exemplar = ae2_lab::prototype(key)?;
-                let max = self
-                    .res
-                    .items()
-                    .get(&exemplar.item)
-                    .map_or(64, |i| i.max_stack)
-                    .max(1);
+                let max = self.res.items().stack_max(&exemplar);
                 let amount = if button == 1 {
                     u64::from(max).min(*count).div_ceil(2)
                 } else {
@@ -1507,24 +1496,15 @@ impl Game<'_> {
                     self.inventory[slot] = Some(item);
                 }
             }
-            (Some(held), None, 0) => self.inventory[slot] = Some(held),
-            (Some(mut held), None, 1) => {
-                self.inventory[slot] = Some(ItemStack {
-                    count: 1,
-                    ..held.clone()
-                });
-                held.count -= 1;
-                if held.count > 0 {
-                    self.carried = Some(held);
-                }
+            (Some(mut held), None, b) => {
+                let limit = self.res.items().stack_max(&held);
+                let n = held.count.min(if b == 1 { 1 } else { limit });
+                self.inventory[slot] = Some(ItemStack { count: n, ..held.clone() });
+                held.count -= n;
+                if held.count > 0 { self.carried = Some(held); }
             }
             (Some(mut held), Some(mut item), b) if same(&held, &item) => {
-                let max = self
-                    .res
-                    .items()
-                    .get(&item.item)
-                    .map_or(64, |i| i.max_stack)
-                    .max(1);
+                let max = self.res.items().stack_max(&item);
                 let n = max
                     .saturating_sub(item.count)
                     .min(if b == 1 { 1 } else { held.count });
@@ -1535,7 +1515,7 @@ impl Game<'_> {
                     self.carried = Some(held);
                 }
             }
-            (Some(held), Some(item), _) => {
+            (Some(held), Some(item), _) if held.count <= self.res.items().stack_max(&held) => {
                 self.inventory[slot] = Some(held);
                 self.carried = Some(item);
             }
@@ -1872,9 +1852,9 @@ impl Game<'_> {
             let cursor=host.hub.guests[gi].carried.take();let stored=machine.slots[slot].take();
             match (cursor,stored) {
                 (None,Some(mut item))=>{let n=if button==1 {(item.count+1)/2}else{item.count};let mut taken=item.clone();taken.count=n;item.count-=n;host.hub.guests[gi].carried=Some(taken);if item.count>0 {machine.slots[slot]=Some(item);}}
-                (Some(mut held),None) if accepts(&held)=>{let n=if button==1 {1}else{held.count.min(if slot==1 {1}else{64})};let mut put=held.clone();put.count=n;held.count-=n;machine.slots[slot]=Some(put);if held.count>0 {host.hub.guests[gi].carried=Some(held);}}
-                (Some(mut held),Some(mut item)) if slot==0 && accepts(&held) && same(&held,&item)=>{let n=64u32.saturating_sub(item.count).min(if button==1 {1}else{held.count});held.count-=n;item.count+=n;machine.slots[slot]=Some(item);if held.count>0 {host.hub.guests[gi].carried=Some(held);}}
-                (Some(held),Some(item)) if button==0 && accepts(&held) && held.count<=if slot==1 {1}else{64}=>{machine.slots[slot]=Some(held);host.hub.guests[gi].carried=Some(item);}
+                (Some(mut held),None) if accepts(&held)=>{let limit=self.res.items().stack_max(&held).min(if slot==1 {1}else{64});let n=if button==1 {1.min(limit)}else{held.count.min(limit)};let mut put=held.clone();put.count=n;held.count-=n;machine.slots[slot]=Some(put);if held.count>0 {host.hub.guests[gi].carried=Some(held);}}
+                (Some(mut held),Some(mut item)) if slot==0 && accepts(&held) && same(&held,&item)=>{let n=self.res.items().stack_max(&held).min(64).saturating_sub(item.count).min(if button==1 {1}else{held.count});held.count-=n;item.count+=n;machine.slots[slot]=Some(item);if held.count>0 {host.hub.guests[gi].carried=Some(held);}}
+                (Some(held),Some(item)) if button==0 && accepts(&held) && held.count<=self.res.items().stack_max(&held).min(if slot==1 {1}else{64})=>{machine.slots[slot]=Some(held);host.hub.guests[gi].carried=Some(item);}
                 (held,item)=>{host.hub.guests[gi].carried=held;machine.slots[slot]=item;}
             }
         }
@@ -1889,7 +1869,7 @@ impl Game<'_> {
         let Some(mut item)=host.hub.guests[gi].inventory.get(index).cloned().flatten() else{return Ok(false)};
         let slot=if item.item.as_ref()=="ae2:blank_pattern" {0} else if super::ae2_encoding::EncodingState::from_pattern(&item).is_some() {1} else{return Ok(false)};
         let mut machine=self.ae2_part_machine(part)?.ok_or("encoding part missing")?;
-        let capacity:u32=if slot==0 {64}else{1};
+        let capacity=self.res.items().stack_max(&item).min(if slot==0 {64}else{1});
         let room=match machine.slots[slot].as_ref() {None=>capacity,Some(existing) if slot==0 && same(existing,&item)=>capacity.saturating_sub(existing.count),_=>0};
         let moved=item.count.min(room);if moved==0{return Ok(true)};
         if let Some(existing)=machine.slots[slot].as_mut(){existing.count+=moved;}else{let mut placed=item.clone();placed.count=moved;machine.slots[slot]=Some(placed);}
@@ -2735,9 +2715,9 @@ impl Game<'_> {
         }
         if stage != 2 || slot != -999 { self.lan_send_ae2_terminal(host, conn); return; }
         let Ok(pocket) = Inventory::read(&drag.tool) else { self.lan_send_ae2_terminal(host, conn); return; };
-        if !toolbox_staging_safe(&pocket, |s| self.res.items().get(&s.item).map_or(64, |i| i.max_stack))
+        if !toolbox_staging_safe(&pocket, |s| self.res.items().stack_max(&s))
             || drag.matrix.iter().flatten().any(|s|
-                s.count == 0 || s.count > self.res.items().get(&s.item).map_or(64, |i| i.max_stack).max(1).min(99))
+                s.count == 0 || s.count > self.res.items().stack_max(&s).min(99))
         { self.lan_send_ae2_terminal(host, conn); return; }
         let before = self.ae2_snapshot_blocks();
         let random = self.world.random.clone();
@@ -2803,7 +2783,7 @@ impl Game<'_> {
             let g = &host.hub.guests[gi];
             let safe = target != ctx.source && source != ctx.source
                 && [toolbox_stack(g, target), toolbox_stack(g, source)].into_iter().flatten()
-                    .all(|s| s.count > 0 && s.count <= self.res.items().get(&s.item).map_or(64, |i| i.max_stack).max(1));
+                    .all(|s| s.count > 0 && s.count <= self.res.items().stack_max(&s));
             if safe {
                 let inventory = g.inventory.clone(); let armor = g.armor.clone();
                 let offhand = g.offhand.clone(); let carried = g.carried.clone();
@@ -2877,7 +2857,7 @@ impl Game<'_> {
             return;
         }
         if stage != 2 || slot != -999 || drag.matrix.iter().flatten().flatten().any(|s|
-            s.count == 0 || s.count > self.res.items().get(&s.item).map_or(64, |i| i.max_stack).max(1).min(99))
+            s.count == 0 || s.count > self.res.items().stack_max(&s).min(99))
         { self.lan_send_ae2_terminal(host, conn); return; }
         let before = self.ae2_snapshot_blocks(); let random = self.world.random.clone();
         let inventory = g.inventory.clone(); let armor = g.armor.clone();
@@ -2937,7 +2917,7 @@ impl Game<'_> {
         }
         let original: Vec<_> = g.inventory.iter().cloned().chain(machine.iter().flat_map(|m| m.slots.iter().cloned())).collect();
         if original.get(target).is_none_or(|stack| stack.is_some() && target != ctx.source) { return Ok(()); }
-        let max = self.res.items().get(&carried.item).map_or(64, |v| v.max_stack).max(1);
+        let max = self.res.items().stack_max(&carried);
         if carried.count >= max { return Ok(()); }
         if !original.iter().enumerate().any(|(i, s)| i != ctx.source && s.as_ref().is_some_and(|s|
             s.same_item_same_components(&carried))) { return Ok(()); }
@@ -3119,7 +3099,7 @@ impl Game<'_> {
         let gi = host.hub.guests.iter().position(|g| g.conn == conn).ok_or("missing guest")?;
         let tool = toolbox_stack(&host.hub.guests[gi], owner).cloned().ok_or("network tool moved")?;
         let mut pocket = Inventory::read(&tool)?;
-        if !toolbox_staging_safe(&pocket, |s| self.res.items().get(&s.item).map_or(64, |i| i.max_stack)) {
+        if !toolbox_staging_safe(&pocket, |s| self.res.items().stack_max(&s)) {
             return Err("oversized toolbox source".into());
         }
         if slot >= pocket.slots.len() { return Ok(()); }
@@ -3154,7 +3134,7 @@ impl Game<'_> {
         if input == Input::Swap {
             let g = &host.hub.guests[gi];
             let source = if button == 40 { g.offhand.as_ref() } else { g.inventory[button as usize].as_ref() };
-            if source.is_some_and(|s| s.count > self.res.items().get(&s.item).map_or(64, |i| i.max_stack).max(1)) {
+            if source.is_some_and(|s| s.count > self.res.items().stack_max(&s)) {
                 return Ok(());
             }
         }
@@ -3214,7 +3194,7 @@ impl Game<'_> {
         let g = &host.hub.guests[gi];
         let tool = toolbox_stack(g, owner).cloned().ok_or("network tool moved")?;
         let pocket = Inventory::read(&tool)?;
-        if g.inventory.len() != 36 || !toolbox_staging_safe(&pocket, |s| self.res.items().get(&s.item).map_or(64, |i| i.max_stack)) {
+        if g.inventory.len() != 36 || !toolbox_staging_safe(&pocket, |s| self.res.items().stack_max(&s)) {
             return Err("invalid toolbox inventory".into());
         }
         if wireless.is_some_and(|ctx| !self.ae2_wireless_source_valid(host, conn, ctx)) { return Err("wireless terminal moved".into()); }
@@ -3228,7 +3208,7 @@ impl Game<'_> {
         let locked = |index: usize| toolbox_pickup_locked(index, owner, wireless.map(|ctx| ctx.source));
         // Both DisabledSlot owners are valid double-click targets but cannot be sources.
         if original.get(target).is_none_or(|v| v.is_some() && !locked(target)) { return Ok(()); }
-        let max = self.res.items().get(&carried.item).map_or(64, |v| v.max_stack).max(1);
+        let max = self.res.items().stack_max(&carried);
         if carried.count >= max { return Ok(()); }
         if original.iter().enumerate().any(|(i,s)| !locked(i) && s.as_ref().is_some_and(|s|
             s.same_item_same_components(&carried) && (s.count == 0 || s.count > max))) {
@@ -3316,7 +3296,7 @@ impl Game<'_> {
         }
         let original: Vec<_> = guest.inventory.iter().chain(machine.slots.iter()).cloned().collect();
         if original[target].is_some() { return Ok(()); }
-        let max = self.res.items().get(&carried.item).map_or(64, |v| v.max_stack).max(1);
+        let max = self.res.items().stack_max(&carried);
         if carried.count >= max { return Ok(()); }
         if !original.iter().flatten().any(|s| s.same_item_same_components(&carried)) {
             return Ok(());
@@ -3401,7 +3381,7 @@ impl Game<'_> {
             // Menu::swap can drop a displaced stack when splitting an invalid
             // oversized source; defer that case rather than emit a world item
             // before the face-owned transaction has committed.
-            if source.is_some_and(|s| s.count > self.res.items().get(&s.item).map_or(64, |i| i.max_stack).max(1)) {
+            if source.is_some_and(|s| s.count > self.res.items().stack_max(&s)) {
                 return Ok(());
             }
         }
@@ -3412,7 +3392,7 @@ impl Game<'_> {
             return Err("invalid crafting matrix".into());
         }
         if matches!(owner, CraftOwner::Wireless(_)) && original.slots.iter().flatten().any(|s|
-            s.count == 0 || s.count > self.res.items().get(&s.item).map_or(64, |i| i.max_stack).max(1).min(99))
+            s.count == 0 || s.count > self.res.items().stack_max(&s).min(99))
         {
             return Err("oversized wireless crafting matrix".into());
         }
@@ -3443,12 +3423,7 @@ impl Game<'_> {
                         let moved = self.lan_craft_grid_insert(host, conn, owner, address, &stack, &mut formation)?;
                         stack.count -= moved as u32;
                     } else {
-                        let max = self
-                            .res
-                            .items()
-                            .get(&stack.item)
-                            .map_or(64, |v| v.max_stack)
-                            .max(1);
+                        let max = self.res.items().stack_max(&stack);
                         let inv = &mut host.hub.guests[gi].inventory;
                         // CraftingTermMenu clears into hotbar 8..0, then the
                         // remaining 27 slots, first merging and then filling.
@@ -3504,12 +3479,7 @@ impl Game<'_> {
                 None
             };
             let max_passes = if let Some(output) = &initial_result {
-                let max = self
-                    .res
-                    .items()
-                    .get(&output.item)
-                    .map_or(64, |item| item.max_stack)
-                    .max(1);
+                let max = self.res.items().stack_max(&output);
                 max / output.count.max(1)
             } else if shift_result {
                 0
@@ -3529,12 +3499,7 @@ impl Game<'_> {
                     {
                         break;
                     }
-                    let max = self
-                        .res
-                        .items()
-                        .get(&expected.item)
-                        .map_or(64, |item| item.max_stack)
-                        .max(1);
+                    let max = self.res.items().stack_max(&expected);
                     let room = host.hub.guests[gi]
                         .inventory
                         .iter()
@@ -3866,7 +3831,7 @@ impl Game<'_> {
                     if g.creative() && g.carried.is_none() {
                         if let Some(mut copy) = toolbox_stack(g, owner).cloned() {
                             horizon_client::ae2_stack_identity::detach_if_tracked(&mut copy);
-                            copy.count = self.res.items().get(&copy.item).map_or(64, |i| i.max_stack).max(1);
+                            copy.count = self.res.items().stack_max(&copy);
                             g.carried = Some(copy);
                         }
                     }
@@ -5058,7 +5023,7 @@ impl Game<'_> {
         **current=machine.clone();self.world.modified.insert((pos.0>>4,pos.2>>4));true
     }
     fn provider_return_item_limit(&self,stack:&ItemStack) -> u32 {
-        self.res.items().get(&stack.item).map_or(64,|item|item.max_stack).max(1)
+        self.res.items().stack_max(stack)
     }
     /// A menu slot is allowed to change the return inventory directly even
     /// though the external capability is insertion-only in the source.
@@ -5126,7 +5091,7 @@ impl Game<'_> {
         let Some(mut machine)=self.provider_menu_machine(pos,part) else{return;};
         let Ok(mut slots)=provider_return_slots(&machine) else{return;};
         let before=source.count;
-        let max=self.res.items().get(&source.item).map_or(64,|item|item.max_stack).max(1);
+        let max=self.res.items().stack_max(&source);
         for slot in &mut slots {
             if let Some(ProviderReturnSlot::Item(item))=slot {
                 if same(item,&source) {let n=max.saturating_sub(item.count).min(source.count);item.count+=n;source.count-=n;}
@@ -5828,28 +5793,11 @@ impl Game<'_> {
         }
     }
     fn ae2_machine_limit(&self, pos: (i32, i32, i32), slot: usize, item: &ItemStack) -> u32 {
-        use horizon_client::{ae2_world::MachineKind as K, containers::BlockEntity};
+        use horizon_client::containers::BlockEntity;
+        let item_max = self.res.items().stack_max(item);
         match self.world.block_entities.get(&pos) {
-            Some(BlockEntity::Ae2(m)) if slot >= m.slots.len() => 1,
-            Some(BlockEntity::Ae2(m))
-                if matches!(
-                    m.kind,
-                    K::Drive
-                        | K::CellWorkbench
-                        | K::QuantumLink
-                        | K::SpatialIoPort
-                        | K::IoPort
-                        | K::Condenser
-                ) || matches!(m.kind, K::Inscriber) && slot < 2 =>
-            {
-                1
-            }
-            _ => self
-                .res
-                .items()
-                .get(&item.item)
-                .map_or(64, |i| i.max_stack)
-                .max(1),
+            Some(BlockEntity::Ae2(m)) => machine_slot_limit(m, slot, item_max),
+            _ => item_max.min(64),
         }
     }
     pub(super) fn lan_open_ae2_machine(
@@ -6780,11 +6728,7 @@ impl Game<'_> {
                     if i >= normal {
                         1
                     } else {
-                        self.res
-                            .items()
-                            .get(&s.item)
-                            .map_or(64, |v| v.max_stack)
-                            .max(1)
+                        self.res.items().stack_max(&s)
                     }
                 };
                 match (held, item, button) {
@@ -6856,11 +6800,7 @@ impl Game<'_> {
                         let max = if i >= normal {
                             1
                         } else {
-                            self.res
-                                .items()
-                                .get(&held.item)
-                                .map_or(64, |v| v.max_stack)
-                                .max(1)
+                            self.res.items().stack_max(&held)
                         };
                         match &mut slots[i] {
                             Some(v) if same(v, &held) => {
@@ -6915,12 +6855,7 @@ impl Game<'_> {
                         }
                     }
                     (Some(mut h), Some(mut v), b) if same(&h, &v) => {
-                        let max = self
-                            .res
-                            .items()
-                            .get(&v.item)
-                            .map_or(64, |i| i.max_stack)
-                            .max(1);
+                        let max = self.res.items().stack_max(&v);
                         let n = max
                             .saturating_sub(v.count)
                             .min(if b == 1 { 1 } else { h.count });
@@ -7228,12 +7163,7 @@ impl Game<'_> {
                 }
             }
             (Some(mut held), Some(mut item), b) if same(&held, &item) => {
-                let max = self
-                    .res
-                    .items()
-                    .get(&item.item)
-                    .map_or(64, |i| i.max_stack)
-                    .max(1);
+                let max = self.res.items().stack_max(&item);
                 let n = max
                     .saturating_sub(item.count)
                     .min(if b == 1 { 1 } else { held.count });
@@ -7619,6 +7549,22 @@ mod terminal_filter_tests {
 }
 
 // Source Settings.INSCRIBER_SEPARATE_SIDES and INSCRIBER_INPUT_CAPACITY.
+/// Source AppEngSlot limits combine each inventory's capacity with the
+/// item's effective maximum. Inscriber's three input capacities are shared
+/// by its configurable setting; its output retains the default capacity.
+fn machine_slot_limit(m:&horizon_client::ae2_world::Machine,slot:usize,item_max:u32)->u32 {
+    use horizon_client::ae2_world::MachineKind as K;
+    let capacity=if slot>=m.slots.len() {1} else {match m.kind {
+        K::Drive|K::CellWorkbench|K::QuantumLink|K::SpatialIoPort|K::IoPort|K::Condenser|K::MolecularAssembler=>1,
+        K::Inscriber if slot<3=>match m.config.get(&"inscriber_input_capacity".into()) {
+            Some(Tag::String(value)) if value.to_string().ok().as_deref()==Some("ONE")=>1,
+            Some(Tag::String(value)) if value.to_string().ok().as_deref()==Some("FOUR")=>4,
+            _=>64,
+        },
+        _=>64,
+    }};
+    item_max.min(capacity)
+}
 fn inscriber_setting_click(m:&mut horizon_client::ae2_world::Machine, slot:usize, reverse:bool)->bool {
     if m.kind!=horizon_client::ae2_world::MachineKind::Inscriber{return false}
     let (key,values):(&str,&[&str])=match slot {
@@ -7646,6 +7592,20 @@ impl Game<'_> {
 #[cfg(test)]
 mod inscriber_setting_tests {
     use super::*;
+    #[test]
+    fn source_machine_slot_limits_follow_inscriber_setting_and_assembler_inventory() {
+        use horizon_client::ae2_world::{Machine,MachineKind};
+        let mut inscriber=Machine::new(MachineKind::Inscriber);
+        for slot in 0..3 {assert_eq!(machine_slot_limit(&inscriber,slot,99),64);}
+        inscriber.config.insert("inscriber_input_capacity".into(),Tag::String("ONE".into()));
+        for slot in 0..3 {assert_eq!(machine_slot_limit(&inscriber,slot,64),1);}
+        assert_eq!(machine_slot_limit(&inscriber,3,64),64);
+        inscriber.config.insert("inscriber_input_capacity".into(),Tag::String("FOUR".into()));
+        for slot in 0..3 {assert_eq!(machine_slot_limit(&inscriber,slot,64),4);}
+        assert_eq!(machine_slot_limit(&inscriber,2,2),2);
+        let assembler=Machine::new(MachineKind::MolecularAssembler);
+        for slot in 0..assembler.slots.len() {assert_eq!(machine_slot_limit(&assembler,slot,64),1);}
+    }
     #[test]
     fn physical_inscriber_settings_cycle_source_values_and_reject_corrupt_state() {
         use horizon_client::ae2_world::{Machine,MachineKind};

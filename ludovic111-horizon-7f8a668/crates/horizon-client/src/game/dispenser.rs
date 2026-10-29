@@ -522,12 +522,7 @@ impl Game<'_> {
         }
         let mut rest = remainder;
         if let Some(entity) = self.world.block_entities.get_mut(&pos) {
-            let max = self
-                .res
-                .items()
-                .get(&rest.item)
-                .map_or(64, |i| i.max_stack)
-                .max(1);
+            let max = self.res.items().stack_max(&rest);
             for cell in entity.slots_mut() {
                 match cell {
                     None => {

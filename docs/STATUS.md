@@ -29,7 +29,7 @@ The initial public Stage 83 export is retained in Git history: its coordinated g
 
 ## Known boundaries
 
-- **Full parity is unfinished.** Concrete remaining requirements and verification gaps are in the ledgers. Current work includes general Formation Plane item placement, full modeled-item component retention and physical stack limits, remaining menu adapters and source callback details. A newly implemented path still needs its coordinated gate.
+- **Full parity is unfinished.** Concrete remaining requirements and verification gaps are in the ledgers. Current work includes general Formation Plane item placement, mixed-channel and overfilled source cells, remaining recipe-aware machine validation, wireless lifecycle and source callback details. A newly implemented path still needs its coordinated gate.
 - **No Java mod loader or modpack support is implied.** This native integration is not an upstream `.jar` or `.hmod`; ATM10 and other Java modpacks are unsupported.
 - **Java-world migration has not been established.** Horizon and the pinned AE2 reference target different Minecraft versions. Do not open an existing Java save as an experiment without a separate preserved copy.
 - **Extension and platform coverage is bounded.** Arbitrary NeoForge custom ingredients, third-party key/container capabilities, unsupported addon integrations, every multiplayer timing and every operating system are not certified by these macOS tests.

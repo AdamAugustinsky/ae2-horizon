@@ -525,12 +525,7 @@ impl Game<'_> {
         {
             return Ok(0);
         }
-        let max = self
-            .res
-            .items()
-            .get(&stack.item)
-            .map_or(64, |v| v.max_stack)
-            .max(1);
+        let max = self.res.items().stack_max(stack);
         let existing = machine.slots[slot].as_ref();
         if existing.is_some_and(|v| !v.same_item_same_components(stack)) {
             return Ok(0);
@@ -1232,12 +1227,7 @@ impl Game<'_> {
         }
         let mut left = limit.min(stack.count);
         let before = left;
-        let max = self
-            .res
-            .items()
-            .get(&stack.item)
-            .map_or(64, |v| v.max_stack)
-            .max(1);
+        let max = self.res.items().stack_max(stack);
         for i in 0..machine.slots.len() {
             if left == 0 {
                 break;

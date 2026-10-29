@@ -135,7 +135,8 @@ impl Game<'_> {
         let Some(state)=self.ae2_monitor_state(pos,face) else{return false};
         if !state.conversion || !self.ae2_part_online(pos,face){return false;}
         let Some((key,false))=state.key else{return true};
-        let max=self.res.items().get(&key.item_id).map_or(64,|item|item.max_stack).max(1);
+        let Ok(prototype)=ae2_lab::prototype(&key) else{return true};
+        let max=self.res.items().stack_max(&prototype);
         let amount=if self.keys.contains(&KeyCode::ShiftLeft){1}else{max};
         if let Ok(Some(item))=self.ae2_grid_extract(pos,&key,u64::from(amount)) {
             if let Some(rest)=self.give(item) && let Some(eye)=self.eye_position() {

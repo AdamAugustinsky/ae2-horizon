@@ -318,7 +318,7 @@ fn simple_stack(id: &str) -> ItemStack {
     }
 }
 fn fits(slot: &Option<ItemStack>, result: &ItemStack, items: &Items) -> bool {
-    let max = items.get(&result.item).map_or(64, |v| v.max_stack);
+    let max = items.stack_max(result);
     match slot {
         None => result.count <= max,
         Some(s) => s.same_item_same_components(result) && s.count.checked_add(result.count).is_some_and(|n|n <= max),
@@ -883,6 +883,18 @@ mod tests {
         assert!(!inscriber_auto_export_work(&machine));
     }
     use super::*;
+    #[test]
+    fn inscriber_output_respects_component_stack_maximum() {
+        let items=Items::tags_only(&std::env::temp_dir().join("ae2-empty-item-catalog")).unwrap();
+        let mut output=ItemStack::new("minecraft:stone",1);
+        output.data_mut().set_other("minecraft:max_stack_size",Some(Tag::Int(16)));
+        let mut partial=output.clone();partial.count=15;
+        assert!(fits(&Some(partial.clone()),&output,&items));
+        partial.count=16;
+        assert!(!fits(&Some(partial),&output,&items));
+        output.count=17;
+        assert!(!fits(&None,&output,&items));
+    }
     #[test]
     fn inscriber_output_keeps_recipe_components_in_the_physical_slot() {
         let result = serde_json::json!({"id":"minecraft:diamond", "count":2,

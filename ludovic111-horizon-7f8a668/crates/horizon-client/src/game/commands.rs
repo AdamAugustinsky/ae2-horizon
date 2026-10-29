@@ -1040,7 +1040,8 @@ impl Game<'_> {
         };
         let count = Self::int(ctx, "count").unwrap_or(1);
         let targets = self.entities(ctx, "targets", true)?;
-        let max_stack = self.res.items().get(&id).map_or(64, |i| i.max_stack) as i32;
+        let prototype = ItemStack {item:id.as_str().into(),count:1,damage,extra:extra.clone()};
+        let max_stack = self.res.items().stack_max(&prototype) as i32;
         if count > max_stack * 100 {
             return Err(CommandError::new(Text::translate(
                 "commands.give.failed.toomanyitems",

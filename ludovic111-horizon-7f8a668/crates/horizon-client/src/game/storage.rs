@@ -170,6 +170,12 @@ impl Game<'_> {
             return;
         }
         #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_pattern_access_open() {
+            if !self.ae2_local_pattern_access_valid(){self.close_container();self.screen=super::Screen::Playing;self.capture(true);}
+            else{self.ae2_local_pattern_access_tick();}
+            return;
+        }
+        #[cfg(feature = "ae2-lab")]
         if self.ae2_local_terminal_open() {
             let pos=self.container.unwrap();
             if !self.ae2_local_terminal_valid()
@@ -272,6 +278,8 @@ impl Game<'_> {
         #[cfg(feature = "ae2-lab")]
         if self.ae2_local_bus_open() {return Some(6);}
         #[cfg(feature = "ae2-lab")]
+        if self.ae2_local_pattern_access_open() {return Some(6);}
+        #[cfg(feature = "ae2-lab")]
         if self.ae2_portable_open() { return Some(6); }
         #[cfg(feature = "ae2-lab")]
         if self.ae2_terminal_open() {
@@ -338,7 +346,7 @@ impl Game<'_> {
             batch.sprite_region(atlas,"ae2:guis/patternaccessterminal",[ox,oy,195.0,224.0],256.0,256.0);
             batch.text(atlas,"Pattern Access",ox+8.0,oy+6.0,grey,false);
             batch.text(atlas,"Inventory",ox+8.0,oy+131.0,grey,false);
-            if let Some(rows)=self.remote.as_ref().and_then(|r|r.ae2_pattern_layout.as_ref()).and_then(|v|v.get("rows")).and_then(|v|v.as_array()) {
+            if let Some(rows)=self.ae2_pattern_access_layout().as_ref().and_then(|v|v.get("rows")).and_then(|v|v.as_array()) {
                 for i in 0..6 {
                     let row=rows.get(i);let provider=row.and_then(|r|r.get("kind")).and_then(|v|v.as_str())==Some("provider");
                     let src=17.0+(i/2) as f32*36.0+if provider {18.0}else{0.0};
@@ -356,7 +364,7 @@ impl Game<'_> {
                 batch.text(atlas,label,ox+x+5.0,oy+y+4.0,grey,false);
             }
             self.ae2_search_draw(batch,ox,oy);
-            let icons:Vec<_>=self.remote.as_ref().and_then(|r|r.ae2_pattern_layout.as_ref()).and_then(|v|v.get("rows")).and_then(|v|v.as_array()).into_iter().flatten().take(6).enumerate().filter_map(|(i,row)|{
+            let icons:Vec<_>=self.ae2_pattern_access_layout().as_ref().and_then(|v|v.get("rows")).and_then(|v|v.as_array()).into_iter().flatten().take(6).enumerate().filter_map(|(i,row)|{
                 if row.get("kind")?.as_str()? != "header" {return None;}
                 let icon=row.get("icon")?;let id=icon.get("id")?.as_str()?.to_string();
                 let bytes=icon.get("components")?.as_array()?.iter().map(|v|u8::try_from(v.as_u64()?).ok()).collect::<Option<Vec<_>>>()?;
@@ -608,7 +616,8 @@ impl Game<'_> {
         let (x,y)=(self.cursor.0-ox,self.cursor.1-oy);
         if !(8.0..170.0).contains(&x) || !(17.0..125.0).contains(&y) {return;}
         let line=((y-17.0)/18.0) as usize;
-        let Some(row)=self.remote.as_ref().and_then(|r|r.ae2_pattern_layout.as_ref()).and_then(|v|v.get("rows")).and_then(|v|v.as_array()).and_then(|rows|rows.get(line)) else{return;};
+        let layout=self.ae2_pattern_access_layout();
+        let Some(row)=layout.as_ref().and_then(|v|v.get("rows")).and_then(|v|v.as_array()).and_then(|rows|rows.get(line)) else{return;};
         if row.get("kind").and_then(|v|v.as_str())!=Some("header") {return;}
         let mut lines=Vec::new();
         if let Some(name)=row.get("name").and_then(|v|v.as_str()) {lines.push((name.to_string(),u32::MAX));}
